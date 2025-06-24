@@ -1,0 +1,49 @@
+#!/bin/bash
+# This Script is used to generate {SAMPLE}.snp_pileup.gz
+
+#SBATCH --job-name=snp_pileup
+#SBATCH --output=slurm_log/snp_pileup_%A_%a.out
+#SBATCH --error=slurm_log/snp_pileup_%A_%a.err
+#SBATCH --time=01:00:00
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=rak373@pitt.edu
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=16G
+#SBATCH --array=1-20  # Update based on actual sample count
+
+module load gcc/12.2.0 
+module load r/4.4.0
+
+CSV_PATH="/ix1/alee/LO_LAB/Personal/Rahul/PDO_CNV/sample.csv"
+RSCRIPT_PATH="/ix1/alee/LO_LAB/Personal/Rahul/PDO_CNV/Facets/snp-pileup-wrapper.R"
+SNP_PILEUP_PATH="/ihome/alee/rak373/R/x86_64-pc-linux-gnu-library/4.3/facets/extcode/snp-pileup"
+VCF_FILE="/ix1/alee/LO_LAB/Personal/Rahul/Reference_genome/Human/00-common_all.vcf.gz"
+PILEUP_DIR="/ix1/alee/LO_LAB/Personal/Rahul/PDO_CNV"
+
+
+LINE_NUM=$((SLURM_ARRAY_TASK_ID + 1))  # +1 to skip header
+LINE="$(sed -n "${LINE_NUM}p" "$CSV_PATH")"
+
+if [ -z "$LINE" ]; then
+    echo "[$(date)] No line found for task ID $SLURM_ARRAY_TASK_ID (line $LINE_NUM). Skipping."
+    exit 1
+fi
+
+IFS=',' read -r SAMPLE NORMAL_BAM TUMOR_BAM <<< "$LINE"
+
+OUTFILE="${PILEUP_DIR}/${SAMPLE}.snp_pileup.gz"
+if [ -f "$OUTFILE" ]; then
+    echo "[$(date)] Output already exists for $SAMPLE. Skipping."
+    exit 0
+fi
+
+echo "[$(date)] Processing sample: $SAMPLE"
+
+Rscript "$RSCRIPT_PATH" \
+    --snp-pileup-path "$SNP_PILEUP_PATH" \
+    --vcf-file "$VCF_FILE" \
+    --normal-bam "$NORMAL_BAM" \
+    --tumor-bam "$TUMOR_BAM" \
+    --output-prefix "$PILEUP_DIR/$SAMPLE"
+
+echo "[$(date)] Completed: $SAMPLE"
