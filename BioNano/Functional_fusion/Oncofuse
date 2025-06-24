@@ -1,5 +1,5 @@
 ## This script is used to estimate the oncogenic potential of de-novo discovered gene fusions by using Oncofuse (https://github.com/mikessh/oncofuse)
-## Before running make sure to have *coord_oncofuse.txt
+## Before running, make sure to have *coord_oncofuse.txt, a Tab-delimited file with lines 5' chrom	5' coord	3' chrom	3' coord	tissue_type           
 #!/bin/bash
 
 #SBATCH --job-name=Oncofuse
