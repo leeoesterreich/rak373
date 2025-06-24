@@ -1,4 +1,4 @@
-##### This script was used to convert HTSeq to log2CPM
+##### This script was used to convert HTSeq to log2CPM for further downstreaming analysis
 
 library(edgeR)
 library(biomaRt)  # For gene annotation
