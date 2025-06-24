@@ -1,4 +1,4 @@
-# This R script is used to identify functional fusions from the list of fusions detected by OGM.
+# This R script is used to identify functional fusions from the list of fusions detected by OGM (Bionano).
 
 library(readr)
 library(dplyr)
