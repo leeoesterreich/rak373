@@ -11,17 +11,17 @@ Before running FACETS, compile the snp-pileup binary from the FACETS source:
 
 To verify that `snp-pileup` is installed correctly, run the following command:
 
-```bash
 ./snp-pileup --help
-Steps
 
-Tool mskcc/facets-suite (https://github.com/mskcc/facets-suite/tree/master)
+## Steps
 
-VCF File
+### Tool
 
- ## Download SNP VCF File
+Tool used: [mskcc/facets-suite](https://github.com/mskcc/facets-suite/tree/master)
 
-Download the SNP VCF file and its index from the NCBI SNP database:
+### VCF File
+
+Download the SNP VCF and its index file from the NCBI SNP database:
 
 ```bash
 wget https://ftp.ncbi.nlm.nih.gov/snp/organisms/human_9606/VCF/00-common_all.vcf.gz
