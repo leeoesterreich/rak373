@@ -1,6 +1,21 @@
-# Bionano Optical Genome Mapping Pipeline: OM2BFB + HRD Score Calculation
+---
 
-This pipeline enables the analysis of Breakage-Fusion-Bridge (BFB) cycles and estimation of Homologous Recombination Deficiency (HRD) scores using **Bionano optical Genomics mapping data**.
+### 🔹 [OM2BFB](https://github.com/siavashre/OM2BFB)
+Tool for the detection of **BFB events** from optical mapping data.
 
-- **OM2BFB**: for detection of BFB events from optical mapping data (https://github.com/siavashre/OM2BFB).
-- **HRD Scoring Tool (by Bionano Genomics)**: for computing genome-wide HRD scores (https://github.com/bionanogenomics/HRD).
+- Detects patterns of Breakage-Fusion-Bridge cycles.
+- Uses the rmcap (contains CN information), smap (contains SV information), xmap (contains alignment information), and cmap (assembled con) file.
+
+### 🔹 [HRD Scoring Tool](https://github.com/bionanogenomics/HRD) by Bionano Genomics
+Estimates **genome-wide HRD scores** using OM data.
+
+- Quantifies the signature of homologous recombination deficiency.
+- Uses the smap, CNV.txt, and Aneuploidy.txt files.
+
+### 🔹 [SVExpress](https://github.com/chadcreighton/SVExpress)
+Associates **Structural Variant breakpoints with gene expression**.
+
+- Integrates SV data with transcriptomic profiles (from RNASeq).
+- Useful for identifying SV-driven expression changes.
+
+---
