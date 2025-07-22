@@ -1,12 +1,12 @@
 ```r
-# Tried to generate geneXsample matrix by Excel macro file (provided by author) but not working
-# one possible reason of not having ori information on bionano data
-# So i used my own R script to generate breakpoint matrix
-# SVexpress Preprocessing and Integration Pipelin
-# Generate CNA and expression matrix as earlier used in SVExpress_TAD and SVExpress_gene_boundaries
+# Tried to generate geneXsample matrix by Excel macro file (provided by author), but not working
+# One possible reason for not having ori information on bionano data
+# So I used my own R script to generate a breakpoint matrix
+# SVexpress Preprocessing and Integration Pipeline
+# Generate CNA and expression matrix as earlier used in SVExpress_gene_boundaries
 #####################################################################################################################
 
-# This can generates the gene-to-sample breakpoint matrix (breakpoints.txt) directly from structural variant and gene annotation files
+# This can generate the gene-to-sample breakpoint matrix (breakpoints.txt) directly from structural variant and gene annotation files
 # SV breakpoints to nearby genes using coordinate overlaps
 # sv_bedpe.txt: BEDPE-like file of SV breakpoints (chrom1, start1, end1, chrom2, start2, end2, sample_id), From SV calling
 # gene_coords.bed: Gene annotations (chrom, start, end, gene_name), Convert GTF to BED
