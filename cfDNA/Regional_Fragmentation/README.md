@@ -10,6 +10,7 @@ samtools view -bh -f 2 -q 30 -F 3844 sample.bam \
   | samtools sort -o sample.filter.coordsort.bam -
 
 samtools index sample.filter.coordsort.bam
+```
 
 ## Step 1 — Generate fixed 100 kb genomic bins (hg38)
 
@@ -22,3 +23,209 @@ CHROMSIZES="/ix1/alee/LO_LAB/References/hg38/hg38.chrom.sizes"
 
 bedtools makewindows -g "$CHROMSIZES" -w 100000 \
   | awk '$1!="chrM"' > hg38.100kb.bed
+```
+## Step 2 — Count reads per 100 kb bin
+
+Count reads per bin across many BAMs by splitting the BAM list into chunks (avoids time/memory crashes).
+
+```bash
+# Working directory
+cd /ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/Broad/NST/Fragmentation_analysis/Regional_Fragment_analysis/02_crpb
+
+# 2A) Make BAM list (filtered + coordinate-sorted BAMs)
+ls /ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/Broad/NST/Fragmentation_analysis/Regional_Fragment_analysis/Sorted_bam/*.filter.coordsort.bam \
+  > bams.coordsort.list.txt
+
+# Split into chunks of 25 BAMs each
+split -d -l 25 bams.coordsort.list.txt bamchunk_   # creates bamchunk_00, bamchunk_01, ...
+
+# 2B) Run CountReadsPerBin per chunk (produce short + long raw TSV per chunk)
+
+# 2C) Merge chunk TSVs into final short/long matrices
+# Each chunk TSV must have identical first 3 columns: chrom / start / end, followed by sample columns.
+```
+## Step 3 — Enforce consistent bin order and verify short/long bin matching
+
+Sort each chunk TSV in a fixed chromosome order (chr1–chr22 + chrX) and confirm that all chunk files (and short vs long) share identical bin rows.
+
+```bash
+cd /ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/Broad/NST/Fragmentation_analysis/Regional_Fragment_analysis/02_crpb
+
+# Create a chr order file (chr1–chr22 + chrX)
+cat > chr_order.txt <<'EOF'
+chr1
+chr2
+chr3
+chr4
+chr5
+chr6
+chr7
+chr8
+chr9
+chr10
+chr11
+chr12
+chr13
+chr14
+chr15
+chr16
+chr17
+chr18
+chr19
+chr20
+chr21
+chr22
+chrX
+EOF
+
+# Sort each TSV using chr_order + genomic coordinates (keeps header)
+for f in short.bamchunk_*.raw.tsv long.bamchunk_*.raw.tsv; do
+  out="${f%.raw.tsv}.sorted.tsv"
+  echo "Sorting $f -> $out"
+
+  # header
+  head -n 1 "$f" > "$out"
+
+  # body: add chr rank, sort, then drop rank
+  tail -n +2 "$f" \
+    | awk -F'\t' 'BEGIN{OFS="\t"} FNR==NR {rank[$1]=NR; next}
+        {r=(($1 in rank)?rank[$1]:999); print r,$0}
+      ' chr_order.txt - \
+    | sort -t $'\t' -k1,1n -k3,3n -k4,4n \
+    | cut -f2- >> "$out"
+done
+
+# Verify bins match AND order matches across short chunks
+ref=short.bamchunk_00.sorted.tsv
+for f in short.bamchunk_*.sorted.tsv; do
+  echo -n "$f  "
+  diff -q <(cut -f1-3 "$ref" | tail -n +2) <(cut -f1-3 "$f" | tail -n +2) >/dev/null \
+    && echo "OK" || echo "DIFF"
+done
+
+# Verify short vs long bins match
+diff -q \
+  <(cut -f1-3 short.bamchunk_00.sorted.tsv | tail -n +2) \
+  <(cut -f1-3 long.bamchunk_00.sorted.tsv  | tail -n +2) \
+  && echo "short/long bins match" || echo "short/long bins DIFF"
+```
+## Step 4 — Blacklist filtering, GC content, and LOESS GC correction
+
+Remove bins overlapping genomic blacklists, compute GC content per bin, and apply LOESS correction per sample to reduce GC bias before calculating fragmentation ratios.
+
+```bash
+# (A) Drop blacklist-overlapping bins
+# Input: hg38.100kb.bed
+# Output: hg38.100kb.noblacklist.bed
+# NOTE: replace BLACKLIST path with the lab standard (hg38 blacklist BED)
+
+module load bedtools/2.31.1
+
+BINS="hg38.100kb.bed"
+BLACKLIST="/ix1/alee/LO_LAB/References/hg38/hg38.blacklist.bed"
+OUT_BINS="hg38.100kb.noblacklist.bed"
+
+bedtools intersect -a "$BINS" -b "$BLACKLIST" -v > "$OUT_BINS"
+echo "Wrote: $OUT_BINS"
+```
+```bash
+# (B) Compute GC content per bin
+# Input: OUT_BINS + reference FASTA
+# Output: hg38.100kb.noblacklist.gc.tsv
+```bash
+module load bedtools/2.31.1
+
+HG38_FA="/ix1/alee/LO_LAB/References/hg38/hg38.fa"
+GC_TSV="hg38.100kb.noblacklist.gc.tsv"
+
+bedtools nuc -fi "$HG38_FA" -bed "$OUT_BINS" \
+  | awk 'BEGIN{OFS="\t"} NR==1{print "chr","start","end","GC"} NR>1{print $1,$2,$3,$5}' \
+  > "$GC_TSV"
+echo "Wrote: $GC_TSV"
+```
+# (C) LOESS GC correction (per sample)
+```text
+# Apply LOESS correction to short and long count matrices using GC per bin.
+# Output examples:
+short.gc_corrected.tsv
+long.gc_corrected.tsv
+```
+
+## Step 5 — Compute short/long fragmentation ratio
+
+Compute the fragmentation signal per bin per sample using the short/long fragment ratio transformed to log2 for downstream comparisons.
+
+```text
+# Raw CountReadsPerBin outputs
+short_rawdata_countreadsperbin.tsv
+long_rawdata_countreadsperbin.tsv
+
+# Blacklist-filtered raw counts
+short_rawdata_countreadsperbin.blacklistFiltered.tsv
+long_rawdata_countreadsperbin.blacklistFiltered.tsv
+
+# GC content + raw counts (before LOESS correction)
+short_readcounts_corr_and_GC.csv
+long_readcounts_corr_and_GC.csv
+
+# LOESS GC-corrected read counts
+short_corr_readcounts.csv
+long_corr_readcounts.csv
+
+# Final fragmentation signal
+short_long_ratio.csv
+```
+## Step 6 — CNV masking and consensus copy-neutral bin universe (ichorCNA)
+
+Identify copy-neutral bins using ichorCNA segments and define consensus neutral-bin universes based on the fraction of samples in which each bin is neutral.
+
+```bash
+# Input:
+#   short_long_ratio.csv
+#   ichorCNA CNV segments (per sample)
+#
+# CNV masking logic:
+#   - CNV status is determined per sample
+#   - Each bin is marked neutral (1) or non-neutral (0) per sample
+#   - A bin × sample mask matrix is generated
+#
+# Output files:
+#   cnv_mask_matrix_bins_x_samples.tsv
+#     Binary matrix indicating copy-neutral status (bins × samples)
+#
+#   neutral_fraction_per_bin.tsv
+#     Fraction of samples in which each bin is copy-neutral
+#
+#   consensus_neutral_bins_<XX>pct.txt
+#     Lists of bins that are copy-neutral in at least XX% of samples
+#     (e.g., 50%, 60%, 70%)
+#
+#   consensus_bin_counts_summary.tsv
+#     Summary of number and percentage of bins retained at each threshold
+```
+## Step 7 — Effect size analysis and site directionality (KW + BH)
+
+Quantify site-specific fragmentation differences per bin using effect size, rather than relying only on statistical significance.
+
+```bash
+# Input:
+#   short_long_ratio.cnv_neutral_universe50.csv
+#   sample metadata with metastatic site labels (e.g., liver, brain, bone)
+#
+# Analysis logic:
+#   - For each bin, compare fragmentation ratios across metastatic sites
+#   - Perform Kruskal–Wallis (KW) test per bin
+#   - Compute effect size (η²) to quantify strength of site-specific bias
+#   - Apply Benjamini–Hochberg (BH) correction across bins
+#
+# Additional per-bin summaries:
+#   - median_liver, median_brain, median_bone
+#   - site_highest: site with highest median fragmentation signal
+#   - site_lowest: site with lowest median fragmentation signal
+#   - delta_high_low: difference between highest and lowest site medians
+#
+# Output example:
+#   effect_size_kw_bh_results.tsv
+#   (includes: kw_p, kw_q_BH, eta2, rank_eta2, site_highest, site_lowest)
+```
+### Step 8 — Visualization (Z-scored heatmaps) and gene annotation
