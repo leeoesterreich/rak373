@@ -1,202 +1,83 @@
-Usage: Regional cfDNA Fragmentation Analysis Pipeline
+opy-paste this whole block into README.md (don’t remove blank lines).
 
-This section describes the end-to-end workflow used to perform regional cfDNA fragmentation analysis based on short/long fragment ratios across fixed genomic bins.
+Step 0 — BAM preprocessing (coordinate sort + filtering)
+Goal
 
-Step 0. BAM preprocessing
+Generate coordinate-sorted BAM files containing high-confidence cfDNA fragments for downstream fragmentation analysis.
 
-All BAM files must be coordinate-sorted and filtered to retain high-confidence cfDNA fragments.
+Input BAMs
+/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/Broad/NST/Fragmentation_analysis/Regional_Fragment_analysis/Aligned_bam/
+
+Output BAMs
+/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/Broad/NST/Fragmentation_analysis/Regional_Fragment_analysis/Sorted_bam/
 
 Filtering criteria
 
-Proper pairs only
+Reads kept:
 
-MAPQ ≥ 30
+Proper pairs (-f 2)
 
-Remove secondary, QC-fail, duplicate, and supplementary reads
+MAPQ ≥ 30 (-q 30)
 
-Example:
+Reads removed:
 
-samtools view -b \
-  -f 2 \
-  -q 30 \
-  -F 3844 \
-  input.bam \
-| samtools sort -o sample.filter.coordsort.bam
+Secondary
 
-samtools index sample.filter.coordsort.bam
+QC-fail
 
-Step 1. Define fixed genomic bins (hg38, 100 kb)
+PCR/optical duplicates
 
-All samples are summarized over identical genomic bins.
+Supplementary alignments
 
-CHROMSIZES=/path/to/hg38.chrom.sizes
+Flag used:
 
-bedtools makewindows -g "$CHROMSIZES" -w 100000 \
-  | awk '$1!="chrM"' > hg38.100kb.bed
+-F 3844
 
+Per-sample command
+module load samtools/1.15
 
-Bin size: 100 kb
+in_bam="sample.bam"
+out_bam="sample.filter.coordsort.bam"
 
-chrM excluded
+samtools view -bh -f 2 -q 30 -F 3844 "$in_bam" \
+  | samtools sort -o "$out_bam" -
 
-Step 2. Count reads per bin (chunked execution)
+samtools index "$out_bam"
 
-Counting reads for hundreds of BAMs in a single job can exceed time/memory limits.
-To avoid this, BAMs are processed in chunks.
+Batch processing (all BAMs)
+module load samtools/1.15
 
-2A. Split BAM list
-ls Sorted_bam/*.filter.coordsort.bam > bams.coordsort.list.txt
-split -d -l 25 bams.coordsort.list.txt bamchunk_
+IN_DIR="/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/Broad/NST/Fragmentation_analysis/Regional_Fragment_analysis/Aligned_bam"
+OUT_DIR="/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/Broad/NST/Fragmentation_analysis/Regional_Fragment_analysis/Sorted_bam"
 
+mkdir -p "$OUT_DIR"
 
-Each bamchunk_* file contains ~25 BAMs.
+for in_bam in "$IN_DIR"/*.bam; do
+  base=$(basename "$in_bam" .bam)
+  out_bam="$OUT_DIR/${base}.filter.coordsort.bam"
 
-2B. Run CountReadsPerBin per chunk
+  echo "Processing: $base"
+  samtools view -bh -f 2 -q 30 -F 3844 "$in_bam" \
+    | samtools sort -o "$out_bam" -
 
-Run the bin-counting step independently per chunk
-
-Ensure all chunks use the same bin BED file
-
-Generate separate raw TSVs for:
-
-short fragments
-
-long fragments
-
-2C. Merge chunk-level TSVs
-
-After all chunks finish, merge them into:
-
-short_rawdata.tsv
-
-long_rawdata.tsv
-
-Each TSV must share identical bin rows across chunks.
-
-Step 2D. Enforce consistent chromosome and bin order
-
-Create a fixed chromosome order:
-
-cat > chr_order.txt <<'EOF'
-chr1
-chr2
-chr3
-chr4
-chr5
-chr6
-chr7
-chr8
-chr9
-chr10
-chr11
-chr12
-chr13
-chr14
-chr15
-chr16
-chr17
-chr18
-chr19
-chr20
-chr21
-chr22
-chrX
-EOF
-
-
-Sort each chunk TSV while preserving headers:
-
-for f in short.bamchunk_*.raw.tsv long.bamchunk_*.raw.tsv; do
-  out="${f%.raw.tsv}.sorted.tsv"
-  head -n 1 "$f" > "$out"
-  tail -n +2 "$f" \
-    | awk -F'\t' 'BEGIN{OFS="\t"} FNR==NR {rank[$1]=NR; next}
-      {r=(($1 in rank)?rank[$1]:999); print r,$0}' chr_order.txt - \
-    | sort -t $'\t' -k1,1n -k3,3n -k4,4n \
-    | cut -f2- >> "$out"
+  samtools index "$out_bam"
 done
 
-Verify bin consistency
-ref=short.bamchunk_00.sorted.tsv
+Sanity checks
 
-for f in short.bamchunk_*.sorted.tsv; do
-  diff -q <(cut -f1-3 "$ref" | tail -n +2) <(cut -f1-3 "$f" | tail -n +2) \
-    && echo "$f OK" || echo "$f DIFF"
-done
+Read count before vs after filtering
 
-diff -q \
-  <(cut -f1-3 short.bamchunk_00.sorted.tsv | tail -n +2) \
-  <(cut -f1-3 long.bamchunk_00.sorted.tsv  | tail -n +2) \
-  && echo "short/long bins match"
-
-Step 2E. Blacklist filtering & GC correction
-
-Remove bins overlapping genomic blacklists
-
-Compute GC content per bin
-
-Apply LOESS GC correction per sample
-
-(This step produces GC-corrected short and long counts.)
-
-Step 3. Short/long fragment ratio
-
-For each bin and sample:
-
-short_long_ratio = short_count / long_count
+samtools view -c sample.bam
+samtools view -c sample.filter.coordsort.bam
 
 
-Optionally transform to:
+Confirm coordinate sorting
 
-log2(short/long)
+samtools view -H sample.filter.coordsort.bam | grep '^@HD'
 
-Z-score per bin across samples
+Output naming convention
+<SAMPLE_ID>.filter.coordsort.bam
+<SAMPLE_ID>.filter.coordsort.bam.bai
 
-Step 4. CNV masking using ichorCNA
 
-To avoid CNV-driven artifacts:
-
-Perform CNV masking per sample
-
-Retain only copy-neutral bins
-
-Use a shared neutral-bin universe across all samples for comparisons
-
-Step 5. Per-site comparison and effect size analysis
-
-Compare bins across metastatic sites (e.g., liver, brain, bone)
-
-Across all bins: no strong global pattern
-
-Compute effect size (η²) per bin
-
-Select top 1000 bins by effect size
-
-Assign site directionality using median values:
-
-median_liver
-
-median_brain
-
-median_bone
-
-Track site_highest / site_lowest per bin
-
-Step 6. Gene annotation of significant bins
-6A. Create BED of BH-significant bins
-
-Example: 986 bins passing BH correction
-
-6B. Intersect bins with genes
-module load bedtools/2.31.1
-
-bedtools intersect \
-  -a universe50.BHsig.bins986.bed \
-  -b gencode.v19.genes.bed \
-  -wa -wb > universe50.BHsig.bins986.geneHits.tsv
-
-6C. Collapse gene hits
-
-Collapse genes per bin_id
-
-Merge gene annotations back into the bin-level TSV
+These BAM files are used as input for Step 1: fixed 100 kb binning and read counting.
