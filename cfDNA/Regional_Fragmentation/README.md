@@ -208,4 +208,24 @@ Quantify site-specific fragmentation differences per bin using effect size, rath
 #   effect_size_kw_bh_results.tsv
 #   (includes: kw_p, kw_q_BH, eta2, rank_eta2, site_highest, site_lowest)
 ```
-### Step 8 — Visualization (Z-scored heatmaps) and gene annotation
+### Step 8 — Visualization (Z-scored heatmaps) 
+
+## Step 9 — Gene annotation of significant fragmentation bins
+
+Annotate BH-significant fragmentation bins with overlapping genes to enable biological interpretation and downstream enrichment analyses.
+Make a BED file for the BH-sig bins for gene-level annotation
+Intersect sign bins with gene names
+
+```bash
+module load bedtools/2.31.1
+
+BINS="/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/Broad/NST/Fragmentation_analysis/Regional_Fragment_analysis/LOLA_inputs_top3sites/Effect_size/KW_BH/universe50.BHsig.bins986.bed"
+
+GENES="/ix1/alee/LO_LAB/Personal/Rahul/Reference_genome/Human/gencode.v19.genes.bed"
+
+OUT="/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/Broad/NST/Fragmentation_analysis/Regional_Fragment_analysis/LOLA_inputs_top3sites/Effect_size/KW_BH/universe50.BHsig.bins986.geneHits.tsv"
+
+bedtools intersect -a "$BINS" -b "$GENES" -wa -wb > "$OUT"
+
+echo "Wrote: $OUT"
+```
