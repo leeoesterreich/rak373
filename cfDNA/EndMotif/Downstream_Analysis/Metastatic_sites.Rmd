@@ -13,6 +13,7 @@ suppressPackageStartupMessages({
 # Paths
 # -----------------------------
 meta_path <- "/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/Broad/NST/End_motif/Metastasis.csv"
+# Sample ID (TP number),ER Status,HER-2 Status,Metastatic_sites (Str of Metastasis.csv)
 outdir    <- "/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/Broad/NST/End_motif/metastasis_site_summary"
 dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
 
