@@ -1,0 +1,206 @@
+---
+title: "Multivariate_Plot"
+output: html_document
+date: "2026-01-23"
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(uwot)
+  library(ggplot2)
+})
+```
+
+
+```{r}
+# -----------------------------
+# Paths
+# -----------------------------
+freq_rds <- "/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/Broad/NST/End_motif/motif_analysis_no_annot/endmotif_4bp_freq_per_sample_ATGC_only.rds"
+
+meta_single_csv <- "/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/Broad/NST/End_motif/metastasis_site_summary/metastasis_single_site_combinations.csv"
+
+sig_motif_csv <- "/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/Broad/NST/End_motif/metastasis_motif_results_single_site_top3/ATGC_only/res_4bp_kw_top_sites_ATGC.csv"
+
+outdir <- "/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/Broad/NST/End_motif/figures_multivariate"
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+top_sites <- c("brain", "bone", "liver")
+```
+
+
+```{r}
+# -----------------------------
+# Load data
+# -----------------------------
+df_freq <- readRDS(freq_rds)
+
+meta_single <- read_csv(meta_single_csv, show_col_types = FALSE) %>%
+  mutate(
+    id = str_trim(id),
+    metastatic_sites = str_to_lower(str_trim(metastatic_sites))
+  ) %>%
+  filter(metastatic_sites %in% top_sites)
+
+kw_res <- read_csv(sig_motif_csv, show_col_types = FALSE)
+
+# Select top 4 significant motifs (you can tighten p < 0.05 if needed)
+sig_motifs <- kw_res %>%
+  arrange(desc(effsize)) %>%
+  slice_head(n = 4) %>%
+  pull(end_motif)
+
+cat("Using motifs:\n")
+print(sig_motifs)
+```
+
+
+```{r}
+# -----------------------------
+# Build wide matrix
+# -----------------------------
+df_wide <- df_freq %>%
+  filter(end_motif %in% sig_motifs) %>%
+  inner_join(meta_single, by = "id") %>%
+  select(id, metastatic_sites, end_motif, freq.corrected) %>%
+  pivot_wider(
+    names_from = end_motif,
+    values_from = freq.corrected
+  ) %>%
+  drop_na()
+
+# Feature matrix
+X <- df_wide %>%
+  select(all_of(sig_motifs)) %>%
+  as.matrix()
+
+# Scale (critical)
+X_scaled <- scale(X)
+
+meta <- df_wide %>%
+  select(id, metastatic_sites) %>%
+  mutate(metastatic_sites = factor(metastatic_sites, levels = top_sites))
+```
+
+
+```{r}
+# -----------------------------
+# PCA
+# -----------------------------
+pca <- prcomp(X_scaled, center = FALSE, scale. = FALSE)
+
+pca_df <- as_tibble(pca$x[, 1:2]) %>%
+  bind_cols(meta)
+
+var_exp <- summary(pca)$importance[2, 1:2] * 100
+
+p_pca <- ggplot(pca_df,
+                aes(PC1, PC2, color = metastatic_sites)) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  scale_color_manual(values = c(
+    brain = "#4DBBD5",
+    bone  = "#E64B35",
+    liver = "#00A087"
+  )) +
+  labs(
+    title = "PCA of significant 4-mer end motifs",
+    subtitle = paste0(
+      "PC1: ", round(var_exp[1], 1), "%, ",
+      "PC2: ", round(var_exp[2], 1), "%"
+    ),
+    x = "PC1",
+    y = "PC2"
+  ) +
+  theme_classic(base_size = 13)
+
+ggsave(file.path(outdir, "PCA_4mer_significant.png"),
+       p_pca, width = 6, height = 5, dpi = 300)
+```
+
+
+```{r}
+# -----------------------------
+# UMAP
+# -----------------------------
+set.seed(123)
+
+umap_emb <- umap(
+  X_scaled,
+  n_neighbors = 15,
+  min_dist = 0.3,
+  metric = "euclidean"
+)
+
+umap_df <- as_tibble(umap_emb) %>%
+  setNames(c("UMAP1", "UMAP2")) %>%
+  bind_cols(meta)
+
+p_umap <- ggplot(umap_df,
+                 aes(UMAP1, UMAP2, color = metastatic_sites)) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  scale_color_manual(values = c(
+    brain = "#4DBBD5",
+    bone  = "#E64B35",
+    liver = "#00A087"
+  )) +
+  labs(
+    title = "UMAP of significant 4-mer end motifs",
+    subtitle = "Non-linear embedding of GC-corrected motif frequencies"
+  ) +
+  theme_classic(base_size = 13)
+
+ggsave(file.path(outdir, "UMAP_4mer_significant.png"),
+       p_umap, width = 6, height = 5, dpi = 300)
+
+cat("Saved PCA and UMAP to:\n", outdir, "\n")
+
+```
+```{r}
+library(Rtsne)
+# -----------------------------
+# t-SNE
+# -----------------------------
+set.seed(123)
+
+# t-SNE perplexity must be < (n_samples - 1)/3
+n_samp <- nrow(X_scaled)
+perp <- min(30, floor((n_samp - 1) / 3))
+perp <- max(perp, 5)   # keep reasonable minimum
+
+tsne_out <- Rtsne(
+  X_scaled,
+  dims = 2,
+  perplexity = perp,
+  pca = FALSE,         # we already scaled; skip internal PCA
+  check_duplicates = FALSE,
+  verbose = TRUE
+)
+
+tsne_df <- as_tibble(tsne_out$Y) %>%
+  setNames(c("tSNE1", "tSNE2")) %>%
+  bind_cols(meta)
+
+p_tsne <- ggplot(tsne_df, aes(tSNE1, tSNE2, color = metastatic_sites)) +
+  geom_point(size = 2.5, alpha = 0.8) +
+  scale_color_manual(values = c(
+    brain = "#4DBBD5",
+    bone  = "#E64B35",
+    liver = "#00A087"
+  )) +
+  labs(
+    title = "t-SNE of significant 4-mer end motifs",
+    subtitle = paste0("Perplexity = ", perp, " (GC-corrected motif frequencies)")
+  ) +
+  theme_classic(base_size = 13)
+
+print(p_tsne)
+
+ggsave(file.path(outdir, "tSNE_4mer_significant.png"),
+       p_tsne, width = 6, height = 5, dpi = 300)
+
+ggsave(file.path(outdir, "tSNE_4mer_significant.pdf"),
+       p_tsne, width = 6, height = 5)
+
+```
+
