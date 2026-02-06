@@ -113,38 +113,18 @@ diff -q \
 
 Remove bins overlapping genomic blacklists, compute GC content per bin, and apply LOESS correction per sample to reduce GC bias before calculating fragmentation ratios.
 
-```bash
+```text
 # (A) Drop blacklist-overlapping bins
-# Input: hg38.100kb.bed
-# Output: hg38.100kb.noblacklist.bed
-# NOTE: replace BLACKLIST path with the lab standard (hg38 blacklist BED)
+# SHORT_IN : short_rawdata_countreadsperbin.tsv;
+# LONG_IN : long_rawdata_countreadsperbin.tsv
+# BLACKLIST: hg38-blacklist.v2.bed
+# Output: *.blacklistFiltered.tsv
 
-module load bedtools/2.31.1
-
-BINS="hg38.100kb.bed"
-BLACKLIST="/ix1/alee/LO_LAB/References/hg38/hg38.blacklist.bed"
-OUT_BINS="hg38.100kb.noblacklist.bed"
-
-bedtools intersect -a "$BINS" -b "$BLACKLIST" -v > "$OUT_BINS"
-echo "Wrote: $OUT_BINS"
-```
-```bash
 # (B) Compute GC content per bin
 # Input: OUT_BINS + reference FASTA
 # Output: hg38.100kb.noblacklist.gc.tsv
-```bash
-module load bedtools/2.31.1
 
-HG38_FA="/ix1/alee/LO_LAB/References/hg38/hg38.fa"
-GC_TSV="hg38.100kb.noblacklist.gc.tsv"
-
-bedtools nuc -fi "$HG38_FA" -bed "$OUT_BINS" \
-  | awk 'BEGIN{OFS="\t"} NR==1{print "chr","start","end","GC"} NR>1{print $1,$2,$3,$5}' \
-  > "$GC_TSV"
-echo "Wrote: $GC_TSV"
-```
 # (C) LOESS GC correction (per sample)
-```text
 # Apply LOESS correction to short and long count matrices using GC per bin.
 # Output examples:
 short.gc_corrected.tsv
