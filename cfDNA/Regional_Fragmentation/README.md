@@ -213,8 +213,8 @@ Quantify site-specific fragmentation differences per bin using effect size, rath
 ## Step 9 — Gene annotation of significant fragmentation bins
 
 Annotate BH-significant fragmentation bins with overlapping genes to enable biological interpretation and downstream enrichment analyses.
-  Make a BED of BH-significant bins
-  Intersect those bins with a gene annotation BED to get overlapping gene names
+  - Make a BED of BH-significant bins
+  - Intersect those bins with a gene annotation BED to get overlapping gene names
 
 ```bash
 module load bedtools/2.31.1
