@@ -1,0 +1,130 @@
+---
+title: "Diversity_50"
+output: html_document
+date: "2026-01-23"
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(rstatix)
+  library(ggpubr)
+})
+freq_rds <- "/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/Broad/NST/End_motif/motif_analysis_no_annot/endmotif_4bp_freq_per_sample_ATGC_only.rds"
+
+meta_single_csv <- "/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/Broad/NST/End_motif/metastasis_site_summary/metastasis_single_site_combinations.csv"
+
+outdir <- "/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/Broad/NST/End_motif/diversity_50"
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+top_sites <- c("brain", "bone", "liver")
+TOP_K <- 50
+
+```
+
+```{r}
+df_freq <- readRDS(freq_rds)
+
+meta_single <- read_csv(meta_single_csv, show_col_types = FALSE) %>%
+  mutate(
+    id = str_trim(id),
+    metastatic_sites = str_to_lower(str_trim(metastatic_sites))
+  ) %>%
+  filter(metastatic_sites %in% top_sites)
+
+```
+
+```{r}
+df_site <- df_freq %>%
+  inner_join(meta_single, by = "id") %>%
+  mutate(
+    metastatic_sites = factor(metastatic_sites, levels = top_sites),
+    end_motif = toupper(str_trim(end_motif))
+  ) %>%
+  filter(!grepl("[^ATGC]", end_motif)) %>%     # ATGC-only
+  filter(is.finite(freq.corrected))            # drop NA / Inf
+df_site %>%
+  distinct(id, metastatic_sites) %>%
+  count(metastatic_sites)
+
+```
+```{r}
+shannon_entropy <- function(p) {
+  p <- p[p > 0]
+  -sum(p * log(p))
+}
+```
+
+
+```{r}
+div50_df <- df_site %>%
+  group_by(id, metastatic_sites) %>%
+  arrange(desc(freq.corrected), .by_group = TRUE) %>%
+  slice_head(n = TOP_K) %>%                     # top 50 motifs
+  summarise(
+    diversity_50 = shannon_entropy(freq.corrected / sum(freq.corrected)),
+    .groups = "drop"
+  )
+
+```
+
+```{r}
+write_csv(div50_df, file.path(outdir, "diversity50_per_sample.csv"))
+
+# Global test (KW)
+res_kw <- kruskal_test(div50_df, diversity_50 ~ metastatic_sites)
+res_kw
+
+# Pairwise Wilcoxon
+res_pairwise <- div50_df %>%
+  wilcox_test(diversity_50 ~ metastatic_sites) %>%
+  adjust_pvalue(method = "BH") %>%
+  add_significance("p.adj")
+
+write_csv(res_pairwise, file.path(outdir, "diversity50_pairwise_wilcox.csv"))
+
+```
+```{r}
+site_cols <- c(
+  brain = "#4DBBD5",
+  bone  = "#E64B35",
+  liver = "#00A087"
+)
+
+p <- ggplot(div50_df,
+            aes(x = metastatic_sites,
+                y = diversity_50,
+                fill = metastatic_sites)) +
+  geom_boxplot(width = 0.6, outlier.shape = NA, alpha = 0.85) +
+  geom_jitter(width = 0.15, size = 1.2, alpha = 0.6, color = "black") +
+  scale_fill_manual(values = site_cols) +
+  labs(
+    x = "Metastatic site (single-site only)",
+    y = "Diversity-50 (Shannon entropy)",
+    title = "cfDNA end-motif diversity across metastatic sites",
+    subtitle = "Shannon entropy of top 50 most abundant 4-mer end motifs"
+  ) +
+  theme_classic(base_size = 13) +
+  theme(legend.position = "none")
+
+# Add global KW p-value
+p <- p + annotate(
+  "text",
+  x = 2,
+  y = max(div50_df$diversity_50) * 1.05,
+  label = paste0("KW p = ", signif(res_kw$p, 3)),
+  size = 4
+)
+
+print(p)
+
+```
+```{r}
+ggsave(file.path(outdir, "boxplot_diversity50_by_site.png"),
+       p, width = 7, height = 5, dpi = 300)
+
+ggsave(file.path(outdir, "boxplot_diversity50_by_site.pdf"),
+       p, width = 7, height = 5)
+
+```
+
