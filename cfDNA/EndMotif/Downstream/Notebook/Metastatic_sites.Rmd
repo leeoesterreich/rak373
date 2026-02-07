@@ -1,0 +1,172 @@
+---
+title: "Metastatic_sites"
+output: html_document
+date: "2025-12-19"
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)
+})
+
+# -----------------------------
+# Paths
+# -----------------------------
+meta_path <- "/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/Broad/NST/End_motif/Metastasis.csv"
+outdir    <- "/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/Broad/NST/End_motif/metastasis_site_summary"
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+# -----------------------------
+# Read metadata
+# -----------------------------
+meta <- read_csv(meta_path, show_col_types = FALSE)
+
+# Remove duplicated header rows if present
+meta <- meta %>%
+  filter(`Sample ID (TP number)` != "Sample ID (TP number)")
+
+# Rename columns for convenience
+meta <- meta %>%
+  rename(
+    id = `Sample ID (TP number)`,
+    ER_Status = `ER Status`,
+    HER2_Status = `HER-2 Status`,
+    metastatic_sites = Metastatic_sites
+  )
+
+```
+```{r}
+# -----------------------------
+# Clean sample IDs and site strings
+# -----------------------------
+meta <- meta %>%
+  mutate(
+    id = str_trim(id),
+    # remove trailing annotations like "(8)"
+    id = str_remove(id, "\\s*\\(.*\\)$"),
+
+    metastatic_sites = as.character(metastatic_sites),
+    metastatic_sites = str_trim(metastatic_sites),
+
+    # Normalize separators:
+    # "bone and liver" -> "bone, liver"
+    metastatic_sites = str_replace_all(metastatic_sites, "\\s+and\\s+", ", "),
+
+    # Normalize comma spacing: "LN,bone" -> "LN, bone"
+    metastatic_sites = str_replace_all(metastatic_sites, "\\s*,\\s*", ", "),
+
+    # Collapse multiple spaces
+    metastatic_sites = str_squish(metastatic_sites),
+
+    # Optional: standardize case
+    metastatic_sites = str_to_lower(metastatic_sites)
+  )
+
+```
+```{r}
+# -----------------------------
+# Expand to long format (one row per id x site)
+# -----------------------------
+meta_long <- meta %>%
+  separate_rows(metastatic_sites, sep = ",\\s*") %>%
+  mutate(
+    metastatic_sites = str_trim(metastatic_sites),
+    metastatic_sites = str_squish(metastatic_sites)
+  ) %>%
+  filter(!is.na(metastatic_sites), metastatic_sites != "")
+
+# -----------------------------
+# Summary: unique site types, top/least sites
+# -----------------------------
+n_sites <- n_distinct(meta_long$metastatic_sites)
+
+top_sites <- meta_long %>%
+  count(metastatic_sites, sort = TRUE) %>%
+  slice_head(n = 5)
+
+least_sites <- meta_long %>%
+  count(metastatic_sites) %>%
+  arrange(n) %>%
+  slice_head(n = 5)
+```
+```{r}
+# -----------------------------
+# Single-site vs multi-site samples
+# -----------------------------
+site_counts_per_sample <- meta_long %>%
+  group_by(id) %>%
+  summarise(n_sites = n_distinct(metastatic_sites), .groups = "drop")
+
+n_single <- sum(site_counts_per_sample$n_sites == 1)
+n_multi  <- sum(site_counts_per_sample$n_sites > 1)
+
+# List ids
+single_site_ids <- site_counts_per_sample %>%
+  filter(n_sites == 1) %>%
+  pull(id)
+
+multi_site_ids <- site_counts_per_sample %>%
+  filter(n_sites > 1) %>%
+  pull(id)
+
+
+# Single-site combinations table
+metastasis_single_site_combinations <- meta_long %>%
+  group_by(id) %>%
+  filter(n_distinct(metastatic_sites) == 1) %>%
+  ungroup() %>%
+  distinct(id, metastatic_sites)
+
+# Multi-site combinations (useful to inspect)
+multi_site_table <- meta_long %>%
+  group_by(id) %>%
+  summarise(
+    n_sites = n_distinct(metastatic_sites),
+    sites = paste(sort(unique(metastatic_sites)), collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  filter(n_sites > 1) %>%
+  arrange(desc(n_sites), id)
+```
+```{r}
+# -----------------------------
+# Print key results
+# -----------------------------
+message("Unique metastatic site types: ", n_sites)
+message("Samples with 1 site: ", n_single)
+message("Samples with >1 site: ", n_multi)
+
+message("\nTop 5 sites:")
+print(top_sites)
+
+message("\nLeast 5 sites:")
+print(least_sites)
+
+message("\nDistribution of n_sites per sample:")
+print(site_counts_per_sample %>% count(n_sites, sort = TRUE))
+```
+
+```{r}
+# -----------------------------
+# Save outputs for downstream work
+# -----------------------------
+write_csv(meta, file.path(outdir, "metastasis_meta_clean_wide.csv"))
+write_csv(site_counts_per_sample, file.path(outdir, "metastasis_n_sites_per_sample.csv"))
+write_csv(metastasis_single_site_combinations, file.path(outdir, "metastasis_single_site_combinations.csv"))
+write_csv(multi_site_table, file.path(outdir, "metastasis_multi_site_combinations.csv"))
+
+message("\nWrote cleaned metadata + summaries to: ", outdir)
+
+```
+```{r}
+ggplot(top_sites, aes(x = reorder(metastatic_sites, n), y = n)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    x = "Metastatic site",
+    y = "Number of samples",
+    title = "Top 5 metastatic sites"
+  )
+```
+
+
