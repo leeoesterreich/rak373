@@ -190,8 +190,8 @@ Quantify site-specific fragmentation differences per bin using effect size, rath
 ```bash
 # Input:
 #   short_long_ratio.cnv_neutral_universe50.csv
-#   sample metadata with metastatic site labels (e.g., liver, brain, bone)
-#
+#   sample metadata with metastatic site labels (id,metastatic_sites)
+#   
 # Analysis logic:
 #   - For each bin, compare fragmentation ratios across metastatic sites
 #   - Perform Kruskal–Wallis (KW) test per bin
