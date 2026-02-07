@@ -1,0 +1,210 @@
+---
+title: "Shannon_entropy_ATGC_only"
+output: html_document
+date: "2025-12-21"
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(rstatix)
+})
+
+# -----------------------------
+# Load data
+# -----------------------------
+df_freq <- readRDS(
+  "/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/Broad/NST/End_motif/motif_analysis_no_annot/endmotif_4bp_freq_per_sample_ATGC_only.rds"
+)
+
+meta_single <- read_csv(
+  "/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/Broad/NST/End_motif/metastasis_site_summary/metastasis_single_site_combinations.csv",
+  show_col_types = FALSE
+) %>%
+  mutate(
+    id = str_trim(id),
+    metastatic_sites = str_to_lower(str_trim(metastatic_sites))
+  )
+
+top_sites <- c("liver", "brain", "bone")
+
+df_site_top <- df_freq %>%
+  inner_join(meta_single, by = "id") %>%
+  mutate(
+    metastatic_sites = str_to_lower(str_trim(metastatic_sites)),
+    end_motif = toupper(str_trim(end_motif))
+  ) %>%
+  filter(metastatic_sites %in% top_sites)
+
+# -----------------------------
+# ATGC-only filter (remove IUPAC/degenerate codes)
+# -----------------------------
+df_site_top_atgc <- df_site_top %>%
+  filter(!grepl("[^ATGC]", end_motif))
+
+message("Samples (top sites): ", n_distinct(df_site_top_atgc$id))
+message("Unique motifs (ATGC-only): ", n_distinct(df_site_top_atgc$end_motif))
+```
+```{r}
+# -----------------------------
+
+# Shannon entropy per sample (ATGC-only)
+
+# -----------------------------
+
+entropy_df <- df_site_top_atgc %>%
+  group_by(id) %>%
+  summarise(
+    metastatic_sites = first(metastatic_sites),
+
+    # entropy on valid probabilities
+    entropy = {
+      p <- freq.corrected
+      p <- p[is.finite(p) & !is.na(p) & p > 0]
+      -sum(p * log(p))
+    },
+
+    sum_p = sum(freq.corrected, na.rm = TRUE),
+    n_motifs = n_distinct(end_motif),
+    n_rows = n(),   # should match n_motifs if one row per motif
+    .groups = "drop"
+  )
+
+message("Samples: ", n_distinct(entropy_df$id))
+print(summary(entropy_df$entropy))
+print(summary(entropy_df$sum_p))
+print(summary(entropy_df$n_motifs))
+print(summary(entropy_df$n_rows))
+
+```
+
+```{r}
+# -----------------------------
+
+# Compare entropy across sites
+
+# -----------------------------
+
+res_entropy_kw <- kruskal_test(entropy ~ metastatic_sites, data = entropy_df)
+print(res_entropy_kw)
+
+# Effect size for entropy difference
+
+res_entropy_eff <- kruskal_effsize(entropy ~ metastatic_sites, data = entropy_df)
+print(res_entropy_eff)
+
+# Optional: pairwise (shown for completeness; interpret cautiously if KW not significant)
+
+res_entropy_pairwise <- entropy_df %>%
+wilcox_test(entropy ~ metastatic_sites) %>%
+adjust_pvalue(method = "BH") %>%
+arrange(p.adj)
+print(res_entropy_pairwise)
+
+```
+```{r}
+# -----------------------------
+
+# Save outputs
+
+# -----------------------------
+
+outdir <- "/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/Broad/NST/End_motif/metastasis_motif_results_single_site_top3/ATGC_only"
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+write_csv(entropy_df, file.path(outdir, "entropy_per_sample_top_sites_ATGC.csv"))
+write_csv(as.data.frame(res_entropy_kw), file.path(outdir, "entropy_kw_top_sites_ATGC.csv"))
+write_csv(as.data.frame(res_entropy_eff), file.path(outdir, "entropy_effsize_top_sites_ATGC.csv"))
+write_csv(as.data.frame(res_entropy_pairwise), file.path(outdir, "entropy_pairwise_wilcox_top_sites_ATGC.csv"))
+
+message("Saved entropy tables to: ", outdir)
+
+```
+```{r}
+suppressPackageStartupMessages({
+library(ggplot2)
+library(dplyr)
+})
+
+# -------------------------------------------------
+
+# Plot outputs
+
+# -------------------------------------------------
+
+figdir <- "/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/Broad/NST/End_motif/figures_entropy/results_ATGC_only"
+dir.create(figdir, recursive = TRUE, showWarnings = FALSE)
+
+# -------------------------------------------------
+
+# Order sites by median RAW entropy (fixed order)
+
+# -------------------------------------------------
+
+site_order <- entropy_df %>%
+group_by(metastatic_sites) %>%
+summarise(med_entropy = median(entropy), .groups = "drop") %>%
+arrange(med_entropy) %>%
+pull(metastatic_sites)
+
+entropy_df <- entropy_df %>%
+mutate(metastatic_sites = factor(metastatic_sites, levels = site_order))
+
+# -------------------------------------------------
+
+# RAW SHANNON ENTROPY PLOT
+
+# -------------------------------------------------
+
+p_entropy_raw <- ggplot(entropy_df, aes(x = metastatic_sites, y = entropy)) +
+geom_violin(trim = FALSE, fill = "grey85", color = "grey40") +
+geom_boxplot(width = 0.15, outlier.shape = NA, fill = "white") +
+geom_jitter(width = 0.15, alpha = 0.6, size = 1.2) +
+labs(
+x = "Metastatic site",
+y = "Shannon entropy (ATGC 4-mer end motifs)",
+title = "Global end-motif diversity (ATGC-only)"
+) +
+theme_classic(base_size = 13)
+
+ggsave(
+filename = file.path(figdir, "entropy_raw_violin_ATGC.png"),
+plot = p_entropy_raw, width = 6, height = 4.5, dpi = 300
+)
+ggsave(
+filename = file.path(figdir, "entropy_raw_violin_ATGC.pdf"),
+plot = p_entropy_raw, width = 6, height = 4.5
+)
+
+# -------------------------------------------------
+
+# NORMALIZED SHANNON ENTROPY
+
+# -------------------------------------------------
+
+entropy_df <- entropy_df %>%
+mutate(entropy_norm = entropy / log(n_motifs))  # log base matches entropy calc (natural log)
+
+p_entropy_norm <- ggplot(entropy_df, aes(x = metastatic_sites, y = entropy_norm)) +
+geom_violin(trim = FALSE, fill = "grey85", color = "grey40") +
+geom_boxplot(width = 0.15, outlier.shape = NA, fill = "white") +
+geom_jitter(width = 0.15, alpha = 0.6, size = 1.2) +
+labs(
+x = "Metastatic site",
+y = "Normalized Shannon entropy",
+title = "Normalized end-motif diversity (ATGC-only)"
+) +
+theme_classic(base_size = 13)
+
+ggsave(
+filename = file.path(figdir, "entropy_normalized_violin_ATGC.png"),
+plot = p_entropy_norm, width = 6, height = 4.5, dpi = 300
+)
+ggsave(
+filename = file.path(figdir, "entropy_normalized_violin_ATGC.pdf"),
+plot = p_entropy_norm, width = 6, height = 4.5
+)
+
+message("Saved entropy figures to: ", figdir)
+
+```
