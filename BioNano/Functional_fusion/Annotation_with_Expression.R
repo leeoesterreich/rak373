@@ -54,20 +54,10 @@ expr_data <- read_csv("/ix1/alee/LO_LAB/Personal/Rahul/BioNano/pILC/pILC_log2cpm
 
 # Keep Ensembl as reference, use gene names as rownames
 expr_data_clean <- expr_data |>
-  filter(!is.na(external_gene_name) & external_gene_name != "") |>  # optional
-  distinct(external_gene_name, .keep_all = TRUE) |>                 # drop duplicates if any
-  column_to_rownames(var = "external_gene_name") |>
-  select(-ensembl_gene_id)
-
-# If above command gives error like : Error: unable to find an inherited method for function â€˜selectâ€™ for signature â€˜x = "data.frame"â€™
-# then replace this block with the below command and the rest will be same
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-expr_data_clean <- expr_data |>                                           
-  dplyr::filter(!is.na(external_gene_name) & external_gene_name != "") |>
-  dplyr::distinct(external_gene_name, .keep_all = TRUE) |>
-  dplyr::select(-ensembl_gene_id) |>
-  tibble::column_to_rownames(var = "external_gene_name")
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  dplyr::filter(!is.na(external_gene_name) & external_gene_name != "") |>  # optional
+  dplyr::distinct(external_gene_name, .keep_all = TRUE) |>                 # drop duplicates if any
+  tibble::column_to_rownames(var = "external_gene_name") |>
+  dplyr::select(-ensembl_gene_id)
  
 # Just to check the matrix of gene expression
 expr_data_clean["TSPAN6", ] #Expression of "TSPAN6" across samples
@@ -173,6 +163,7 @@ write.csv(
 )
 
 ##### chromosomal enrichment analysis #####
+# Use all the SVs in the background, not restricted to fusion ("PutativeGeneFusion")
 
 # Total expression-relevant fusions involving each chromosome
 chr_focus <- c("chr1", "chr8", "chr11", "chr17")
@@ -185,7 +176,7 @@ fusion_chr_counts <- table(
 )
 fusion_chr_counts
 
-# Compare to Background (All fusions)
+# Compare to Background (All SVs)
 all_chr_counts <- table(
   c(
     fusion_df$chrA[fusion_df$chrA %in% chr_focus],
@@ -234,45 +225,55 @@ results <- lapply(c("chr1", "chr8", "chr11", "chr17"), function(chr) {
 }) |> bind_rows()
 print(results)
 
-# Save a Summary Table and create Plot
- 
+# Save a Summary Table and create a Plot
+results <- results %>%
+  mutate(sig_label = case_when(
+    p_value < 0.001 ~ "***",
+    p_value < 0.01  ~ "**",
+    p_value < 0.05  ~ "*",
+    TRUE            ~ ""
+  ),
+  label_y = upper_CI + 0.3)   # offset above error bar
+
 chr_fusion_enrichment_plot <- ggplot(results, aes(x = chromosome, y = odds_ratio)) +
   geom_bar(stat = "identity", fill = "steelblue") +
-  geom_errorbar(
-    aes(ymin = lower_CI, ymax = upper_CI),
-    width = 0.2
-  ) +
+  geom_errorbar(aes(ymin = lower_CI, ymax = upper_CI), width = 0.2) +
+  geom_text(aes(y = label_y, label = sig_label), vjust = 0) +   # use adjusted label position
   labs(
     title = "Odds Ratio of Expression-Relevant Fusions by Chromosome",
     y = "Odds Ratio (Fisher Test)",
     x = "Chromosome"
   ) +
   scale_y_continuous(
-    expand = c(0, 0),
-    breaks = function(x) {
-      b <- pretty(x)
-      b[b != 0]  # drop 0 tick & label only
-    }
+    expand = expansion(mult = c(0, 0.15))  # give extra space at top for labels
   ) +
-  theme_classic() +
+  theme_classic(base_size = 16) +
   theme(
     axis.line = element_line(color = "black"),
-    axis.ticks = element_line(color = "black")
+    axis.ticks = element_line(color = "black"),
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+    axis.text = element_text(size = 16),
+    axis.title = element_text(size = 16)
   )
-
 # Save the summary table
 write.csv(
   results,
-  file = "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Functional_Fusion/chr_fusion_enrichment_summary.csv",
+  file = "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Functional_Fusion/chr_fusion_enrichment_summary_Tumor.csv",
   row.names = FALSE
 )
 
 # Save the plot
 ggsave(
-  filename = "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Functional_Fusion/chr_fusion_enrichment_plot.png",
+  filename = "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Functional_Fusion/chr_fusion_enrichment_plot_Tumor.png",
   plot = chr_fusion_enrichment_plot,
   width = 8,
   height = 5,
   dpi = 300
 )
-
+# Save PDF
+ggsave(
+  filename = "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Functional_Fusion/chr_fusion_enrichment_plot_Tumor.pdf",
+  plot = chr_fusion_enrichment_plot,
+  width = 8,
+  height = 5
+)
