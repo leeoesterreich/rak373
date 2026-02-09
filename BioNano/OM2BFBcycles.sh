@@ -1,5 +1,5 @@
 #!/bin/bash
-# This script is used to Analyze Breakage Fusion Bridge (BFB)
+# This script is used to analyze Breakage Fusion Bridge (BFB) event
 
 #SBATCH --job-name=BFB
 #SBATCH --mem=128GB
