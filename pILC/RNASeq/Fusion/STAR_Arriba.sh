@@ -1,4 +1,7 @@
 #!/bin/bash
+# This script is used to run STAR to generate *.Aligned.out.bam as an input for Arriba
+# Arriba commonly uses --chimOutType WithinBAM HardClip
+
 #SBATCH --job-name=STAR_ArribaMode
 #SBATCH -N 1
 #SBATCH --cpus-per-task=16
