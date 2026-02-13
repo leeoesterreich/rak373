@@ -13,7 +13,6 @@ DB path:
 🔴 Error Observed
 
 During runtime:
-
 ```txt
 faToTwoBit: error while loading shared libraries:
 libssl.so.3: cannot open shared object file: No such file or directory
@@ -47,20 +46,18 @@ faToTwoBit produced:
 Segmentation fault (core dumped)
 ```
 Root Cause
-  Mixing host OpenSSL libraries with container glibc/loader caused ABI mismatch.
-  Injecting host system libraries into container is unsafe unless built against identical runtime.
+  - Mixing host OpenSSL libraries with container glibc/loader caused ABI mismatch.
+  - Injecting host system libraries into container is unsafe unless built against identical runtime.
 
 *Final Stable Solution*
-✔ Replace broken faToTwoBit with UCSC official binary
+- Replace broken faToTwoBit with UCSC official binary
 
 *Downloaded working UCSC binary:*
 ```bash
 mkdir -p /ix1/alee/LO_LAB/Personal/Rahul/tools/ucsc
 cd /ix1/alee/LO_LAB/Personal/Rahul/tools/ucsc
-
 wget -O faToTwoBit http://hgdownload.cse.ucsc.edu/admin/exe/linux.x86_64/faToTwoBit
 chmod +x faToTwoBit
-
 ./faToTwoBit # Check
 ```
 Works without OpenSSL dependency.
@@ -85,5 +82,3 @@ singularity exec --cleanenv \
     -p "$THREADS" \
     -Z
 ```
-
-
