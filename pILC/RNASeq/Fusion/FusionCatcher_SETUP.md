@@ -34,20 +34,13 @@ Produced:
 ```txt
 error while loading shared libraries: libssl.so.3
 ```
-
-# Root Cause
-
-The faToTwoBit binary shipped inside the FusionCatcher SIF was dynamically linked against OpenSSL 3.
-
-The container did not include libssl.so.3 / libcrypto.so.3.
-
-Attempting to bind host OpenSSL libraries resulted in:
-
-segmentation faults
-
-ABI instability
-
-Therefore, the container's faToTwoBit binary was broken for this system.
+Root Cause
+  The faToTwoBit binary shipped inside the FusionCatcher SIF was dynamically linked against OpenSSL 3.
+  The container did not include libssl.so.3 / libcrypto.so.3.
+  Attempting to bind host OpenSSL libraries resulted in:
+    segmentation faults
+    ABI instability
+  Therefore, the container's faToTwoBit binary was broken for this system.
 
 ❗ Issue 2: Segmentation Fault After Binding OpenSSL
 
@@ -61,10 +54,8 @@ faToTwoBit produced:
 Segmentation fault (core dumped)
 ```
 Root Cause
-
-Mixing host OpenSSL libraries with container glibc/loader caused ABI mismatch.
-
-Injecting host system libraries into container is unsafe unless built against identical runtime.
+  Mixing host OpenSSL libraries with container glibc/loader caused ABI mismatch.
+  Injecting host system libraries into container is unsafe unless built against identical runtime.
 
 *Final Stable Solution*
 ✔ Replace broken faToTwoBit with UCSC official binary
