@@ -1,4 +1,4 @@
-*FusionCatcher (v1.33, Singularity) – Troubleshooting & Fix Log*
+**FusionCatcher (v1.33, Singularity) – Troubleshooting & Fix Log**
 ```txt
 Environment
 FusionCatcher version: 1.33
@@ -49,7 +49,7 @@ Root Cause
   - Mixing host OpenSSL libraries with container glibc/loader caused ABI mismatch.
   - Injecting host system libraries into container is unsafe unless built against identical runtime.
 
-*Final Stable Solution*
+**Final Stable Solution**
 - Replace broken faToTwoBit with UCSC official binary
 
 *Downloaded working UCSC binary:*
