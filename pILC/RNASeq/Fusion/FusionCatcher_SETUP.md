@@ -1,18 +1,11 @@
 *FusionCatcher (v1.33, Singularity) – Troubleshooting & Fix Log*
 ```txt
 Environment
-
 FusionCatcher version: 1.33
-
-Container:
-/software/rhel9/manual/install/fusioncatcher/fusioncatcher-1.33.sif
-
+Container: /software/rhel9/manual/install/fusioncatcher/fusioncatcher-1.33.sif
 HPC: Slurm-based cluster
-
 Input: paired-end FASTQ
-
 Database: human_v102
-
 DB path:
 /ix1/alee/LO_LAB/Personal/Rahul/Reference_genome/FusionCatcher_db/current
 ```
@@ -35,12 +28,12 @@ Produced:
 error while loading shared libraries: libssl.so.3
 ```
 Root Cause
-  The faToTwoBit binary shipped inside the FusionCatcher SIF was dynamically linked against OpenSSL 3.
-  The container did not include libssl.so.3 / libcrypto.so.3.
-  Attempting to bind host OpenSSL libraries resulted in:
-    segmentation faults
-    ABI instability
-  Therefore, the container's faToTwoBit binary was broken for this system.
+  - The faToTwoBit binary shipped inside the FusionCatcher SIF was dynamically linked against OpenSSL 3.
+  - The container did not include libssl.so.3 / libcrypto.so.3.
+  - Attempting to bind host OpenSSL libraries resulted in:
+    - segmentation faults
+    - ABI instability
+  - Therefore, the container's faToTwoBit binary was broken for this system.
 
 ❗ Issue 2: Segmentation Fault After Binding OpenSSL
 
