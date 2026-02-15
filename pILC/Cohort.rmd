@@ -10,6 +10,168 @@ suppressPackageStartupMessages({
   library(readr)
   library(stringr)
   library(janitor)
+})
+
+# -------------------------
+# Input
+# -------------------------
+infile <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/Clinical_correlation/pILC_ClinicoPathological_details.csv"
+
+# -------------------------
+# Helpers
+# -------------------------
+trim_na <- function(x) {
+  x <- str_squish(as.character(x))
+  x[x %in% c("", "NA", "Na", "N/A", "na", "null", "NULL")] <- NA
+  x
+}
+
+looks_numericish <- function(x) {
+  # Accept numbers, decimals, percent signs, commas, <5, >5
+  x <- trim_na(x)
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(FALSE)
+  # if at least 70% match numeric-ish pattern, call it numeric-ish
+  pat <- "^\\s*[<>]?\\s*[-+]?[0-9]{1,3}(?:,[0-9]{3})*(?:\\.[0-9]+)?\\s*%?\\s*$"
+  mean(str_detect(x, pat)) >= 0.70
+}
+
+to_numeric_safe <- function(x, less_policy = c("as_number", "minus_epsilon")) {
+  # Converts: "60", "60%", "<5", "  Negative   " etc
+  less_policy <- match.arg(less_policy)
+  x0 <- trim_na(x)
+  if (all(is.na(x0))) return(rep(NA_real_, length(x0)))
+
+  x1 <- str_replace_all(x0, ",", "")
+  x1 <- str_replace_all(x1, "%", "")
+  if (less_policy == "as_number") {
+    x1 <- str_replace(x1, "^<\\s*", "")
+    x1 <- str_replace(x1, "^>\\s*", "")
+  } else {
+    # <5 -> 4.9 ; >5 -> 5.1 (epsilon=0.1)
+    x1 <- ifelse(str_detect(x1, "^<"),
+                 as.character(as.numeric(str_replace(x1, "^<\\s*", "")) - 0.1),
+                 x1)
+    x1 <- ifelse(str_detect(x1, "^>"),
+                 as.character(as.numeric(str_replace(x1, "^>\\s*", "")) + 0.1),
+                 x1)
+    x1 <- str_replace(x1, "^<\\s*", "")
+    x1 <- str_replace(x1, "^>\\s*", "")
+  }
+  suppressWarnings(as.numeric(x1))
+}
+
+top_levels <- function(x, n = 10) {
+  x <- trim_na(x)
+  x <- fct_explicit_na(factor(x), na_level = "Missing")
+  tab <- sort(table(x), decreasing = TRUE)
+  head(tab, n)
+}
+
+# -------------------------
+# Read
+# -------------------------
+raw <- read_csv(infile, show_col_types = FALSE)
+
+cat("\n============================\n")
+cat("RAW COLUMN NAMES (as in CSV)\n")
+cat("============================\n")
+print(names(raw))
+
+df <- raw %>%
+  clean_names() %>%
+  mutate(across(everything(), trim_na))
+
+cat("\n============================\n")
+cat("CLEANED COLUMN NAMES (after clean_names)\n")
+cat("============================\n")
+print(names(df))
+
+cat("\n============================\n")
+cat("GLIMPSE (types + preview)\n")
+cat("============================\n")
+print(glimpse(df))
+
+cat("\n============================\n")
+cat("FIRST 6 ROWS\n")
+cat("============================\n")
+print(head(df, 6))
+
+# -------------------------
+# Missingness report
+# -------------------------
+miss <- tibble(
+  column = names(df),
+  n_total = nrow(df),
+  n_missing = map_int(df, ~ sum(is.na(.x))),
+  pct_missing = round(100 * n_missing / n_total, 1)
+) %>% arrange(desc(n_missing))
+
+cat("\n============================\n")
+cat("MISSINGNESS PER COLUMN\n")
+cat("============================\n")
+print(miss)
+
+# -------------------------
+# Per-column profiling
+# -------------------------
+cat("\n============================\n")
+cat("COLUMN-BY-COLUMN PROFILE\n")
+cat("============================\n")
+
+for (cn in names(df)) {
+  x <- df[[cn]]
+  cat("\n----------------------------------\n")
+  cat("COLUMN: ", cn, "\n", sep = "")
+  cat("Class:  ", paste(class(x), collapse = ", "), "\n", sep = "")
+
+  # Show a few raw examples (including weird ones)
+  ex <- unique(trim_na(x))
+  ex <- ex[!is.na(ex)]
+  cat("Example values (up to 12): ",
+      paste(head(ex, 12), collapse = " | "),
+      "\n", sep = "")
+
+  # Decide numeric-ish vs categorical
+  if (looks_numericish(x)) {
+    xn <- to_numeric_safe(x, less_policy = "as_number")
+    cat("Detected as: NUMERIC-LIKE\n")
+    cat("Numeric summary (na.rm=TRUE):\n")
+    if (all(is.na(xn))) {
+      cat("  (all values became NA after numeric conversion)\n")
+    } else {
+      cat("  min:   ", suppressWarnings(min(xn, na.rm = TRUE)), "\n", sep = "")
+      cat("  q1:    ", suppressWarnings(quantile(xn, 0.25, na.rm = TRUE)), "\n", sep = "")
+      cat("  median:", suppressWarnings(median(xn, na.rm = TRUE)), "\n", sep = "")
+      cat("  mean:  ", suppressWarnings(mean(xn, na.rm = TRUE)), "\n", sep = "")
+      cat("  q3:    ", suppressWarnings(quantile(xn, 0.75, na.rm = TRUE)), "\n", sep = "")
+      cat("  max:   ", suppressWarnings(max(xn, na.rm = TRUE)), "\n", sep = "")
+    }
+
+    # Count how many have "<" or ">" patterns
+    lt <- sum(str_detect(trim_na(x), "^<"), na.rm = TRUE)
+    gt <- sum(str_detect(trim_na(x), "^>"), na.rm = TRUE)
+    if (lt + gt > 0) {
+      cat("Special values detected: ",
+          ifelse(lt > 0, paste0(lt, " with '<'"), ""),
+          ifelse(gt > 0, paste0("  ", gt, " with '>'"), ""),
+          "\n", sep = "")
+    }
+  } else {
+    cat("Detected as: CATEGORICAL / TEXT\n")
+    cat("Top levels (up to 10):\n")
+    print(top_levels(x, n = 10))
+  }
+}
+
+cat("\n============================\n")
+```
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(readr)
+  library(stringr)
+  library(janitor)
   library(forcats)
   library(patchwork)
 })
@@ -80,7 +242,7 @@ clean_status <- function(x) {
 }
 
 # -------------------------
-# Read + standardize
+# Read 
 # -------------------------
 df <- read_csv(infile, show_col_types = FALSE) %>%
   clean_names() %>%
@@ -90,9 +252,7 @@ df2 <- df %>%
   transmute(
     sample = sample,
 
-    age_dx   = parse_numeric_mixed(age_at_diagnosis),
-    age_meno = parse_numeric_mixed(age_at_menopause),
-
+    age_dx = parse_numeric_mixed(age_at_diagnosis),
     tumor_cellularity = parse_numeric_mixed(tumor_cellularity_percent),
     pleomorphic_cellularity = parse_numeric_mixed(pleomorphic_invasive_compoent_cellularity_percent),
     tils = parse_numeric_mixed(ti_ls_percent),  # NOTE: your column is ti_ls_percent
@@ -104,7 +264,6 @@ df2 <- df %>%
   ) %>%
   mutate(
     grade = factor(grade),
-    # avoid warnings if some grades are absent (e.g., Grade I)
     grade = fct_relevel(
       grade,
       intersect(
@@ -121,21 +280,27 @@ df2 <- df %>%
 # Long formats
 # -------------------------
 num_long <- df2 %>%
-  select(sample, age_dx, age_meno, tumor_cellularity, pleomorphic_cellularity, tils) %>%
+  select(sample, age_dx, tumor_cellularity, pleomorphic_cellularity, tils) %>%
   pivot_longer(-sample, names_to = "feature", values_to = "value") %>%
   mutate(
     feature = recode(feature,
       age_dx = "Age at diagnosis",
-      age_meno = "Age at menopause",
       tumor_cellularity = "Tumor cellularity (%)",
       pleomorphic_cellularity = "Pleomorphic component (%)",
       tils = "TILs (%)"
     ),
     feature = factor(feature, levels = c(
-      "Tumor cellularity (%)", "TILs (%)", "Pleomorphic component (%)",
-      "Age at menopause", "Age at diagnosis"
+      "Tumor cellularity (%)", "TILs (%)", "Pleomorphic component (%)", "Age at diagnosis"
     ))
   )
+
+# Build labels like "Feature\n(n=XX)" (non-NA values)
+num_n <- num_long %>%
+  group_by(feature) %>%
+  summarise(n_available = sum(!is.na(value)), .groups = "drop") %>%
+  mutate(feature_label = paste0(as.character(feature), "\n(n=", n_available, ")"))
+
+num_label_map <- setNames(num_n$feature_label, as.character(num_n$feature))
 
 cat_long <- df2 %>%
   select(sample, grade, her2, er, pr) %>%
@@ -156,7 +321,6 @@ cat_long <- df2 %>%
 # -------------------------
 num_colors <- c(
   "Age at diagnosis" = "#1b9e77",
-  "Age at menopause" = "#66a61e",
   "Tumor cellularity (%)" = "#7570b3",
   "Pleomorphic component (%)" = "#e7298a",
   "TILs (%)" = "#d95f02"
@@ -192,6 +356,7 @@ p_num <- ggplot(num_long, aes(x = feature, y = value, fill = feature, color = fe
   geom_boxplot(outlier.shape = NA, alpha = 0.45, linewidth = 0.6) +
   geom_jitter(width = 0.15, height = 0, alpha = 0.65, size = 1.6) +
   coord_flip() +
+  scale_x_discrete(labels = num_label_map) +
   scale_fill_manual(values = num_colors) +
   scale_color_manual(values = num_colors) +
   theme_bw(base_size = 12) +
@@ -203,7 +368,7 @@ p_num <- ggplot(num_long, aes(x = feature, y = value, fill = feature, color = fe
   labs(x = NULL, y = NULL)
 
 # -------------------------
-# Categorical panel
+# Categorical panel (bar plots + n labels)
 # -------------------------
 cat_counts <- cat_long %>%
   count(feature, value, name = "n")
@@ -220,7 +385,7 @@ p_cat <- ggplot(cat_counts, aes(x = value, y = n, fill = feature)) +
   scale_fill_manual(values = cat_colors) +
   scale_y_continuous(
     breaks = seq(0, ymax, 10),
-    limits = c(0, ymax + 3)  # headroom so labels don't get clipped
+    limits = c(0, ymax + 3)
   ) +
   theme_bw(base_size = 12) +
   theme(
