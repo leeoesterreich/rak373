@@ -1,5 +1,5 @@
 ---
-title: "ClinicoPathological_details"
+title: "ClinicoPathological"
 output: html_document
 date: "2026-02-15"
 ---
@@ -165,7 +165,10 @@ for (cn in names(df)) {
 }
 
 cat("\n============================\n")
+
 ```
+
+
 ```{r}
 suppressPackageStartupMessages({
   library(tidyverse)
@@ -242,7 +245,7 @@ clean_status <- function(x) {
 }
 
 # -------------------------
-# Read 
+# Read + standardize
 # -------------------------
 df <- read_csv(infile, show_col_types = FALSE) %>%
   clean_names() %>%
@@ -334,7 +337,7 @@ cat_colors <- c(
 )
 
 # -------------------------
-# Theme
+# Theme: no grid + high-contrast black text/strips
 # -------------------------
 theme_publication <- theme(
   panel.grid.major = element_blank(),
@@ -405,5 +408,6 @@ fig1 <- p_num / p_cat + plot_layout(heights = c(2.2, 1))
 ggsave("Figure1_pILC_CohortOverview_facets.png", fig1, width = 12, height = 8, dpi = 300)
 ggsave("Figure1_pILC_CohortOverview_facets.pdf", fig1, width = 12, height = 8)
 
-fig1 
+fig1
+
 ```
