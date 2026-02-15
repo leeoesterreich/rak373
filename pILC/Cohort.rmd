@@ -405,5 +405,5 @@ fig1 <- p_num / p_cat + plot_layout(heights = c(2.2, 1))
 ggsave("Figure1_pILC_CohortOverview_facets.png", fig1, width = 12, height = 8, dpi = 300)
 ggsave("Figure1_pILC_CohortOverview_facets.pdf", fig1, width = 12, height = 8)
 
-fig1
+fig1 
 ```
