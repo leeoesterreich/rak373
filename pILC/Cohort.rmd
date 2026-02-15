@@ -1,0 +1,244 @@
+---
+title: "ClinicoPathological_details"
+output: html_document
+date: "2026-02-15"
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(readr)
+  library(stringr)
+  library(janitor)
+  library(forcats)
+  library(patchwork)
+})
+
+# -------------------------
+# Input
+# -------------------------
+infile <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/Clinical_correlation/pILC_ClinicoPathological_details.csv"
+
+# -------------------------
+# Helpers
+# -------------------------
+trim_na <- function(x) {
+  x <- str_squish(as.character(x))
+  x[x %in% c("", "NA", "Na", "N/A", "na", "null", "NULL")] <- NA
+  x
+}
+
+# Parse numeric-like values:
+# - "60", "60%" -> 60
+# - "<5" -> 4.9   (epsilon = 0.1)
+# - "<10" -> 9.9
+# - "5~10" -> 7.5 (midpoint)
+# - "5-10" -> 7.5 (midpoint)
+parse_numeric_mixed <- function(x, epsilon = 0.1) {
+  x0 <- trim_na(x)
+  y <- str_replace_all(x0, ",", "")
+  y <- str_replace_all(y, "%", "")
+  y <- str_squish(y)
+
+  # range pattern: "5~10" or "5-10"
+  is_range <- str_detect(y, "^\\d+(?:\\.\\d+)?\\s*[~-]\\s*\\d+(?:\\.\\d+)?$")
+  is_range[is.na(is_range)] <- FALSE
+  if (any(is_range)) {
+    parts <- str_split(y[is_range], "\\s*[~-]\\s*")
+    mid <- map_dbl(parts, ~ mean(as.numeric(.x)))
+    y[is_range] <- as.character(mid)
+  }
+
+  # "<5" -> 4.9 ; "<10" -> 9.9
+  is_lt <- str_detect(y, "^<\\s*\\d+(?:\\.\\d+)?$")
+  is_lt[is.na(is_lt)] <- FALSE
+  if (any(is_lt)) {
+    num <- suppressWarnings(as.numeric(str_replace(y[is_lt], "^<\\s*", "")))
+    y[is_lt] <- as.character(num - epsilon)
+  }
+
+  # ">5" -> 5.1 (optional)
+  is_gt <- str_detect(y, "^>\\s*\\d+(?:\\.\\d+)?$")
+  is_gt[is.na(is_gt)] <- FALSE
+  if (any(is_gt)) {
+    num <- suppressWarnings(as.numeric(str_replace(y[is_gt], "^>\\s*", "")))
+    y[is_gt] <- as.character(num + epsilon)
+  }
+
+  suppressWarnings(as.numeric(y))
+}
+
+clean_status <- function(x) {
+  x <- trim_na(x)
+  case_when(
+    is.na(x) ~ NA_character_,
+    str_detect(str_to_lower(x), "pos") ~ "Positive",
+    str_detect(str_to_lower(x), "neg") ~ "Negative",
+    str_detect(str_to_lower(x), "unknown") ~ "Unknown",
+    TRUE ~ x
+  )
+}
+
+# -------------------------
+# Read + standardize
+# -------------------------
+df <- read_csv(infile, show_col_types = FALSE) %>%
+  clean_names() %>%
+  mutate(across(everything(), trim_na))
+
+df2 <- df %>%
+  transmute(
+    sample = sample,
+
+    age_dx   = parse_numeric_mixed(age_at_diagnosis),
+    age_meno = parse_numeric_mixed(age_at_menopause),
+
+    tumor_cellularity = parse_numeric_mixed(tumor_cellularity_percent),
+    pleomorphic_cellularity = parse_numeric_mixed(pleomorphic_invasive_compoent_cellularity_percent),
+    tils = parse_numeric_mixed(ti_ls_percent),  # NOTE: your column is ti_ls_percent
+
+    grade = trim_na(grade_differentiation_desc),
+    her2  = clean_status(breast_her_2_neu_desc),
+    er    = clean_status(tumor_marker_number_1_er),
+    pr    = clean_status(tumor_marker_number_2_pr)
+  ) %>%
+  mutate(
+    grade = factor(grade),
+    # avoid warnings if some grades are absent (e.g., Grade I)
+    grade = fct_relevel(
+      grade,
+      intersect(
+        c("Grade I", "Grade II", "Grade III", "Cell type not determined"),
+        levels(grade)
+      )
+    ),
+    her2 = factor(her2, levels = c("Negative", "Positive", "Unknown")),
+    er   = factor(er,   levels = c("Positive", "Negative", "Unknown")),
+    pr   = factor(pr,   levels = c("Positive", "Negative", "Unknown"))
+  )
+
+# -------------------------
+# Long formats
+# -------------------------
+num_long <- df2 %>%
+  select(sample, age_dx, age_meno, tumor_cellularity, pleomorphic_cellularity, tils) %>%
+  pivot_longer(-sample, names_to = "feature", values_to = "value") %>%
+  mutate(
+    feature = recode(feature,
+      age_dx = "Age at diagnosis",
+      age_meno = "Age at menopause",
+      tumor_cellularity = "Tumor cellularity (%)",
+      pleomorphic_cellularity = "Pleomorphic component (%)",
+      tils = "TILs (%)"
+    ),
+    feature = factor(feature, levels = c(
+      "Tumor cellularity (%)", "TILs (%)", "Pleomorphic component (%)",
+      "Age at menopause", "Age at diagnosis"
+    ))
+  )
+
+cat_long <- df2 %>%
+  select(sample, grade, her2, er, pr) %>%
+  pivot_longer(-sample, names_to = "feature", values_to = "value") %>%
+  mutate(
+    feature = recode(feature,
+      grade = "Grade",
+      her2  = "HER2",
+      er    = "ER",
+      pr    = "PR"
+    ),
+    feature = factor(feature, levels = c("ER", "Grade", "HER2", "PR")),
+    value = fct_na_value_to_level(factor(value), level = "Missing")
+  )
+
+# -------------------------
+# Color palettes
+# -------------------------
+num_colors <- c(
+  "Age at diagnosis" = "#1b9e77",
+  "Age at menopause" = "#66a61e",
+  "Tumor cellularity (%)" = "#7570b3",
+  "Pleomorphic component (%)" = "#e7298a",
+  "TILs (%)" = "#d95f02"
+)
+
+cat_colors <- c(
+  "ER" = "#1f78b4",
+  "PR" = "#33a02c",
+  "HER2" = "#e31a1c",
+  "Grade" = "#6a3d9a"
+)
+
+# -------------------------
+# Theme
+# -------------------------
+theme_publication <- theme(
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+
+  axis.text  = element_text(color = "black", size = 11),
+  axis.title = element_text(color = "black", size = 12),
+
+  strip.text = element_text(color = "black", face = "bold", size = 12),
+  strip.background = element_rect(fill = "white", color = "black", linewidth = 0.6),
+
+  panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8)
+)
+
+# -------------------------
+# Numeric panel (boxplots + jitter)
+# -------------------------
+p_num <- ggplot(num_long, aes(x = feature, y = value, fill = feature, color = feature)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.45, linewidth = 0.6) +
+  geom_jitter(width = 0.15, height = 0, alpha = 0.65, size = 1.6) +
+  coord_flip() +
+  scale_fill_manual(values = num_colors) +
+  scale_color_manual(values = num_colors) +
+  theme_bw(base_size = 12) +
+  theme(
+    axis.title = element_blank(),
+    legend.position = "none"
+  ) +
+  theme_publication +
+  labs(x = NULL, y = NULL)
+
+# -------------------------
+# Categorical panel
+# -------------------------
+cat_counts <- cat_long %>%
+  count(feature, value, name = "n")
+
+ymax <- ceiling(max(cat_counts$n, na.rm = TRUE) / 10) * 10
+
+p_cat <- ggplot(cat_counts, aes(x = value, y = n, fill = feature)) +
+  geom_col(color = "black", linewidth = 0.2) +
+  geom_text(
+    aes(label = paste0("n=", n)),
+    vjust = -0.35, size = 3.4, color = "black", fontface = "bold"
+  ) +
+  facet_wrap(~ feature, scales = "free_x", nrow = 1) +
+  scale_fill_manual(values = cat_colors) +
+  scale_y_continuous(
+    breaks = seq(0, ymax, 10),
+    limits = c(0, ymax + 3)  # headroom so labels don't get clipped
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    axis.title = element_blank(),
+    legend.position = "none",
+    axis.text.x = element_text(angle = 30, hjust = 1, color = "black")
+  ) +
+  theme_publication +
+  labs(y = NULL, x = NULL)
+
+# -------------------------
+# Combine into Figure 1
+# -------------------------
+fig1 <- p_num / p_cat + plot_layout(heights = c(2.2, 1))
+
+# Save outputs
+ggsave("Figure1_pILC_CohortOverview_facets.png", fig1, width = 12, height = 8, dpi = 300)
+ggsave("Figure1_pILC_CohortOverview_facets.pdf", fig1, width = 12, height = 8)
+
+fig1
+```
