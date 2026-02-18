@@ -1,0 +1,128 @@
+---
+title: "RNA_Fusion_Venn"
+output: html_document
+date: "2026-02-18"
+---
+
+```{r setup, include=FALSE}
+suppressPackageStartupMessages({
+  library(data.table)
+  library(VennDiagram)
+  library(grid)
+})
+
+REPORT_ROOT <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/RNAfusion/FusionReports"
+
+ARRIBA_CALLS <- file.path(REPORT_ROOT, "arriba.calls.high_medium.tsv")
+FC_CALLS     <- file.path(REPORT_ROOT, "fusioncatcher.calls.kept.tsv")
+SF_CALLS     <- file.path(REPORT_ROOT, "starfusion.calls.filtered.tsv")
+
+OUT_PNG <- file.path(REPORT_ROOT, "venn_fusions_3callers.png")
+OUT_PDF <- file.path(REPORT_ROOT, "venn_fusions_3callers.pdf")
+
+```
+
+```{r}
+# ---- canonicalize fusion so A--B == B--A ----
+canon_fusion <- function(x) {
+  x <- trimws(as.character(x))
+  x[x == "" | is.na(x)] <- NA_character_
+  out <- vapply(x, function(f) {
+    if (is.na(f)) return(NA_character_)
+    if (!grepl("--", f, fixed = TRUE)) return(f)
+    parts <- strsplit(f, "--", fixed = TRUE)[[1]]
+    if (length(parts) < 2) return(NA_character_)
+    g1 <- trimws(parts[1]); g2 <- trimws(paste(parts[-1], collapse="--"))
+    if (g1 == "" && g2 == "") return(NA_character_)
+    if (g1 == "") return(g2)
+    if (g2 == "") return(g1)
+    paste(sort(c(g1, g2)), collapse="--")
+  }, character(1))
+  out
+}
+
+read_calls <- function(path) {
+  dt <- fread(path, sep = "\t", header = TRUE, data.table = TRUE)
+  # Expect at least: sample, caller, fusion
+  if (!("fusion" %in% names(dt))) stop("Missing column 'fusion' in: ", path)
+  dt[, fusion_canon := canon_fusion(fusion)]
+  dt <- dt[!is.na(fusion_canon) & fusion_canon != "--"]
+  unique(dt$fusion_canon)
+}
+
+arriba_set <- read_calls(ARRIBA_CALLS)
+fc_set     <- read_calls(FC_CALLS)
+sf_set     <- read_calls(SF_CALLS)
+
+venn_list <- list(
+  Arriba = arriba_set,
+  FusionCatcher = fc_set,
+  `STAR-Fusion` = sf_set
+)
+```
+
+```{r}
+# ---- quick overlap numbers ----
+cat("Set sizes:\n")
+cat("  Unique_Arriba:", length(arriba_set), "\n")
+cat("  Unique_FusionCatcher:", length(fc_set), "\n")
+cat("  Unique_STAR-Fusion:", length(sf_set), "\n\n")
+
+cat("Overlaps:\n")
+cat("  Arriba ∩ FusionCatcher:", length(intersect(arriba_set, fc_set)), "\n")
+cat("  Arriba ∩ STAR-Fusion:", length(intersect(arriba_set, sf_set)), "\n")
+cat("  FusionCatcher ∩ STAR-Fusion:", length(intersect(fc_set, sf_set)), "\n")
+cat("  All three:", length(Reduce(intersect, venn_list)), "\n\n")
+```
+```{r}
+# ---- draw venn to screen ----
+venn_plot <- venn.diagram(
+  x = venn_list,
+  filename = NULL,           # draw to current device
+  main = "Fusion overlap across callers (cohort-level)",
+  main.cex = 1.4,
+  fill = c("#1b9e77", "#F8766D", "#00BFC4"),
+  alpha = 0.5,
+  cex = 1.1,
+  cat.cex = 1.1,
+  cat.col = "black",
+  margin = 0.08,
+  disable.logging = TRUE
+)
+
+grid.newpage()
+grid.draw(venn_plot)
+
+```
+```{r}
+# ---- save PNG ----
+png(OUT_PNG, width = 1800, height = 1400, res = 200)
+grid.newpage()
+grid.draw(venn_plot)
+dev.off()
+
+# ---- save PDF ----
+pdf(OUT_PDF, width = 8, height = 6)
+grid.newpage()
+grid.draw(venn_plot)
+dev.off()
+
+cat("Saved:\n  ", OUT_PNG, "\n  ", OUT_PDF, "\n", sep = "")
+```
+```{r}
+OUT_ALL3 <- file.path(REPORT_ROOT, "fusions_in_all_3_callers.tsv")
+
+# ---- fusions present in ALL THREE callers ----
+all3 <- Reduce(intersect, venn_list)
+
+cat("Fusions present in all 3 callers:", length(all3), "\n")
+
+# Save as TSV
+all3_dt <- data.table(Fusion = sort(all3))
+fwrite(all3_dt, OUT_ALL3, sep = "\t")
+
+cat("Saved 3-caller fusions to:\n  ", OUT_ALL3, "\n", sep = "")
+
+```
+
+

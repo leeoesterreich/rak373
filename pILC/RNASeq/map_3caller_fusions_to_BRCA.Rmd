@@ -1,0 +1,150 @@
+---
+title: "map_3caller_fusions_to_BRCA"
+output: html_document
+date: "2026-02-18"
+---
+
+```{r setup, include=FALSE}
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(stringr)
+})
+
+# -------------------------------
+# Paths
+# -------------------------------
+fusion_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/RNAfusion/FusionReports/fusions_in_all_3_callers.tsv"
+
+tcga_file <- "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Reference/TCGA.BRCA.onco.genes.OncoVar.tsv"
+icgc_file <- "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Reference/ICGC.BRCA.onco.genes.OncoVar.tsv"
+
+out_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/RNAfusion/FusionReports/fusions_in_all_3_callers_BRCA_overlap.tsv"
+
+```
+
+```{r}
+# -------------------------------
+# Helpers
+# -------------------------------
+clean_partner <- function(x) {
+  x <- as.character(x)
+  x <- str_trim(x)
+
+  # If like "ELF1(41522),WBP4(671)" -> take first before comma
+  x <- str_split_fixed(x, ",", 2)[,1]
+
+  # Remove "^ENSG..." suffix if present
+  x <- str_replace(x, "\\^.*$", "")
+
+  # Remove "(...)" suffix like "ELF1(41522)" -> "ELF1"
+  x <- str_replace(x, "\\(.*\\)$", "")
+
+  x <- str_trim(x)
+  x
+}
+
+```
+
+```{r}
+# -------------------------------
+# Load BRCA gene set (OncoVar)
+# -------------------------------
+tcga_df <- fread(tcga_file) %>% mutate(Source = "TCGA")
+icgc_df <- fread(icgc_file) %>% mutate(Source = "ICGC")
+combined_df <- bind_rows(tcga_df, icgc_df)
+
+# Build gene roles (as you did before)
+gene_roles <- combined_df %>%
+  group_by(Gene_symbol) %>%
+  summarise(
+    is_oncogene = any(str_detect(
+      paste(OncoKB, OncoVar, `2020Rule`, CTAT, HCD, Intogen, Oncogene),
+      regex("oncogene", ignore_case = TRUE)
+    ), na.rm = TRUE),
+    is_tsg = any(str_detect(
+      paste(OncoKB, OncoVar, `2020Rule`, CTAT, HCD, Intogen, TSgene),
+      regex("tsg", ignore_case = TRUE)
+    ), na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    cancer_role = case_when(
+      is_oncogene & !is_tsg ~ "Oncogene",
+      is_tsg & !is_oncogene ~ "TSG",
+      is_tsg & is_oncogene  ~ "Dual",
+      TRUE ~ "Other"
+    )
+  )
+
+metadata_cols <- c("Gene_symbol", "Gene_biotype", "OncoKB", "OncoVar", "MutPanning",
+                   "2020Rule", "CTAT", "HCD", "Intogen", "Oncogene", "TSgene")
+
+gene_metadata_full <- combined_df %>%
+  arrange(Gene_symbol, desc(Source)) %>%
+  distinct(Gene_symbol, .keep_all = TRUE) %>%
+  select(all_of(metadata_cols))
+
+cgc_df <- left_join(gene_roles, gene_metadata_full, by = "Gene_symbol") %>%
+  rename(OverlapGenes = Gene_symbol)
+
+cgc_genes <- unique(cgc_df$OverlapGenes)
+
+cat("Loaded BRCA gene set size:", length(cgc_genes), "\n")
+
+```
+```{r}
+# -------------------------------
+# Load fusions (3 callers)
+# -------------------------------
+fus <- fread(fusion_file)
+stopifnot("Fusion" %in% names(fus))
+
+fus2 <- fus %>%
+  mutate(
+    GeneA_raw = str_split_fixed(Fusion, "--", 2)[,1],
+    GeneB_raw = str_split_fixed(Fusion, "--", 2)[,2],
+    GeneA = clean_partner(GeneA_raw),
+    GeneB = clean_partner(GeneB_raw),
+    GeneA_in_BRCA = GeneA %in% cgc_genes,
+    GeneB_in_BRCA = GeneB %in% cgc_genes,
+    BRCA_match = GeneA_in_BRCA | GeneB_in_BRCA,
+    BRCA_match_type = case_when(
+      GeneA_in_BRCA & GeneB_in_BRCA ~ "Both_partners_BRCA",
+      GeneA_in_BRCA & !GeneB_in_BRCA ~ "GeneA_BRCA",
+      !GeneA_in_BRCA & GeneB_in_BRCA ~ "GeneB_BRCA",
+      TRUE ~ "No_match"
+    )
+  )
+
+```
+
+```{r}
+# -------------------------------
+# Summaries
+# -------------------------------
+n_total <- nrow(fus2)
+n_any   <- sum(fus2$BRCA_match)
+n_both  <- sum(fus2$BRCA_match_type == "Both_partners_BRCA")
+n_A     <- sum(fus2$BRCA_match_type == "GeneA_BRCA")
+n_B     <- sum(fus2$BRCA_match_type == "GeneB_BRCA")
+
+cat("Total fusions (3 callers):", n_total, "\n")
+cat("Fusions with >=1 BRCA partner:", n_any, "\n")
+cat("  GeneA in BRCA:", n_A, "\n")
+cat("  GeneB in BRCA:", n_B, "\n")
+cat("  Both partners in BRCA:", n_both, "\n")
+
+# -------------------------------
+# Save overlap table (only matches)
+# -------------------------------
+overlap_tbl <- fus2 %>%
+  filter(BRCA_match) %>%
+  select(Fusion, GeneA, GeneB, GeneA_in_BRCA, GeneB_in_BRCA, BRCA_match_type) %>%
+  arrange(desc(BRCA_match_type), Fusion)
+
+fwrite(as.data.table(overlap_tbl), out_file, sep = "\t")
+
+cat("Saved overlap table to:\n", out_file, "\n")
+```
+
