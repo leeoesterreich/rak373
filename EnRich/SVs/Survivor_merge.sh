@@ -1,4 +1,6 @@
 #!/bin/bash
+# https://github.com/fritzsedlazeck/SURVIVOR
+# Merge VCF files to generate a consensus file
 # Params: max_dist=1000, min_support=2, use_type=1 (require same SVTYPE to merge), use_strand=1 (require same strand orientation), disabled=0, min_size=50
 
 #SBATCH --job-name=Survivor_merge
