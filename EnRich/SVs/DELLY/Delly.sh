@@ -1,7 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=Delly
 #SBATCH -N 1
-#SBATCH --cpus-per-task=32
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=32G
 #SBATCH -t 1-00:00
 #SBATCH --array=0-7
 #SBATCH --output=slurm_log/Delly/Delly_%A_%a.out
