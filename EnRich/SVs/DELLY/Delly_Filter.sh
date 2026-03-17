@@ -3,7 +3,7 @@
 # This script is used to filter Delly output vcf file.
 # High-confidence filter:
             #  - FILTER must be PASS
-            #  - at least 1 split-read (SR>=3)
+            #  - at least 3 split-read (SR>=3)
             #  - PE + SR >= 8 total support
             #  - mapping quality for paired-ends and split-reads >= 30
 
