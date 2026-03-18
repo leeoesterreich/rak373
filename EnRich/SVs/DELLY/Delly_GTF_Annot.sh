@@ -12,7 +12,7 @@ set -euo pipefail
 # -----------------------------
 # Paths
 # -----------------------------
-BASE="/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/EnRich/20260105/Delly_010526/"
+BASE="/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/EnRich/20260213/Batch2_021326/Delly_021326/"
 OUTBASE="${BASE}/Delly_ANNOT_GTF"
 mkdir -p "$OUTBASE" slurm_log
 
@@ -75,12 +75,14 @@ for vcf in "${VCFS[@]}"; do
   pairs="${outdir}/${sample}.BND.pairs.tsv"
 
   awk -F'\t' -v OFS='\t' -v SAMPLE="$sample" '
-    # 1) support + CT stream
+    # 1) support + CT + REF/ALT stream
     NR==FNR{
       id=$1
       sr[id]=($2=="."||$2==""?0:$2)
       pe[id]=($3=="."||$3==""?0:$3)
       ct[id]=($4=="."||$4==""?"NA":$4)
+      ref[id]=($5=="."||$5==""?"NA":$5)
+      alt[id]=($6=="."||$6==""?"NA":$6)
       next
     }
 
@@ -104,17 +106,19 @@ for vcf in "${VCFS[@]}"; do
     }
 
     END{
-      print "ChrA","PositionA","Gene_ChrA","ChrB","PositionB","Gene_ChrB","SV_ID","CT","Sample","SR","PE","TOTAL_SUPPORT"
+      print "ChrA","PositionA","Gene_ChrA","ChrB","PositionB","Gene_ChrB","SV_ID","CT","REF","ALT","Sample","SR","PE","TOTAL_SUPPORT"
 
       for(id in chrA){
         s=(id in sr ? sr[id] : 0)
         p=(id in pe ? pe[id] : 0)
         c=(id in ct ? ct[id] : "NA")
+        r=(id in ref ? ref[id] : "NA")
+        a=(id in alt ? alt[id] : "NA")
         gA=(geneA[id] && geneA[id]!="") ? geneA[id] : "NA"
         gB=(geneB[id] && geneB[id]!="") ? geneB[id] : "NA"
         cB=(id in chrB) ? chrB[id] : "NA"
         pB=(id in posB) ? posB[id] : "NA"
-        print chrA[id],posA[id],gA,cB,pB,gB,id,c,SAMPLE,s,p,(s+p)
+        print chrA[id],posA[id],gA,cB,pB,gB,id,c,r,a,SAMPLE,s,p,(s+p)
       }
 
       for(id in chrB){
@@ -122,18 +126,22 @@ for vcf in "${VCFS[@]}"; do
         s=(id in sr ? sr[id] : 0)
         p=(id in pe ? pe[id] : 0)
         c=(id in ct ? ct[id] : "NA")
+        r=(id in ref ? ref[id] : "NA")
+        a=(id in alt ? alt[id] : "NA")
         gB=(geneB[id] && geneB[id]!="") ? geneB[id] : "NA"
-        print "NA","NA","NA",chrB[id],posB[id],gB,id,c,SAMPLE,s,p,(s+p)
+        print "NA","NA","NA",chrB[id],posB[id],gB,id,c,r,a,SAMPLE,s,p,(s+p)
       }
     }
   ' \
   <(
-    bcftools query -i 'INFO/SVTYPE=="BND"' -f '%ID\t%INFO/SR\t%INFO/PE\t%INFO/CT\n' "$vcf" \
+    bcftools query -i 'INFO/SVTYPE=="BND"' -f '%ID\t%INFO/SR\t%INFO/PE\t%INFO/CT\t%REF\t%ALT\n' "$vcf" \
     | awk 'BEGIN{OFS="\t"}{
         sr=($2=="."||$2=="")?0:$2
         pe=($3=="."||$3=="")?0:$3
         ct=($4=="."||$4=="")?"NA":$4
-        print $1,sr,pe,ct
+        ref=($5=="."||$5=="")?"NA":$5
+        alt=($6=="."||$6=="")?"NA":$6
+        print $1,sr,pe,ct,ref,alt
       }' | sort -u
   ) \
   <(
@@ -169,12 +177,12 @@ fi
 awk -F'\t' 'BEGIN{OFS="\t"}
 FNR==1{next}
 {
-  key = $1 FS $2 FS $3 FS $4 FS $5 FS $6 FS $7 FS $8
+  key = $1 FS $2 FS $3 FS $4 FS $5 FS $6 FS $7 FS $8 FS $9 FS $10
 
-  s=$9
-  sr=($10==""?0:$10)
-  pe=($11==""?0:$11)
-  tot=($12==""?0:$12)
+  s=$11
+  sr=($12==""?0:$12)
+  pe=($13==""?0:$13)
+  tot=($14==""?0:$14)
 
   if(!((key SUBSEP s) in seen)){
     seen[key SUBSEP s]=1
@@ -185,6 +193,7 @@ FNR==1{next}
   chrA[key]=$1; posA[key]=$2; geneA[key]=$3
   chrB[key]=$4; posB[key]=$5; geneB[key]=$6
   sv[key]=$7; ct[key]=$8
+  ref[key]=$9; alt[key]=$10
 
   if(!(key in maxTot) || tot>maxTot[key]) maxTot[key]=tot
 
@@ -194,9 +203,9 @@ FNR==1{next}
   }
 }
 END{
-  print "ChrA","PositionA","Gene_ChrA","ChrB","PositionB","Gene_ChrB","SV_ID","CT","Unique_Samples","Sample_List","Max_TOTAL_SUPPORT","Support_BySample"
+  print "ChrA","PositionA","Gene_ChrA","ChrB","PositionB","Gene_ChrB","SV_ID","CT","REF","ALT","Unique_Samples","Sample_List","Max_TOTAL_SUPPORT","Support_BySample"
   for(k in nsamp){
-    print chrA[k],posA[k],geneA[k],chrB[k],posB[k],geneB[k],sv[k],ct[k],nsamp[k],slist[k],maxTot[k],supList[k]
+    print chrA[k],posA[k],geneA[k],chrB[k],posB[k],geneB[k],sv[k],ct[k],ref[k],alt[k],nsamp[k],slist[k],maxTot[k],supList[k]
   }
 }' "${PAIRS_FILES[@]}" > "$Summary"
 
