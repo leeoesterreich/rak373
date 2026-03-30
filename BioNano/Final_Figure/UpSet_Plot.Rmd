@@ -1,0 +1,119 @@
+---
+title: "UpSet_Plot"
+output: html_document
+date: "2026-03-06"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# ---- Load Required Libraries ----
+library(readr)
+library(dplyr)
+library(tidyr)
+library(UpSetR)
+library(stringr)
+
+# ---- Load Data ----
+full_df <- read_csv("/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Cohort/Clinical/Bionano_cohort.csv")
+
+# ---- Clean Character Columns ----
+full_df <- full_df %>%
+  mutate(across(where(is.character), ~ str_trim(.)))
+
+# ---- One-hot Encode Selected Categorical Columns ----
+categorical_cols <- c("Origin", "Source")
+
+df_onehot <- full_df %>%
+  select(SampleID, all_of(categorical_cols)) %>%
+  pivot_longer(
+    cols = -SampleID,
+    names_to = "Attribute",
+    values_to = "Value"
+  ) %>%
+  filter(!is.na(Value), Value != "") %>%
+  unite("AttrValue", Attribute, Value, sep = "_") %>%
+  mutate(Present = 1) %>%
+  pivot_wider(
+    names_from = AttrValue,
+    values_from = Present,
+    values_fill = 0
+  )
+```
+
+
+```{r}
+# ---- Convert Platform Columns to Binary ----
+platform_cols <- c("Bionano", "RNAseq")
+
+df_binary <- full_df %>%
+  select(SampleID, all_of(platform_cols)) %>%
+  mutate(
+    across(
+      all_of(platform_cols),
+      ~ ifelse(!is.na(.) & . == "Yes", 1, 0)
+    )
+  )
+
+# ---- Merge One-hot and Platform Data ----
+df_combined <- df_binary %>%
+  left_join(df_onehot, by = "SampleID") %>%
+  mutate(across(-SampleID, ~ replace_na(., 0))) %>%
+  mutate(across(-SampleID, as.numeric))
+```
+
+
+```{r}
+# ---- Convert to Base Data Frame for UpSetR ----
+df_combined_base <- df_combined %>%
+  select(-SampleID) %>%
+  as.data.frame()
+
+# ---- Optional: Check Final Matrix ----
+print(colnames(df_combined_base))
+print(head(df_combined_base))
+```
+
+
+```{r}
+# ---- Save UpSet Plot ----
+outdir <- "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Cohort/Clinical/UpSetPlot"
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+make_upset_plot <- function() {
+  upset(
+    df_combined_base,
+    sets = colnames(df_combined_base),
+    nsets = ncol(df_combined_base),
+    order.by = "freq",
+    keep.order = TRUE,
+    main.bar.color = "steelblue",
+    sets.bar.color = "gray40",
+    text.scale = 2.0
+  )
+}
+make_upset_plot()
+```
+
+```{r}
+# Save as PNG
+png(
+  filename = file.path(outdir, "upset_plot.png"),
+  width = 1600,
+  height = 1200,
+  res = 150
+)
+make_upset_plot()
+dev.off()
+
+# Save as PDF
+pdf(
+  file = file.path(outdir, "upset_plot.pdf"),
+  width = 12,
+  height = 9
+)
+make_upset_plot()
+dev.off()
+
+cat("UpSet plot script finished successfully\n")
+```
+
