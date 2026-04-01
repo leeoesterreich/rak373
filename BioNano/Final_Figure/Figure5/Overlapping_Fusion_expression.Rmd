@@ -1,0 +1,228 @@
+---
+title: "Overlapping_Fusion_expression"
+output: html_document
+date: "2026-04-01"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# ============================================================
+# Load libraries
+# ============================================================
+library(circlize)
+library(data.table)
+
+# ============================================================
+# Input / output
+# ============================================================
+input_file  <- "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Functional_Fusion/Functional_fusion_expression_OverlappingGene.csv"
+png_file    <- "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Functional_Fusion/Overlapping_Functional_Fusion_Combined_Circos.png"
+pdf_file    <- "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Functional_Fusion/Overlapping_Functional_Fusion_Combined_Circos.pdf"
+```
+
+
+```{r }
+# ============================================================
+# Load fusion data
+# ============================================================
+fusion_data <- fread(input_file)
+
+# ============================================================
+# Sanity check: raw input
+# ============================================================
+cat("========================================\n")
+cat("SANITY CHECK: INPUT DATA\n")
+cat("========================================\n")
+cat("Total rows in input file:", nrow(fusion_data), "\n\n")
+```
+
+
+```{r }
+# ============================================================
+# Format chromosome names
+# ============================================================
+fusion_data$chrA <- ifelse(grepl("^chr", fusion_data$chrA),
+                           fusion_data$chrA,
+                           paste0("chr", trimws(fusion_data$chrA)))
+
+fusion_data$chrB <- ifelse(grepl("^chr", fusion_data$chrB),
+                           fusion_data$chrB,
+                           paste0("chr", trimws(fusion_data$chrB)))
+
+# ============================================================
+# Keep valid chromosomes only
+# ============================================================
+valid_chroms <- paste0("chr", c(1:22, "X"))
+before_chr_filter <- nrow(fusion_data)
+
+fusion_data <- fusion_data[chrA %in% valid_chroms & chrB %in% valid_chroms]
+
+after_chr_filter <- nrow(fusion_data)
+removed_invalid_chr <- before_chr_filter - after_chr_filter
+
+# ============================================================
+# Filter only up/down-regulated fusions
+# ============================================================
+before_exp_filter <- nrow(fusion_data)
+
+fusion_data <- fusion_data[exp %in% c("up-regulation", "down-regulation")]
+
+after_exp_filter <- nrow(fusion_data)
+removed_invalid_exp <- before_exp_filter - after_exp_filter
+
+# ============================================================
+# Stop if no data left
+# ============================================================
+if (nrow(fusion_data) == 0) {
+  stop("No valid fusion events available after filtering.")
+}
+
+# ============================================================
+# Count up/down regulation
+# ============================================================
+up_count <- sum(fusion_data$exp == "up-regulation", na.rm = TRUE)
+down_count <- sum(fusion_data$exp == "down-regulation", na.rm = TRUE)
+total_fusions <- nrow(fusion_data)
+
+# ============================================================
+# Check missing coordinates before simulation
+# ============================================================
+missing_startA <- sum(is.na(fusion_data$StartA))
+missing_startB <- sum(is.na(fusion_data$StartB))
+```
+
+
+```{r }
+# ============================================================
+# Simulate coordinates if missing
+# ============================================================
+set.seed(42)
+fusion_data$StartA <- ifelse(is.na(fusion_data$StartA),
+                             sample(1e6:1e8, nrow(fusion_data), replace = TRUE),
+                             fusion_data$StartA)
+fusion_data$EndA <- fusion_data$StartA + 1000
+
+fusion_data$StartB <- ifelse(is.na(fusion_data$StartB),
+                             sample(1e6:1e8, nrow(fusion_data), replace = TRUE),
+                             fusion_data$StartB)
+fusion_data$EndB <- fusion_data$StartB + 1000
+
+# ============================================================
+# Print sanity check summary
+# ============================================================
+cat("========================================\n")
+cat("SANITY CHECK: FILTERED DATA FOR PLOTTING\n")
+cat("========================================\n")
+cat("Rows before chromosome filtering:", before_chr_filter, "\n")
+cat("Rows removed due to invalid chromosomes:", removed_invalid_chr, "\n")
+cat("Rows after chromosome filtering:", after_chr_filter, "\n\n")
+
+cat("Rows before expression filtering:", before_exp_filter, "\n")
+cat("Rows removed due to non up/down expression:", removed_invalid_exp, "\n")
+cat("Total number of Fusion:", total_fusions, "\n")
+cat("Total number of Upregulated:", up_count, "\n")
+cat("Total number of Downregulated:", down_count, "\n\n")
+
+cat("Missing StartA coordinates simulated:", missing_startA, "\n")
+cat("Missing StartB coordinates simulated:", missing_startB, "\n")
+cat("========================================\n\n")
+```
+
+
+```{r }
+exp_colors <- c(
+  "up-regulation"   = "#E64B35",
+  "down-regulation" = "#4DBBD5"
+)
+
+# ============================================================
+# Create links table
+# ============================================================
+links <- data.frame(
+  chr1   = fusion_data$chrA,
+  start1 = fusion_data$StartA,
+  end1   = fusion_data$EndA,
+  chr2   = fusion_data$chrB,
+  start2 = fusion_data$StartB,
+  end2   = fusion_data$EndB,
+  exp    = fusion_data$exp,
+  stringsAsFactors = FALSE
+)
+
+# ============================================================
+# Circos plotting function
+# ============================================================
+plot_fusion_circos <- function() {
+  circos.clear()
+  circos.par(track.height = 0.05,
+             cell.padding = c(0, 0, 0, 0),
+             gap.degree = 1)
+
+  circos.initializeWithIdeogram(
+    species = "hg38",
+    chromosome.index = valid_chroms
+  )
+
+  for (exp_type in unique(links$exp)) {
+    subset_links <- links[links$exp == exp_type, ]
+    if (nrow(subset_links) == 0) next
+
+    circos.genomicLink(
+      region1 = subset_links[, c("chr1", "start1", "end1")],
+      region2 = subset_links[, c("chr2", "start2", "end2")],
+      col = exp_colors[exp_type],
+      rou = 0.8,
+      lwd = 1
+    )
+  }
+}
+
+# ============================================================
+# Wrapper to draw plot + legend
+# ============================================================
+draw_full_plot <- function() {
+  layout(matrix(c(1, 2), nrow = 1), widths = c(4.2, 2.8))
+
+  # ---- Circos plot ----
+  par(mar = c(1, 1, 1, 1))
+  plot_fusion_circos()
+
+  # ---- Legend panel ----
+  par(mar = c(1, 0, 1, 2))
+  plot.new()
+  legend(
+    "topright",
+    legend = c("Up-regulation", "Down-regulation"),
+    col = exp_colors,
+    pch = 15,
+    pt.cex = 1.8,
+    cex = 1.4,
+    title = "Fusion Expression",
+    bty = "n"
+  )
+}
+
+draw_full_plot()
+```
+
+
+```{r }
+# ============================================================
+# Save to PNG
+# ============================================================
+png(png_file, width = 2400, height = 1600, res = 300)
+draw_full_plot()
+dev.off()
+
+cat("PNG saved to:\n", png_file, "\n\n")
+
+# ============================================================
+# Save to PDF
+# ============================================================
+pdf(pdf_file, width = 12, height = 8)
+draw_full_plot()
+dev.off()
+
+cat("PDF saved to:\n", pdf_file, "\n")
+```
+

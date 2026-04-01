@@ -1,0 +1,220 @@
+---
+title: "Functional_BRCA_Circos_IPM"
+output: html_document
+date: "2026-02-05"
+---
+
+```{r}
+
+```
+
+
+```{r}
+suppressPackageStartupMessages({
+  library(circlize)
+  library(data.table)
+})
+
+# =========================
+# Inputs
+# =========================
+in_csv   <- "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Functional_Fusion/IPM/functional_fusions_expression_only_IPM.BRCA_only.csv"
+cyto_file <- "/ix1/alee/LO_LAB/Personal/Rahul/Reference_genome/Human/Human_ref_hg38_p7/cytoBand.txt"
+out_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Functional_Fusion/IPM"
+out_circos_pdf <- file.path(out_dir, "functional_fusions_expression_only_IPM.BRCA_only.circos.pdf")
+out_circos_png <- file.path(out_dir, "functional_fusions_expression_only_IPM.BRCA_only.circos.png")
+out_legend_pdf <- file.path(out_dir, "functional_fusions_expression_only_IPM.BRCA_only.legend.pdf")
+out_legend_png <- file.path(out_dir, "functional_fusions_expression_only_IPM.BRCA_only.legend.png")
+# out_table <- file.path(out_dir, "functional_fusions_expression_only_IPM.BRCA_only.arc_summary.csv")
+
+# =========================
+# Colors by expression status
+# =========================
+exp_colors <- c(
+  "up-regulation"   = "#E64B35",
+  "down-regulation" = "#4DBBD5"
+)
+
+# =========================
+# Read + sanity
+# =========================
+dt <- fread(in_csv)
+req <- c("chrA","StartA","chrB","StartB","exp")
+missing_req <- setdiff(req, names(dt))
+if (length(missing_req) > 0) {
+  stop("Missing required columns: ", paste(missing_req, collapse = ", "))
+}
+
+dt[, chrA := as.character(chrA)]
+dt[, chrB := as.character(chrB)]
+dt[, StartA := suppressWarnings(as.numeric(StartA))]
+dt[, StartB := suppressWarnings(as.numeric(StartB))]
+dt[, exp := as.character(exp)]
+
+dt <- dt[!is.na(StartA) & !is.na(StartB)]
+dt <- dt[nchar(chrA) > 0 & nchar(chrB) > 0]
+
+std_chr <- c(paste0("chr", 1:22), "chrX", "chrY")
+dt <- dt[chrA %in% std_chr & chrB %in% std_chr]
+
+dt[, exp_clean := exp]
+dt[!(exp_clean %in% names(exp_colors)) & !is.na(exp_clean), exp_clean := NA]
+
+if (dt[is.na(exp_clean), .N] > 0) {
+  bad_levels <- unique(dt[is.na(exp_clean), exp])
+  message("WARNING: Found exp values not in exp_colors. These rows will be dropped.")
+  message("Bad exp levels: ", paste(bad_levels, collapse = ", "))
+  dt <- dt[!is.na(exp_clean)]
+}
+
+# =========================
+# Collapse arcs
+# =========================
+dt_arc <- dt[, .(
+  n_fusions = .N,
+  exp_major = names(sort(table(exp_clean), decreasing = TRUE))[1]
+), by = .(chrA, StartA, chrB, StartB)]
+
+message("Total fusion rows in CSV: ", nrow(dt))
+message("Unique arcs to plot: ", nrow(dt_arc))
+message("Max fusions per arc: ", ifelse(nrow(dt_arc)>0, max(dt_arc$n_fusions), NA))
+
+# =========================
+# Quick table to inspect arcs
+# =========================
+message("\nTop arcs by fusion count:")
+print(dt_arc[order(-n_fusions)][1:min(10, .N)])
+
+# =========================
+# Save arc summary table
+# =========================
+dt_arc_sorted <- dt_arc[order(-n_fusions)]
+fwrite(dt_arc_sorted, out_table)
+message("\nArc summary table saved to: ", out_table)
+
+# =========================
+# Chromosome lengths
+# =========================
+cyto <- fread(cyto_file, header = FALSE)
+chr_len <- cyto[, .(chr_len = max(V3, na.rm = TRUE)), by = V1]
+setnames(chr_len, "V1", "chr")
+
+# =========================
+# Add EndA and EndB columns
+# =========================
+dt_arc[, EndA := StartA + 1000]
+dt_arc[, EndB := StartB + 1000]
+
+# =========================
+# Calculate line width based on fusion count
+# Scale: 1 fusion = lwd 1, 2+ fusions = thicker
+# =========================
+dt_arc[, line_width := pmin(n_fusions, 5)]  # Cap at 5 to avoid overly thick lines
+
+# =========================
+# Prepare links for circos (EXACT format from original)
+# =========================
+links <- data.frame(
+  chr1 = dt_arc$chrA,
+  start1 = dt_arc$StartA,
+  end1 = dt_arc$EndA,
+  chr2 = dt_arc$chrB,
+  start2 = dt_arc$StartB,
+  end2 = dt_arc$EndB,
+  n_fusions = dt_arc$n_fusions,
+  line_width = dt_arc$line_width
+)
+
+# Add color based on expression
+links$color <- exp_colors[dt_arc$exp_major]
+
+# Valid chromosomes
+valid_chroms <- std_chr
+
+# =========================
+# Plotting function with variable line width
+# =========================
+plot_fusion_circos <- function() {
+  circos.clear()
+  circos.par("track.height" = 0.05, cell.padding = c(0, 0, 0, 0), gap.degree = 1)
+  
+  circos.initializeWithIdeogram(
+    species = "hg38", 
+    chromosome.index = valid_chroms,
+    labels.cex = 1.5,                    # Chromosome label size
+  )
+  
+  if (nrow(links) > 0) {
+    # Plot each link individually to control line width
+    for (i in 1:nrow(links)) {
+      circos.genomicLink(
+        region1 = links[i, c("chr1", "start1", "end1"), drop = FALSE],
+        region2 = links[i, c("chr2", "start2", "end2"), drop = FALSE],
+        col = links$color[i],
+        rou = 0.8,
+        lwd = links$line_width[i]
+      )
+    }
+  } else {
+    warning("No fusions to plot.")
+  }
+}
+
+# =========================
+# Save circos plot to PNG (NO legend)
+# =========================
+png(out_circos_png, width = 2400, height = 2400, res = 300)
+par(mar = c(1, 1, 1, 1))
+plot_fusion_circos()
+dev.off()
+
+# =========================
+# Save circos plot to PDF (NO legend)
+# =========================
+pdf(out_circos_pdf, width = 8, height = 8)
+par(mar = c(1, 1, 1, 1))
+plot_fusion_circos()
+dev.off()
+
+# =========================
+# Save legend only to PNG 
+# =========================
+png(out_legend_png, width = 600, height = 400, res = 300)
+par(mar = c(0, 0, 0, 0))
+plot.new()
+legend("center",
+       legend = c("Up-regulated Fusions", "Down-regulated Fusions"),
+       col = c("#E64B35", "#4DBBD5"),
+       pch = 15,
+       pt.cex = 1.2,
+       cex = 0.9,
+       title = "Fusion Expression",
+       title.cex = 1.0,
+       bty = "n")
+dev.off()
+
+# =========================
+# Save legend only to PDF 
+# =========================
+pdf(out_legend_pdf, width = 2.5, height = 1.5)
+par(mar = c(0, 0, 0, 0))
+plot.new()
+legend("center",
+       legend = c("Up-regulated Fusions", "Down-regulated Fusions"),
+       col = c("#E64B35", "#4DBBD5"),
+       pch = 15,
+       pt.cex = 1.2,
+       cex = 0.9,
+       title = "Fusion Expression",
+       title.cex = 1.0,
+       bty = "n")
+dev.off()
+
+message("\nPlots saved to:")
+message("  Circos PNG: ", out_circos_png)
+message("  Circos PDF: ", out_circos_pdf)
+message("  Legend PNG: ", out_legend_png)
+message("  Legend PDF: ", out_legend_pdf)
+
+```
+

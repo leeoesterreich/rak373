@@ -1,0 +1,488 @@
+---
+title: "Heatmap_BRCA_SV_IPM"
+output: html_document
+date: "2026-03-31"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# All genes that are present in the TCGA + ICGC BRCA OncoVar lists
+# Have at least one structural variant (SV) in cohort
+
+# ===============================
+# Load libraries
+# ===============================
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(ComplexHeatmap)
+library(circlize)
+library(stringr)
+library(grid)
+
+# ===============================
+# SV color mapping
+# ===============================
+# For heatmap CELLS (keep Multi-Hit black)
+col_fun_cell <- c(
+  "Del" = "#E64B35",
+  "Dup" = "#4DBBD5",
+  "Inv" = "#3C5488",
+  "Ins" = "#00A087",
+  "Transloc-Inter" = "#F39B7F",
+  "Transloc-Intra" = "#8491B4",
+  "Multi-Hit" = "#000000"
+)
+
+# For BARPLOTS (NO Multi-Hit)
+col_fun_bar <- c(
+  "Del" = "#E64B35",
+  "Dup" = "#4DBBD5",
+  "Inv" = "#3C5488",
+  "Ins" = "#00A087",
+  "Transloc-Inter" = "#F39B7F",
+  "Transloc-Intra" = "#8491B4"
+)
+
+# ===============================
+# Load SV input data
+# ===============================
+df_raw <- fread("/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Cohort/SV_df_unqiue_IPM.csv")
+names(df_raw) <- str_trim(names(df_raw))
+
+df_raw <- df_raw %>%
+  separate_rows(OverlapGenes, sep = ";") %>%
+  mutate(OverlapGenes = str_trim(OverlapGenes)) %>%
+  filter(!is.na(OverlapGenes), OverlapGenes != "", OverlapGenes != "-")
+```
+
+```{r}
+# ===============================
+# Load and merge OncoVar annotations (TCGA + ICGC BRCA)
+# ===============================
+tcga_df <- fread("/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Reference/TCGA.BRCA.onco.genes.OncoVar.tsv") %>%
+  mutate(Source = "TCGA")
+
+icgc_df <- fread("/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Reference/ICGC.BRCA.onco.genes.OncoVar.tsv") %>%
+  mutate(Source = "ICGC")
+
+combined_df <- bind_rows(tcga_df, icgc_df)
+
+gene_roles <- combined_df %>%
+  group_by(Gene_symbol) %>%
+  summarise(
+    is_oncogene = any(str_detect(
+      paste(OncoKB, OncoVar, `2020Rule`, CTAT, HCD, Intogen, Oncogene),
+      regex("oncogene", ignore_case = TRUE)
+    ), na.rm = TRUE),
+    is_tsg = any(str_detect(
+      paste(OncoKB, OncoVar, `2020Rule`, CTAT, HCD, Intogen, TSgene),
+      regex("tsg", ignore_case = TRUE)
+    ), na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    cancer_role = case_when(
+      is_oncogene & !is_tsg ~ "Oncogene",
+      is_tsg & !is_oncogene ~ "TSG",
+      is_tsg & is_oncogene  ~ "Dual",
+      TRUE ~ "Other"
+    )
+  )
+
+metadata_cols <- c(
+  "Gene_symbol", "Gene_biotype", "OncoKB", "OncoVar", "MutPanning",
+  "2020Rule", "CTAT", "HCD", "Intogen", "Oncogene", "TSgene"
+)
+
+gene_metadata_full <- combined_df %>%
+  arrange(Gene_symbol, desc(Source)) %>%
+  distinct(Gene_symbol, .keep_all = TRUE) %>%
+  select(all_of(metadata_cols))
+
+cgc_df <- left_join(gene_roles, gene_metadata_full, by = "Gene_symbol") %>%
+  rename(OverlapGenes = Gene_symbol)
+
+cgc_genes <- unique(cgc_df$OverlapGenes)
+```
+
+```{r}
+# ===============================
+# SANITY CHECK BEFORE FILTERING
+# ===============================
+sample_match_df <- df_raw %>%
+  mutate(
+    OverlapGenes_clean = gsub("-", "", OverlapGenes),
+    in_combined = OverlapGenes_clean %in% gsub("-", "", cgc_genes)
+  ) %>%
+  group_by(sample) %>%
+  summarise(
+    n_total_gene_rows = n(),
+    n_matching_gene_rows = sum(in_combined, na.rm = TRUE),
+    has_match = any(in_combined, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(has_match), desc(n_matching_gene_rows), sample)
+
+matched_samples <- sample_match_df %>% filter(has_match) %>% pull(sample)
+unmatched_samples <- sample_match_df %>% filter(!has_match) %>% pull(sample)
+
+cat("\n===============================\n")
+cat("Sanity check: sample match to combined_df genes\n")
+cat("===============================\n")
+cat("Total unique samples in SV file:", n_distinct(df_raw$sample), "\n")
+cat("Samples with >=1 SV in gene matched to combined_df:", length(matched_samples), "\n")
+cat("Samples with NO SV in gene matched to combined_df:", length(unmatched_samples), "\n\n")
+
+if (length(unmatched_samples) > 0) {
+  cat("Samples with NO matched genes:\n")
+  print(unmatched_samples)
+} else {
+  cat("All samples have at least one matched gene.\n")
+}
+```
+```{r}
+# ===============================
+# Filter genes to curated BRCA list
+# ===============================
+df <- df_raw %>% filter(OverlapGenes %in% cgc_genes)
+
+# Keep gene naming consistent between df_top and mat
+df <- df %>% mutate(OverlapGenes = gsub("-", "", OverlapGenes))
+df_top <- df
+
+gene_metadata <- cgc_df %>%
+  mutate(OverlapGenes = gsub("-", "", OverlapGenes)) %>%
+  filter(OverlapGenes %in% unique(df_top$OverlapGenes))
+
+# ===============================
+# Build stable event_id ONCE (for event-level counts)
+# ===============================
+if (!"event_id" %in% names(df_top)) {
+  if ("X.h.SmapEntryID" %in% names(df_top)) {
+    df_top$event_id <- as.character(df_top$X.h.SmapEntryID)
+  } else if (all(c("RefcontigID1", "RefcontigID2", "RefStartPos", "RefEndPos", "Type") %in% names(df_top))) {
+    df_top$event_id <- paste(
+      df_top$RefcontigID1, df_top$RefcontigID2,
+      df_top$RefStartPos, df_top$RefEndPos, df_top$Type,
+      sep = "|"
+    )
+  } else {
+    df_top$event_id <- paste0("row_", seq_len(nrow(df_top)))
+  }
+}
+
+# ===============================
+# Prepare matrix for heatmap CELLS (presence/type)
+# ===============================
+mat <- df_top %>%
+  select(sample, OverlapGenes, Type) %>%
+  distinct() %>%
+  pivot_wider(
+    names_from = sample,
+    values_from = Type,
+    values_fn = function(x) paste(unique(x), collapse = ";")
+  )
+
+mat <- as.data.frame(mat)
+rownames(mat) <- mat$OverlapGenes
+mat$OverlapGenes <- NULL
+
+# ===============================
+# Sample order by total SV counts
+# ===============================
+sample_total_counts <- df_top %>%
+  distinct(sample, event_id, Type) %>%
+  count(sample, name = "total_sv_events") %>%
+  arrange(desc(total_sv_events), sample)
+
+sample_order <- sample_total_counts$sample
+sample_order <- sample_order[sample_order %in% colnames(mat)]
+
+# reorder heatmap columns
+mat <- mat[, sample_order, drop = FALSE]
+
+
+# ===============================
+# SV frequency and labels (sample-level prevalence)
+# ===============================
+gene_freq <- rowSums(!is.na(mat) & mat != "")
+gene_freq_pct <- round((gene_freq / ncol(mat)) * 100, 1)
+gene_freq_labels <- paste0(gene_freq_pct, "%")
+names(gene_freq_labels) <- rownames(mat)
+
+# ===============================
+# Bottom annotation: Source, Histology
+# ===============================
+annotation_df <- read.csv(
+  "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Cohort/Heatmap_SV/Annotation.csv",
+  header = TRUE,
+  stringsAsFactors = FALSE
+)
+
+annotation_df$Sample <- trimws(annotation_df$Sample)
+colnames(mat) <- trimws(colnames(mat))
+rownames(annotation_df) <- annotation_df$Sample
+annotation_df <- annotation_df[colnames(mat), , drop = FALSE]
+
+source_colors <- c(
+  "Metastasis" = rgb(231, 138, 195, maxColorValue = 255),
+  "Primary"    = rgb(255, 217, 47, maxColorValue = 255)
+)
+
+histology_colors <- c(
+  "ILC"  = "#FF6B6B",
+  "NST"  = "#4D79FF",
+  "mDLC" = "#B07CC6"
+)
+
+bottom_anno <- HeatmapAnnotation(
+  df = annotation_df[, c("Source", "Histology")],
+  col = list(
+    Source = source_colors,
+    Histology = histology_colors
+  ),
+  annotation_name_side = "left",
+  annotation_name_gp = gpar(fontsize = 10),
+  gp = gpar(fontsize = 10),
+  annotation_height = unit(c(1.2, 1.2), "cm"),
+  which = "column"
+)
+
+# ===============================
+# Order genes by prevalence (heatmap row order)
+# ===============================
+ordering <- gene_metadata %>%
+  mutate(freq = gene_freq[OverlapGenes]) %>%
+  arrange(desc(freq)) %>%
+  pull(OverlapGenes)
+
+ordering <- ordering[ordering %in% rownames(mat)]
+mat <- mat[ordering, , drop = FALSE]
+gene_freq_labels <- gene_freq_labels[ordering]
+
+gene_metadata <- gene_metadata %>%
+  filter(OverlapGenes %in% ordering) %>%
+  arrange(match(OverlapGenes, ordering))
+# ===============================
+# Top annotation: per sample SV count (EVENT-LEVEL)
+# ordered MAX -> MIN
+# ===============================
+sample_sv_counts <- df_top %>%
+  distinct(sample, event_id, Type) %>%
+  count(sample, Type, name = "n") %>%
+  tidyr::complete(sample, Type = names(col_fun_bar), fill = list(n = 0)) %>%
+  tidyr::pivot_wider(names_from = Type, values_from = n, values_fill = 0) %>%
+  as.data.frame()
+
+rownames(sample_sv_counts) <- sample_sv_counts$sample
+sample_sv_counts$sample <- NULL
+sample_sv_counts <- sample_sv_counts[colnames(mat), , drop = FALSE]
+sample_sv_counts <- as.matrix(sample_sv_counts)
+
+top_anno <- HeatmapAnnotation(
+  SVs = anno_barplot(
+    sample_sv_counts,
+    gp = gpar(fill = col_fun_bar),
+    border = FALSE,
+    bar_width = 0.95,
+    axis_param = list(side = "left", gp = gpar(fontsize = 12))
+  ),
+  annotation_height = unit(4, "cm"),
+  annotation_name_side = "left",
+  annotation_name_gp = gpar(fontsize = 11)
+)
+
+# ===============================
+# Right annotation: per-gene SV counts (EVENT-LEVEL)
+# ===============================
+sv_levels <- names(col_fun_bar)
+
+gene_sv_counts_full <- df_top %>%
+  distinct(OverlapGenes, sample, event_id, Type) %>%
+  count(OverlapGenes, Type, name = "n") %>%
+  tidyr::complete(OverlapGenes, Type = sv_levels, fill = list(n = 0)) %>%
+  tidyr::pivot_wider(names_from = Type, values_from = n, values_fill = 0) %>%
+  as.data.frame()
+
+rownames(gene_sv_counts_full) <- gene_sv_counts_full$OverlapGenes
+gene_sv_counts_full$OverlapGenes <- NULL
+
+gene_sv_counts_full <- gene_sv_counts_full[ordering, sv_levels, drop = FALSE]
+gene_sv_counts_full <- as.matrix(gene_sv_counts_full)
+
+right_anno <- rowAnnotation(
+  SVs = anno_barplot(
+    gene_sv_counts_full,
+    gp = gpar(fill = col_fun_bar),
+    border = FALSE,
+    bar_width = 0.95,
+    axis_param = list(side = "bottom", gp = gpar(fontsize = 12))
+  ),
+  annotation_name_side = "bottom",
+  annotation_name_gp = gpar(fontsize = 12),
+  annotation_width = unit(2, "cm")
+)
+
+# ===============================
+# Role & Prevalence annotations (LEFT)
+# ===============================
+role_colors <- c(
+  Oncogene = "#FF4E42",
+  TSG      = "#3B75AF",
+  Dual     = "#F2B701",
+  Other    = "#BBBBBB"
+)
+
+role_anno <- rowAnnotation(
+  Role = gene_metadata$cancer_role,
+  col = list(Role = role_colors),
+  annotation_width = unit(1.5, "cm")
+)
+
+left_anno <- rowAnnotation(
+  freq = anno_text(
+    gene_freq_labels,
+    gp = gpar(fontsize = 14),
+    just = "right",
+    location = unit(1, "npc")
+  ),
+  annotation_width = unit(1.8, "cm")
+)
+
+# ===============================
+# Heatmap
+# ===============================
+ht <- Heatmap(
+  mat,
+  name = "SV Type",
+  col = col_fun_cell,
+  na_col = "#E5E5E5",
+  border = FALSE,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  top_annotation = top_anno,
+  bottom_annotation = bottom_anno,
+  left_annotation = c(role_anno, left_anno),
+  right_annotation = right_anno,
+  row_names_gp = gpar(fontsize = 14),
+  column_names_gp = gpar(fontsize = 11),
+  row_title = "SV-Altered BRCA Genes",
+  show_heatmap_legend = FALSE,
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    cell_value <- mat[i, j]
+    if (is.na(cell_value) || cell_value == "") {
+      cell_fill <- "#E5E5E5"
+    } else {
+      svs <- unique(str_split(cell_value, ";")[[1]])
+      if (length(svs) == 1 && svs %in% names(col_fun_cell)) {
+        cell_fill <- col_fun_cell[[svs]]
+      } else {
+        cell_fill <- col_fun_cell[["Multi-Hit"]]
+      }
+    }
+    grid.rect(
+      x = x, y = y, width = width, height = height,
+      gp = gpar(col = "white", lwd = 3, fill = cell_fill)
+    )
+  }
+)
+draw(ht)
+```
+```{r}
+# ===============================
+# Save heatmap (no legend)
+# ===============================
+png(
+  "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Cohort/Heatmap_SV/IPM_TCGA_ICGC_BRCA_SVs_Heatmap_PlotOnly.png",
+  width = 10, height = 16, units = "in", res = 300
+)
+draw(ht)
+dev.off()
+
+pdf(
+  "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Cohort/Heatmap_SV/IPM_TCGA_ICGC_BRCA_SVs_Heatmap_PlotOnly.pdf",
+  width = 12, height = 14
+)
+draw(ht)
+dev.off()
+
+# ===============================
+# Save Combined Legend
+# ===============================
+sv_legend <- Legend(
+  title = "SV Type",
+  at = names(col_fun_cell),
+  legend_gp = gpar(fill = unname(col_fun_cell))
+)
+
+role_legend <- Legend(
+  title = "Gene Role",
+  at = names(role_colors),
+  legend_gp = gpar(fill = unname(role_colors))
+)
+
+source_legend <- Legend(
+  title = "Sample Source",
+  at = names(source_colors),
+  legend_gp = gpar(fill = unname(source_colors))
+)
+
+histology_legend <- Legend(
+  title = "Histology",
+  at = names(histology_colors),
+  legend_gp = gpar(fill = unname(histology_colors))
+)
+
+combined_legend <- packLegend(
+  sv_legend,
+  role_legend,
+  source_legend,
+  histology_legend,
+  direction = "vertical",
+  column_gap = unit(1, "cm")
+)
+
+png(
+  "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Cohort/Heatmap_SV/IPM_TCGA_ICGC_BRCA_SVs_Combined_Legend.png",
+  width = 5, height = 6, units = "in", res = 300
+)
+grid.newpage()
+draw(combined_legend)
+dev.off()
+
+pdf(
+  "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Cohort/Heatmap_SV/IPM_TCGA_ICGC_BRCA_SVs_Combined_Legend.pdf",
+  width = 5, height = 6
+)
+grid.newpage()
+draw(combined_legend)
+dev.off()
+
+# ===============================
+# Save Metadata Table
+# ===============================
+write.csv(
+  gene_metadata,
+  "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Cohort/Heatmap_SV/IPM_TCGA_ICGC_BRCA_genes_with_roles.csv",
+  row.names = FALSE
+)
+```
+```{r}
+# ===============================
+# Optional sanity check 
+# ===============================
+cat("\nSanity check: PPM1D event-level counts in IPM\n")
+print(df_top %>%
+        filter(OverlapGenes == "PPM1D") %>%
+        distinct(sample, event_id, Type) %>%
+        count(Type, name = "SV_events"))
+
+cat("Total PPM1D events:",
+    nrow(df_top %>% filter(OverlapGenes == "PPM1D") %>% distinct(event_id)),
+    "\n")
+cat("Number of genes displayed in heatmap:", length(ordering), "\n")
+```
+

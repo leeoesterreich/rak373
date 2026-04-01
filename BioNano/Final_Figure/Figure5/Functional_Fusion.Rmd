@@ -1,0 +1,316 @@
+---
+title: "Functional_Fusion"
+output: html_document
+date: "2026-04-01"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# ============================================================
+# - Putative Functional Fusion Annotation
+# - Keep recurrent fusions across samples, but remove repeated
+#   same fusion calls within the same sample
+# - exclude "-" 
+# - split complex fusion entries separated by ";"
+# ============================================================
+
+library(readr)
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(ggplot2)
+```
+
+
+```{r }
+# ============================================================
+# Read SV data and build fusion table
+# ============================================================
+
+SV_df <- read.csv(
+  "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Cohort/SV_df_unqiue.csv",
+  stringsAsFactors = FALSE
+)
+
+fusion_df <- SV_df %>%
+  filter(
+    !is.na(PutativeGeneFusion),
+    PutativeGeneFusion != "",
+    PutativeGeneFusion != "-"
+  ) %>%
+  transmute(
+    samples = sample,
+    type    = Type,
+    fusions = PutativeGeneFusion,
+    chrA    = RefcontigID1,
+    StartA  = RefStartPos,
+    EndA    = RefStartPos,
+    chrB    = RefcontigID2,
+    StartB  = RefEndPos,
+    EndB    = RefEndPos
+  ) %>%
+  separate_rows(fusions, sep = ";") %>%
+  mutate(
+    fusions = trimws(fusions)
+  ) %>%
+  filter(
+    !is.na(fusions),
+    fusions != "",
+    fusions != "-",
+    grepl(".+-.+", fusions)
+  )
+```
+
+
+```{r }
+# ============================================================
+# Extract fusion partners
+# ============================================================
+
+fusion_df$geneA <- sapply(strsplit(fusion_df$fusions, split = "-", fixed = TRUE), function(x) x[1])
+fusion_df$geneB <- sapply(strsplit(fusion_df$fusions, split = "-", fixed = TRUE), function(x) {
+  if (length(x) >= 2) paste(x[-1], collapse = "-") else NA
+})
+
+fusion_df$fusions_inv <- paste0(fusion_df$geneB, "-", fusion_df$geneA)
+
+# ============================================================
+#  Collapse repeated same fusion within the same sample
+#    Keeps recurrence across different samples
+# ============================================================
+
+fusion_df <- fusion_df %>%
+  distinct(samples, fusions, .keep_all = TRUE)
+
+# ============================================================
+# Basic summaries
+# ============================================================
+
+cat("Total SV rows in input:", nrow(SV_df), "\n")
+cat("Total fusion rows after collapsing repeated same fusion within sample:", nrow(fusion_df), "\n")
+cat("Unique fusion strings:", length(unique(fusion_df$fusions)), "\n")
+cat("Unique samples with fusion calls:", length(unique(fusion_df$samples)), "\n\n")
+
+cat("Fusion count per sample:\n")
+print(table(fusion_df$samples))
+
+cat("\nOriginal SV row count per sample:\n")
+print(table(SV_df$sample))
+
+cat("\nSamples present in SV_df but missing from fusion_df:\n")
+print(setdiff(unique(SV_df$sample), unique(fusion_df$samples)))
+```
+
+
+```{r }
+# ============================================================
+# Read expression matrix
+# ============================================================
+
+expr_data <- read_tsv(
+  "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/RNASeq/4_Count_file/tpm_matrix_log2TPM.txt",
+  show_col_types = FALSE
+)
+
+expr_data_clean <- expr_data %>%
+  filter(!is.na(Gene), Gene != "") %>%
+  distinct(Gene, .keep_all = TRUE) %>%
+  column_to_rownames(var = "Gene")
+```
+
+
+```{r }
+# ============================================================
+# Check overlap between fusion samples and expression samples
+# ============================================================
+
+fusion_samples <- unique(fusion_df$samples)
+expr_samples   <- colnames(expr_data_clean)
+common_samples <- intersect(fusion_samples, expr_samples)
+
+cat("\nNumber of samples in fusion data:", length(fusion_samples), "\n")
+cat("Number of samples in expression data:", length(expr_samples), "\n")
+cat("Number of common samples:", length(common_samples), "\n")
+cat("Common sample names:\n")
+print(common_samples)
+```
+
+
+```{r }
+# ============================================================
+# Annotate expression values
+# ============================================================
+
+fusion_df <- fusion_df %>%
+  rowwise() %>%
+  mutate(
+    geneA_exp = if (!is.na(geneA) &&
+                    geneA %in% rownames(expr_data_clean) &&
+                    samples %in% colnames(expr_data_clean)) {
+      as.numeric(expr_data_clean[geneA, samples])
+    } else {
+      NA_real_
+    },
+    geneB_exp = if (!is.na(geneB) &&
+                    geneB %in% rownames(expr_data_clean) &&
+                    samples %in% colnames(expr_data_clean)) {
+      as.numeric(expr_data_clean[geneB, samples])
+    } else {
+      NA_real_
+    }
+  ) %>%
+  ungroup()
+```
+
+
+```{r }
+# ============================================================
+# Function to classify expression status
+# ============================================================
+
+get_expr_status <- function(gene, sample, expr_matrix) {
+  if (is.na(gene) ||
+      !(gene %in% rownames(expr_matrix)) ||
+      !(sample %in% colnames(expr_matrix))) {
+    return(NA_character_)
+  }
+
+  expr_vec <- expr_matrix[gene, ] %>% unlist() %>% as.numeric()
+  expr_val <- as.numeric(expr_matrix[gene, sample])
+
+  up_thresh   <- median(expr_vec, na.rm = TRUE) + 0.4 * sd(expr_vec, na.rm = TRUE)
+  down_thresh <- median(expr_vec, na.rm = TRUE) - 0.4 * sd(expr_vec, na.rm = TRUE)
+
+  if (is.na(expr_val)) return(NA_character_)
+  if (expr_val > up_thresh) return("up")
+  if (expr_val < down_thresh) return("dn")
+  return("normal")
+}
+```
+
+
+```{r }
+# ============================================================
+# Annotate expression status
+# ============================================================
+
+fusion_df <- fusion_df %>%
+  rowwise() %>%
+  mutate(
+    geneA_status = get_expr_status(geneA, samples, expr_data_clean),
+    geneB_status = get_expr_status(geneB, samples, expr_data_clean)
+  ) %>%
+  ungroup()
+```
+
+
+```{r }
+# ============================================================
+# Save final output
+# ============================================================
+
+write.csv(
+  fusion_df,
+  file = "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Functional_Fusion/fusion_expression_annotation.csv",
+  row.names = FALSE
+)
+
+cat("\nSaved output to:\n")
+cat("/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Functional_Fusion/fusion_expression_annotation.csv\n")
+```
+
+
+
+
+
+
+
+
+
+```{r }
+##### Combining expression status with functional annotation from OncoVar #####
+oncoVar <- read.delim("/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Reference/ICGC.BRCA.all.genes.OncoVar.tsv", sep = "\t", stringsAsFactors = FALSE)
+rownames(oncoVar) <- oncoVar$Gene_symbol
+
+# Annotate Each Fusion Gene (A & B) with OncoVar Status
+fusion_df$geneA_OncoTS <- ifelse(
+  grepl("Oncogene", oncoVar[fusion_df$geneA, "OncoKB"], ignore.case = TRUE), "Oncogene",
+  ifelse(grepl("TSG", oncoVar[fusion_df$geneA, "OncoKB"], ignore.case = TRUE), "TSG", NA)
+)
+
+fusion_df$geneB_OncoTS <- ifelse(
+  grepl("Oncogene", oncoVar[fusion_df$geneB, "OncoKB"], ignore.case = TRUE), "Oncogene",
+  ifelse(grepl("TSG", oncoVar[fusion_df$geneB, "OncoKB"], ignore.case = TRUE), "TSG", NA)
+)
+
+# Summarize Fusion Expression Status
+fusion_df$exp <- ifelse(
+  fusion_df$geneA_status == "up" | fusion_df$geneB_status == "up", "up-regulation",
+  ifelse(fusion_df$geneA_status == "dn" | fusion_df$geneB_status == "dn", "down-regulation", "-")
+)
+
+write.csv(
+  fusion_df,
+  file = "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Functional_Fusion/fusion_expression_OncoVar_annotated.csv",
+  row.names = FALSE
+)
+
+# Filter Expression-Relevant Fusions
+functional_fusions <- fusion_df %>% 
+  filter(exp != "-")
+  
+write.csv(
+  functional_fusions,
+  file = "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Functional_Fusion/functional_fusions_expression_only.csv",
+  row.names = FALSE
+)
+```
+
+```{r}
+# Shared Fusions Identified in Functional and Overlapping Datasets from DNA and RNA
+library(readr)
+library(dplyr)
+
+# ============================================================
+# Input files
+# ============================================================
+functional_file <- "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Functional_Fusion/functional_fusions_expression_only.csv"
+overlap_file    <- "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/SVs/overlapping_fusions.csv"
+
+# Output file
+out_file <- "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Functional_Fusion/Functional_fusion_expression_OverlappingGene.csv"
+
+# ============================================================
+# Read files
+# ============================================================
+functional_df <- read_csv(functional_file, show_col_types = FALSE)
+overlap_df    <- read_csv(overlap_file, show_col_types = FALSE)
+
+# ============================================================
+# Clean fusion names
+# ============================================================
+functional_df <- functional_df %>%
+  mutate(fusions = trimws(fusions))
+
+overlap_df <- overlap_df %>%
+  mutate(OverlappingFusions = trimws(OverlappingFusions))
+
+# ============================================================
+# Keep only overlapping fusions
+# ============================================================
+overlap_functional_df <- functional_df %>%
+  filter(fusions %in% overlap_df$OverlappingFusions)
+
+# ============================================================
+# Save output
+# ============================================================
+write_csv(overlap_functional_df, out_file)
+
+# ============================================================
+# Print summary
+# ============================================================
+cat("Total rows in functional fusion file:", nrow(functional_df), "\n")
+cat("Total overlapping fusion names:", nrow(overlap_df), "\n")
+cat("Matched rows saved:", nrow(overlap_functional_df), "\n")
+cat("Output saved to:\n", out_file, "\n")
+```
