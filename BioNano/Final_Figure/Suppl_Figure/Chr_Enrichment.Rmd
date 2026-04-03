@@ -1,0 +1,236 @@
+---
+title: "Chr_Enrichment"
+output: html_document
+date: "2026-04-03"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+##### Chromosomal Enrichment Analysis for PDO and Tumor #####
+# Restricted to fusions in background ("PutativeGeneFusion")
+
+library(dplyr)
+library(ggplot2)
+```
+
+
+```{r}
+# ============================================================
+# INPUT FILES
+# ============================================================
+functional_fusions <- read.csv(
+  "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Functional_Fusion/functional_fusions_expression_only.csv",
+  stringsAsFactors = FALSE
+)
+
+SV_df <- read.csv(
+  "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Cohort/SV_df_unqiue.csv",
+  stringsAsFactors = FALSE
+)
+
+# ============================================================
+# OUTPUT DIRECTORIES
+# ============================================================
+outdir_base <- "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Functional_Fusion"
+dir.create(file.path(outdir_base, "PDO"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(outdir_base, "Tumor"), recursive = TRUE, showWarnings = FALSE)
+
+# ============================================================
+# DEFINE CHROMOSOMES OF INTEREST
+# ============================================================
+chr_focus <- c("chr1", "chr8", "chr11", "chr12", "chr17")
+
+# ============================================================
+# CLEAN / STANDARDIZE
+# ============================================================
+functional_fusions$chrA <- trimws(functional_fusions$chrA)
+functional_fusions$chrB <- trimws(functional_fusions$chrB)
+
+SV_df$RefcontigID1 <- trimws(SV_df$RefcontigID1)
+SV_df$RefcontigID2 <- trimws(SV_df$RefcontigID2)
+```
+
+
+```{r}
+# ============================================================
+# SPLIT PDO AND TUMOR
+# functional_fusions uses "samples"
+# SV_df may use either "sample" or "samples"
+# ============================================================
+if ("sample" %in% colnames(SV_df)) {
+  sv_sample_col <- "sample"
+} else if ("samples" %in% colnames(SV_df)) {
+  sv_sample_col <- "samples"
+} else {
+  stop("No sample column found in SV_df. Expected 'sample' or 'samples'.")
+}
+
+functional_fusions_pdo <- functional_fusions %>%
+  filter(grepl("^IPM", samples))
+
+functional_fusions_tumor <- functional_fusions %>%
+  filter(grepl("^TP", samples))
+
+SV_df_pdo <- SV_df %>%
+  filter(grepl("^IPM", .data[[sv_sample_col]]))
+
+SV_df_tumor <- SV_df %>%
+  filter(grepl("^TP", .data[[sv_sample_col]]))
+```
+
+
+```{r}
+# ============================================================
+# FUNCTION
+# ============================================================
+run_chr_enrichment <- function(functional_df, fusion_df, group_name, outdir_group) {
+
+  cat("\n====================================================\n")
+  cat("Running:", group_name, "\n")
+  cat("====================================================\n")
+
+  # Filter to include only true fusions in background
+  fusion_df_fusions_only <- fusion_df %>%
+    filter(!is.na(PutativeGeneFusion) &
+             PutativeGeneFusion != "" &
+             PutativeGeneFusion != "-")
+
+  # Count chromosome appearances in expression-relevant fusions
+  fusion_chr_counts <- sapply(chr_focus, function(chr) {
+    sum(functional_df$chrA == chr, na.rm = TRUE) +
+      sum(functional_df$chrB == chr, na.rm = TRUE)
+  })
+
+  cat("\nExpression-Relevant Fusions (chrA + chrB appearances):\n")
+  print(fusion_chr_counts)
+
+  # Count chromosome appearances in background fusions
+  all_chr_counts <- sapply(chr_focus, function(chr) {
+    sum(fusion_df_fusions_only$RefcontigID1 == chr, na.rm = TRUE) +
+      sum(fusion_df_fusions_only$RefcontigID2 == chr, na.rm = TRUE)
+  })
+
+  cat("\nBackground Fusions (RefcontigID1 + RefcontigID2 appearances):\n")
+  print(all_chr_counts)
+
+  cat("\nTotal Expression-Relevant Fusion Rows:", nrow(functional_df), "\n")
+  cat("Total Background Fusion Rows:", nrow(fusion_df_fusions_only), "\n")
+
+  # Fisher test
+  results <- lapply(chr_focus, function(chr) {
+    exp_chr <- fusion_chr_counts[chr]
+    bg_chr  <- all_chr_counts[chr]
+
+    nonexp_chr   <- bg_chr - exp_chr
+    exp_other    <- sum(fusion_chr_counts) - exp_chr
+    nonexp_other <- sum(all_chr_counts) - exp_chr - nonexp_chr
+
+    mat <- matrix(c(exp_chr, nonexp_chr, exp_other, nonexp_other), nrow = 2)
+
+    if (any(mat < 0) || any(!is.finite(mat))) {
+      warning(paste("Skipping", chr, "- invalid contingency matrix."))
+      return(data.frame(
+        chromosome = chr,
+        p_value = NA,
+        odds_ratio = NA,
+        lower_CI = NA,
+        upper_CI = NA
+      ))
+    }
+
+    ft <- fisher.test(mat)
+
+    data.frame(
+      chromosome = chr,
+      p_value = ft$p.value,
+      odds_ratio = unname(ft$estimate),
+      lower_CI = ft$conf.int[1],
+      upper_CI = ft$conf.int[2]
+    )
+  }) %>% bind_rows()
+
+  cat("\nFisher Test Results:\n")
+  print(results)
+
+  # Significance labels
+  results <- results %>%
+    mutate(
+      sig_label = case_when(
+        p_value < 0.001 ~ "***",
+        p_value < 0.01  ~ "**",
+        p_value < 0.05  ~ "*",
+        TRUE            ~ ""
+      ),
+      label_y = ifelse(is.na(upper_CI), odds_ratio, upper_CI + 0.3)
+    )
+
+  # Plot
+  chr_fusion_enrichment_plot <- ggplot(results, aes(x = chromosome, y = odds_ratio)) +
+    geom_bar(stat = "identity", fill = "steelblue") +
+    geom_errorbar(aes(ymin = lower_CI, ymax = upper_CI), width = 0.2) +
+    geom_text(aes(y = label_y, label = sig_label), vjust = 0, size = 6) +
+    labs(
+      # title = paste0("OR of Expression-Relevant Fusions by Chromosome (", group_name, ")"),
+      y = "Odds Ratio (Fisher Test)",
+      x = "Chromosome"
+    ) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+    theme_classic(base_size = 16) +
+    theme(
+      axis.line = element_line(color = "black"),
+      axis.ticks = element_line(color = "black"),
+      plot.title = element_text(size = 18, hjust = 0.5),
+      axis.text = element_text(size = 16),
+      axis.title = element_text(size = 16)
+    )
+
+  # Save summary table
+  write.csv(
+    results,
+    file = file.path(outdir_group, paste0("chr_fusion_enrichment_summary_", group_name, ".csv")),
+    row.names = FALSE
+  )
+
+  # Save plots
+  ggsave(
+    filename = file.path(outdir_group, paste0("chr_fusion_enrichment_plot_", group_name, ".png")),
+    plot = chr_fusion_enrichment_plot,
+    width = 8,
+    height = 5,
+    dpi = 300
+  )
+
+  ggsave(
+    filename = file.path(outdir_group, paste0("chr_fusion_enrichment_plot_", group_name, ".pdf")),
+    plot = chr_fusion_enrichment_plot,
+    width = 8,
+    height = 5
+  )
+
+  return(results)
+}
+```
+
+
+```{r}
+# ============================================================
+# RUN FOR PDO AND TUMOR
+# ============================================================
+results_pdo <- run_chr_enrichment(
+  functional_df = functional_fusions_pdo,
+  fusion_df     = SV_df_pdo,
+  group_name    = "PDO",
+  outdir_group  = file.path(outdir_base, "PDO")
+)
+
+results_tumor <- run_chr_enrichment(
+  functional_df = functional_fusions_tumor,
+  fusion_df     = SV_df_tumor,
+  group_name    = "Tumor",
+  outdir_group  = file.path(outdir_base, "Tumor")
+)
+```
+

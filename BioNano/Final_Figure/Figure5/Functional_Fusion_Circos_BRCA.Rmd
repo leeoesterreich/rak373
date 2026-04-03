@@ -1,0 +1,269 @@
+---
+title: "Functional_Fusion_BRCA"
+output: html_document
+date: "2026-04-02"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# ============================================================
+# BRCA-only Functional Fusion Circos Plot for PDO and Tumor
+# - filters fusion table to BRCA genes
+# - saves BRCA-only CSV
+# - makes circos plot (PDF + PNG)
+# - makes legend (PDF + PNG)
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(circlize)
+  library(data.table)
+})
+```
+
+
+```{r }
+# =========================
+# Shared files
+# =========================
+brca_file <- "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Reference/Unique_genes_TCGA_ICGC.txt"
+cyto_file <- "/ix1/alee/LO_LAB/Personal/Rahul/Reference_genome/Human/Human_ref_hg38_p7/cytoBand.txt"
+
+# =========================
+# Colors by expression status
+# =========================
+exp_colors <- c(
+  "up-regulation"   = "#E64B35",
+  "down-regulation" = "#4DBBD5"
+)
+```
+
+
+```{r }
+# =========================
+# Function
+# =========================
+make_brca_circos <- function(fusion_file, out_dir, prefix, plot_title = NULL) {
+  
+  # -----------------------------
+  # Read fusion data
+  # -----------------------------
+  fusion_df <- read.csv(fusion_file, stringsAsFactors = FALSE)
+  
+  brca_genes <- readLines(brca_file)
+  brca_genes <- trimws(brca_genes)
+  brca_genes <- brca_genes[brca_genes != ""]
+  
+  # -----------------------------
+  # Keep rows where geneA or geneB
+  # is in the BRCA gene list
+  # -----------------------------
+  fusion_brca <- fusion_df %>%
+    filter(geneA %in% brca_genes | geneB %in% brca_genes)
+  
+  # -----------------------------
+  # Save BRCA-only CSV
+  # -----------------------------
+  out_csv <- file.path(out_dir, paste0(prefix, ".BRCA_only.csv"))
+  write.csv(fusion_brca, out_csv, row.names = FALSE)
+  
+  cat("\n=====================================\n")
+  cat(prefix, "\n")
+  cat("=====================================\n")
+  cat("Total rows in input:", nrow(fusion_df), "\n")
+  cat("Rows kept in BRCA-only output:", nrow(fusion_brca), "\n")
+  cat("Saved BRCA-only CSV to:", out_csv, "\n")
+  
+  # -----------------------------
+  # Output files for plots
+  # -----------------------------
+  out_circos_pdf <- file.path(out_dir, paste0(prefix, ".BRCA_only.circos.pdf"))
+  out_circos_png <- file.path(out_dir, paste0(prefix, ".BRCA_only.circos.png"))
+  out_legend_pdf <- file.path(out_dir, paste0(prefix, ".BRCA_only.legend.pdf"))
+  out_legend_png <- file.path(out_dir, paste0(prefix, ".BRCA_only.legend.png"))
+  
+  # -----------------------------
+  # Read BRCA-only CSV for plotting
+  # -----------------------------
+  dt <- fread(out_csv)
+  
+  req <- c("chrA", "StartA", "chrB", "StartB", "exp")
+  missing_req <- setdiff(req, names(dt))
+  if (length(missing_req) > 0) {
+    stop("Missing required columns: ", paste(missing_req, collapse = ", "))
+  }
+  
+  dt[, chrA := as.character(chrA)]
+  dt[, chrB := as.character(chrB)]
+  dt[, StartA := suppressWarnings(as.numeric(StartA))]
+  dt[, StartB := suppressWarnings(as.numeric(StartB))]
+  dt[, exp := as.character(exp)]
+  
+  dt <- dt[!is.na(StartA) & !is.na(StartB)]
+  dt <- dt[nchar(chrA) > 0 & nchar(chrB) > 0]
+  
+  std_chr <- c(paste0("chr", 1:22), "chrX", "chrY")
+  dt <- dt[chrA %in% std_chr & chrB %in% std_chr]
+  
+  dt[, exp_clean := exp]
+  dt[!(exp_clean %in% names(exp_colors)) & !is.na(exp_clean), exp_clean := NA]
+  
+  if (dt[is.na(exp_clean), .N] > 0) {
+    bad_levels <- unique(dt[is.na(exp_clean), exp])
+    message("WARNING: Found exp values not in exp_colors. These rows will be dropped.")
+    message("Bad exp levels: ", paste(bad_levels, collapse = ", "))
+    dt <- dt[!is.na(exp_clean)]
+  }
+  # -----------------------------
+  # Collapse arcs
+  # -----------------------------
+  dt_arc <- dt[, .(
+    n_fusions = .N,
+    exp_major = names(sort(table(exp_clean), decreasing = TRUE))[1]
+  ), by = .(chrA, StartA, chrB, StartB)]
+  
+  message("Total fusion rows in BRCA-only CSV: ", nrow(dt))
+  message("Unique arcs to plot: ", nrow(dt_arc))
+  message("Max fusions per arc: ", ifelse(nrow(dt_arc) > 0, max(dt_arc$n_fusions), NA))
+  
+  message("\nTop arcs by fusion count:")
+  print(dt_arc[order(-n_fusions)][1:min(10, .N)])
+  
+  # -----------------------------
+  # Add end positions and line width
+  # -----------------------------
+  dt_arc[, EndA := StartA]
+  dt_arc[, EndB := StartB]
+  dt_arc[, line_width := pmin(n_fusions, 5)]
+  
+  # -----------------------------
+  # Prepare links
+  # -----------------------------
+  links <- data.frame(
+    chr1 = dt_arc$chrA,
+    start1 = dt_arc$StartA,
+    end1 = dt_arc$EndA,
+    chr2 = dt_arc$chrB,
+    start2 = dt_arc$StartB,
+    end2 = dt_arc$EndB,
+    n_fusions = dt_arc$n_fusions,
+    line_width = dt_arc$line_width,
+    color = exp_colors[dt_arc$exp_major]
+  )
+  
+  valid_chroms <- std_chr
+  
+  # -----------------------------
+  # Plot function
+  # -----------------------------
+  plot_fusion_circos <- function() {
+    circos.clear()
+    circos.par("track.height" = 0.05, cell.padding = c(0, 0, 0, 0), gap.degree = 1)
+    
+    circos.initializeWithIdeogram(
+      species = "hg38",
+      chromosome.index = valid_chroms,
+      labels.cex = 1.5
+    )
+    
+    if (!is.null(plot_title)) {
+      title(plot_title)
+    }
+    
+    if (nrow(links) > 0) {
+      for (i in 1:nrow(links)) {
+        circos.genomicLink(
+          region1 = links[i, c("chr1", "start1", "end1"), drop = FALSE],
+          region2 = links[i, c("chr2", "start2", "end2"), drop = FALSE],
+          col = links$color[i],
+          rou = 0.8,
+          lwd = links$line_width[i]
+        )
+      }
+    } else {
+      warning("No fusions to plot.")
+    }
+  }
+  
+  # -----------------------------
+  # Save circos PNG
+  # -----------------------------
+  png(out_circos_png, width = 2400, height = 2400, res = 300)
+  par(mar = c(1, 1, 1, 1))
+  plot_fusion_circos()
+  dev.off()
+  
+  # -----------------------------
+  # Save circos PDF
+  # -----------------------------
+  pdf(out_circos_pdf, width = 8, height = 8)
+  par(mar = c(1, 1, 1, 1))
+  plot_fusion_circos()
+  dev.off()
+  
+  # -----------------------------
+  # Save legend PNG
+  # -----------------------------
+  png(out_legend_png, width = 600, height = 400, res = 300)
+  par(mar = c(0, 0, 0, 0))
+  plot.new()
+  legend("center",
+         legend = c("Up-regulated Fusions", "Down-regulated Fusions"),
+         col = c("#E64B35", "#4DBBD5"),
+         pch = 15,
+         pt.cex = 1.2,
+         cex = 0.9,
+         title = "Fusion Expression",
+         title.cex = 1.0,
+         bty = "n")
+  dev.off()
+  
+  # -----------------------------
+  # Save legend PDF
+  # -----------------------------
+  pdf(out_legend_pdf, width = 2.5, height = 1.5)
+  par(mar = c(0, 0, 0, 0))
+  plot.new()
+  legend("center",
+         legend = c("Up-regulated Fusions", "Down-regulated Fusions"),
+         col = c("#E64B35", "#4DBBD5"),
+         pch = 15,
+         pt.cex = 1.2,
+         cex = 0.9,
+         title = "Fusion Expression",
+         title.cex = 1.0,
+         bty = "n")
+  dev.off()
+  
+  message("\nPlots saved to:")
+  message("  Circos PNG: ", out_circos_png)
+  message("  Circos PDF: ", out_circos_pdf)
+  message("  Legend PNG: ", out_legend_png)
+  message("  Legend PDF: ", out_legend_pdf)
+}
+```
+
+
+```{r }
+
+
+# =========================
+# Run for PDO
+# =========================
+make_brca_circos(
+  fusion_file = "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Functional_Fusion/IPM/functional_fusions_expression_only_PDO.csv",
+  out_dir     = "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Functional_Fusion/IPM",
+  prefix      = "functional_fusions_expression_only_IPM")
+```
+
+
+```{r }
+# =========================
+# Run for Tumor
+# =========================
+make_brca_circos(
+  fusion_file = "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Functional_Fusion/Tumor/functional_fusions_expression_only_Tumor.csv",
+  out_dir     = "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Functional_Fusion/Tumor",
+  prefix      = "functional_fusions_expression_only_Tumor")
+```
+
