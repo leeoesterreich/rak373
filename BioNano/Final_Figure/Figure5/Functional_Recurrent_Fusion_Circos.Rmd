@@ -1,0 +1,334 @@
+---
+title: "Functional_Recurrent_Fusion_Circos"
+output: html_document
+date: "2026-04-02"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# ============================================================
+# Recurrent fusion circos plot
+# ============================================================
+
+# ==== Load libraries ====
+library(circlize)
+library(data.table)
+library(RColorBrewer)
+library(dplyr)
+```
+
+```{r}
+# ============================================================
+# Set cohort = "Tumor" or "PDO"
+# ============================================================
+cohort <- "PDO" 
+
+# ============================================================
+# Input / output settings
+# ============================================================
+if (cohort == "Tumor") {
+  fusion_file <- "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Functional_Fusion/Tumor/functional_fusions_expression_only_Tumor.csv"
+  recurrent_file <- "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Functional_Fusion/Tumor/repeated_fusions_across_samples.tsv"
+  outdir <- "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Functional_Fusion/Tumor"
+  out_prefix <- "Functional_Fusion_Combined_Tumor_Circos"
+} else if (cohort == "PDO") {
+  fusion_file <- "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Functional_Fusion/IPM/functional_fusions_expression_only_PDO.csv"
+  recurrent_file <- "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Functional_Fusion/IPM/repeated_fusions_across_samples.tsv"
+  outdir <- "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Functional_Fusion/IPM"
+  out_prefix <- "Functional_Fusion_Combined_PDO_Circos"
+} else {
+  stop("Invalid cohort. Use 'Tumor' or 'PDO'.")
+}
+```
+
+```{r}
+# ============================================================
+# Load functional fusion data
+# ============================================================
+fusion_data <- fread(fusion_file)
+
+# ============================================================
+# Load recurrent fusions across samples
+# This file is a TSV and the fusion name column is 'fusions'
+# unique() removes repeated entries coming from different samples
+# ============================================================
+events_to_label_df <- read.delim(
+  recurrent_file,
+  check.names = FALSE,
+  stringsAsFactors = FALSE
+)
+
+events_to_label <- unique(events_to_label_df$fusions)
+
+# show rows in fusion_data that match recurrent fusions
+matched_fusions <- fusion_data[fusions %in% events_to_label]
+print(paste("Number of matching recurrent fusions in fusion_data:", nrow(matched_fusions)))
+if (nrow(matched_fusions) > 0) {
+  print(head(matched_fusions))
+}
+```
+
+```{r}
+# ============================================================
+# Keep valid chromosomes only
+# ============================================================
+valid_chroms <- paste0("chr", c(1:22, "X"))
+fusion_data <- fusion_data[fusion_data$chrA %in% valid_chroms & fusion_data$chrB %in% valid_chroms]
+
+# ============================================================
+# Keep only fusions with expression status of interest
+# ============================================================
+fusion_data <- fusion_data[exp %in% c("up-regulation", "down-regulation")]
+
+# ============================================================
+# Remove rows with missing breakpoint coordinates
+# ============================================================
+fusion_data <- fusion_data[!is.na(StartA) & !is.na(StartB)]
+fusion_data$EndA <- fusion_data$StartA
+fusion_data$EndB <- fusion_data$StartB
+```
+
+```{r}
+# ============================================================
+# Generate colors for recurrent fusions
+# ============================================================
+n_events <- length(events_to_label)
+
+if (n_events <= 8) {
+  label_colors <- brewer.pal(max(3, n_events), "Dark2")[1:n_events]
+} else if (n_events <= 12) {
+  label_colors <- brewer.pal(n_events, "Set3")
+} else {
+  label_colors <- colorRampPalette(brewer.pal(12, "Set3"))(n_events)
+}
+
+names(label_colors) <- events_to_label
+
+# ============================================================
+# Color mapping for expression status
+# ============================================================
+exp_colors <- c(
+  "up-regulation"   = "#E64B35",
+  "down-regulation" = "#4DBBD5"
+)
+```
+
+```{r}
+# ============================================================
+# Create links table for circos
+# These are the links that will be drawn inside the circos plot
+# ============================================================
+links <- data.frame(
+  chr1 = fusion_data$chrA,
+  start1 = fusion_data$StartA,
+  end1 = fusion_data$EndA,
+  chr2 = fusion_data$chrB,
+  start2 = fusion_data$StartB,
+  end2 = fusion_data$EndB,
+  exp = fusion_data$exp,
+  fusion_name = fusion_data$fusions,
+  stringsAsFactors = FALSE
+)
+```
+
+```{r}
+# ============================================================
+# Create highlight bars for recurrent fusions
+# Use unique breakpoint pairs only
+# Both gene A and gene B ends are highlighted
+# ============================================================
+
+bar_width <- 10e3  # 10 Kb window for visibility
+
+highlight_bars_list <- list()
+
+for (event in events_to_label) {
+  
+  # Keep only rows for this fusion
+  event_data <- links %>%
+    filter(fusion_name == event)
+  
+  # Remove repeated same breakpoint pairs across samples
+  event_data_unique <- event_data %>%
+    distinct(fusion_name, chr1, start1, end1, chr2, start2, end2, .keep_all = TRUE)
+  
+  if (nrow(event_data_unique) > 0) {
+    
+    # Gene A side bars
+    bars_A <- data.frame(
+      chr    = event_data_unique$chr1,
+      start  = pmax(1, event_data_unique$start1 - bar_width / 2),
+      end    = event_data_unique$end1 + bar_width / 2,
+      fusion = event,
+      color  = unname(label_colors[event]),
+      stringsAsFactors = FALSE
+    )
+    
+    # Gene B side bars
+    bars_B <- data.frame(
+      chr    = event_data_unique$chr2,
+      start  = pmax(1, event_data_unique$start2 - bar_width / 2),
+      end    = event_data_unique$end2 + bar_width / 2,
+      fusion = event,
+      color  = unname(label_colors[event]),
+      stringsAsFactors = FALSE
+    )
+    
+    # Combine A and B bars for this fusion
+    highlight_bars_list[[event]] <- bind_rows(bars_A, bars_B)
+  }
+}
+
+# Combine all events
+highlight_bars <- bind_rows(highlight_bars_list)
+
+# Optional: remove exact duplicate bars if still present
+highlight_bars <- highlight_bars %>%
+  distinct(chr, start, end, fusion, color, .keep_all = TRUE)
+
+print(paste("Number of recurrent fusion highlight bars created:", nrow(highlight_bars)))
+if (nrow(highlight_bars) > 0) {
+  print(head(highlight_bars))
+}
+```
+
+```{r}
+# ============================================================
+# Circos plotting function
+# ============================================================
+plot_fusion_circos <- function() {
+  circos.clear()
+  
+  circos.par(
+    "track.height" = 0.25,
+    cell.padding = c(0, 0, 0, 0),
+    gap.degree = 2
+  )
+  
+  # Initialize human hg38 ideogram
+  circos.initializeWithIdeogram(
+    species = "hg38",
+    chromosome.index = valid_chroms
+  )
+  
+  # Outer highlight bars for recurrent fusions
+  if (nrow(highlight_bars) > 0) {
+    circos.track(
+      ylim = c(0, 1),
+      track.height = 0.05,
+      bg.border = NA,
+      track.index = get.current.track.index() + 1,
+      panel.fun = function(x, y) {
+        chr <- CELL_META$sector.index
+        bars_in_chr <- highlight_bars[highlight_bars$chr == chr, ]
+        
+        if (nrow(bars_in_chr) > 0) {
+          for (i in 1:nrow(bars_in_chr)) {
+            circos.rect(
+              xleft = bars_in_chr$start[i],
+              xright = bars_in_chr$end[i],
+              ybottom = 0,
+              ytop = 1,
+              col = bars_in_chr$color[i],
+              border = bars_in_chr$color[i],
+              lwd = 1.5
+            )
+          }
+        }
+      }
+    )
+  }
+  
+  # Spacer track
+  circos.track(ylim = c(0, 1), track.height = 0.03, bg.border = NA)
+  
+  # Draw fusion links inside the ideogram
+  for (exp_type in unique(links$exp)) {
+    subset_links <- links[links$exp == exp_type, ]
+    
+    if (nrow(subset_links) == 0) next
+    
+    circos.genomicLink(
+      region1 = subset_links[, c("chr1", "start1", "end1")],
+      region2 = subset_links[, c("chr2", "start2", "end2")],
+      col = adjustcolor(exp_colors[exp_type], alpha.f = 0.75),
+      rou = 0.75,
+      lwd = 0.8
+    )
+  }
+}
+
+# ============================================================
+# Full plot = circos + legend
+# ============================================================
+draw_full_plot <- function() {
+  layout(matrix(c(1, 2), nrow = 1), widths = c(3, 2))
+  
+  # Circos panel
+  par(mar = c(1, 1, 1, 1))
+  plot_fusion_circos()
+  
+  # Legend panel
+  par(mar = c(1, 1, 1, 1))
+  plot.new()
+  
+  legend(
+    "top",
+    legend = names(exp_colors),
+    col = exp_colors,
+    pch = 15,
+    pt.cex = 2,
+    cex = 1.2,
+    title = "Fusion Expression",
+    bty = "n"
+  )
+  
+  legend(
+    "center",
+    legend = events_to_label,
+    col = label_colors,
+    pch = 15,
+    pt.cex = 2,
+    cex = 1,
+    title = "Highlighted Recurrent Fusions",
+    bty = "n"
+  )
+}
+
+draw_full_plot()
+```
+
+```{r}
+# ============================================================
+# Output directory
+# ============================================================
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+# ============================================================
+# Save as PNG
+# ============================================================
+png(
+  file.path(outdir, paste0(out_prefix, ".png")),
+  width = 2400,
+  height = 1600,
+  res = 300
+)
+draw_full_plot()
+dev.off()
+
+# ============================================================
+# Save as PDF
+# ============================================================
+pdf(
+  file.path(outdir, paste0(out_prefix, ".pdf")),
+  width = 14,
+  height = 8
+)
+draw_full_plot()
+dev.off()
+```
+
+
