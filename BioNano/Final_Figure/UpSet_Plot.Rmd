@@ -43,7 +43,7 @@ df_onehot <- full_df %>%
 
 ```{r}
 # ---- Convert Platform Columns to Binary ----
-platform_cols <- c("Bionano", "RNAseq")
+platform_cols <- c("OGM", "RNAseq")
 
 df_binary <- full_df %>%
   select(SampleID, all_of(platform_cols)) %>%
