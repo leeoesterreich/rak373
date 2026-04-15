@@ -1,5 +1,5 @@
 ---
-title: "Heatmap_BRCA_SV_IPM"
+title: "Heatmap_BRCA_SV_Tumor"
 output: html_document
 date: "2026-03-31"
 ---
@@ -47,7 +47,7 @@ col_fun_bar <- c(
 # ===============================
 # Load SV input data
 # ===============================
-df_raw <- fread("/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Cohort/SV_df_unqiue_IPM.csv")
+df_raw <- fread("/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Cohort/SV_df_unqiue_Tumor.csv")
 names(df_raw) <- str_trim(names(df_raw))
 
 df_raw <- df_raw %>%
@@ -226,8 +226,8 @@ rownames(annotation_df) <- annotation_df$Sample
 annotation_df <- annotation_df[colnames(mat), , drop = FALSE]
 
 source_colors <- c(
-  "Metastasis" = rgb(231, 138, 195, maxColorValue = 255),
-  "Primary"    = rgb(255, 217, 47, maxColorValue = 255)
+  "Metastasis" = "#C16622",
+  "Primary"    = "#FF99BF"
 )
 
 histology_colors <- c(
@@ -328,10 +328,10 @@ right_anno <- rowAnnotation(
 # Role & Prevalence annotations (LEFT)
 # ===============================
 role_colors <- c(
-  Oncogene = "#FF4E42",
-  TSG      = "#3B75AF",
-  Dual     = "#F2B701",
-  Other    = "#BBBBBB"
+  Oncogene = "#7F1D3A", 
+  TSG      = "#7A6A12",
+  Dual     = "#D19A00",
+  Other    = "#BDBDBD"
 )
 
 role_anno <- rowAnnotation(
@@ -396,14 +396,14 @@ draw(ht)
 # Save heatmap (no legend)
 # ===============================
 png(
-  "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Cohort/Heatmap_SV/IPM_TCGA_ICGC_BRCA_SVs_Heatmap_PlotOnly.png",
+  "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Cohort/Heatmap_SV/Tumor_TCGA_ICGC_BRCA_SVs_Heatmap_PlotOnly.png",
   width = 10, height = 16, units = "in", res = 300
 )
 draw(ht)
 dev.off()
 
 pdf(
-  "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Cohort/Heatmap_SV/IPM_TCGA_ICGC_BRCA_SVs_Heatmap_PlotOnly.pdf",
+  "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Cohort/Heatmap_SV/Tumor_TCGA_ICGC_BRCA_SVs_Heatmap_PlotOnly.pdf",
   width = 12, height = 14
 )
 draw(ht)
@@ -446,7 +446,7 @@ combined_legend <- packLegend(
 )
 
 png(
-  "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Cohort/Heatmap_SV/IPM_TCGA_ICGC_BRCA_SVs_Combined_Legend.png",
+  "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Cohort/Heatmap_SV/Tumor_TCGA_ICGC_BRCA_SVs_Combined_Legend.png",
   width = 5, height = 6, units = "in", res = 300
 )
 grid.newpage()
@@ -454,7 +454,7 @@ draw(combined_legend)
 dev.off()
 
 pdf(
-  "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Cohort/Heatmap_SV/IPM_TCGA_ICGC_BRCA_SVs_Combined_Legend.pdf",
+  "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Cohort/Heatmap_SV/Tumor_TCGA_ICGC_BRCA_SVs_Combined_Legend.pdf",
   width = 5, height = 6
 )
 grid.newpage()
@@ -466,7 +466,7 @@ dev.off()
 # ===============================
 write.csv(
   gene_metadata,
-  "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Cohort/Heatmap_SV/IPM_TCGA_ICGC_BRCA_genes_with_roles.csv",
+  "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Cohort/Heatmap_SV/Tumor_TCGA_ICGC_BRCA_genes_with_roles.csv",
   row.names = FALSE
 )
 ```
@@ -474,7 +474,7 @@ write.csv(
 # ===============================
 # Optional sanity check 
 # ===============================
-cat("\nSanity check: PPM1D event-level counts in IPM\n")
+cat("\nSanity check: PPM1D event-level counts in Tumor\n")
 print(df_top %>%
         filter(OverlapGenes == "PPM1D") %>%
         distinct(sample, event_id, Type) %>%
