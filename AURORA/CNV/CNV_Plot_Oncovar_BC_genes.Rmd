@@ -1,0 +1,297 @@
+---
+title: "CNV_Plot_Oncovar_BC_genes"
+output: html_document
+date: "2026-04-16"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(ComplexHeatmap)
+library(circlize)
+```
+
+
+```{r}
+# So for a case-wise CNV heatmap, the most sensible choice is to use 267 altered cases
+# exclude AO92, APID, AQ3V
+# if all samples are NEUT → NEUT
+# if some samples show gain-side calls and some show loss-side calls for the same gene → MIXED
+# otherwise collapse to the strongest state:
+# HLAMP > AMP > GAIN
+# HOMD > HETD
+```
+
+
+```{r}
+#
+# ===============================
+# Paths
+# ===============================
+cnr_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/AURORA/CNVKit/Annotated_cnr_file"
+
+tcga_file <- "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Reference/TCGA.BRCA.onco.genes.OncoVar.tsv"
+icgc_file <- "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Reference/ICGC.BRCA.onco.genes.OncoVar.tsv"
+
+# ===============================
+# Load OncoVar genes
+# ===============================
+tcga_df <- fread(tcga_file) %>% mutate(Source = "TCGA")
+icgc_df <- fread(icgc_file) %>% mutate(Source = "ICGC")
+combined_df <- bind_rows(tcga_df, icgc_df)
+
+# update this line if your gene column has a different name
+gene_col_oncovar <- "Gene_symbol"
+
+onco_genes <- combined_df %>%
+  pull(all_of(gene_col_oncovar)) %>%
+  unique() %>%
+  na.omit()
+
+cat("Number of OncoVar genes:", length(onco_genes), "\n")
+```
+
+
+```{r}
+# ===============================
+# List files
+# ===============================
+cnr_files <- list.files(
+  path = cnr_dir,
+  pattern = "\\.annotated\\.cnr$",
+  full.names = TRUE
+)
+
+cat("Total files:", length(cnr_files), "\n")
+
+# ===============================
+# Read one CNR file
+# ===============================
+read_one_cnr <- function(f) {
+  dt <- fread(f)
+
+  sample_name <- basename(f) %>%
+    str_remove("\\.annotated\\.cnr$")
+
+  case_id <- sub("-.*", "", sample_name)
+
+  corrected_call_col <- grep("\\.Corrected_Call$", names(dt), value = TRUE)
+
+  if (length(corrected_call_col) == 0) return(NULL)
+
+  dt %>%
+    transmute(
+      chromosome = chromosome,
+      start = start,
+      end = end,
+      gene = gene,
+      Sample = sample_name,
+      Case = case_id,
+      Corrected_Call = as.character(.data[[corrected_call_col[1]]])
+    )
+}
+
+all_cnr <- map_dfr(cnr_files, read_one_cnr)
+
+# ===============================
+# Remove cases with no CNV at all
+# ===============================
+case_status <- all_cnr %>%
+  group_by(Sample, Case) %>%
+  summarise(
+    has_CNV = any(!is.na(Corrected_Call) & Corrected_Call != "NEUT"),
+    .groups = "drop"
+  ) %>%
+  group_by(Case) %>%
+  summarise(
+    has_CNV = any(has_CNV),
+    .groups = "drop"
+  )
+
+altered_cases <- case_status %>%
+  filter(has_CNV) %>%
+  pull(Case)
+
+cat("Cases with CNV alteration:", length(altered_cases), "\n")
+
+all_cnr <- all_cnr %>%
+  filter(Case %in% altered_cases)
+```
+
+
+```{r}
+# ===============================
+# Split multi-gene rows
+# ===============================
+cnr_long <- all_cnr %>%
+  separate_rows(gene, sep = ",") %>%
+  mutate(
+    gene = str_trim(gene),
+    Corrected_Call = str_trim(Corrected_Call)
+  ) %>%
+  filter(gene %in% onco_genes)
+
+cat("Rows after filtering to OncoVar genes:", nrow(cnr_long), "\n")
+cat("Genes present in CNR among OncoVar set:", length(unique(cnr_long$gene)), "\n")
+```
+
+
+```{r}
+# ===============================
+# Helper functions
+# ===============================
+gain_states <- c("GAIN", "AMP", "HLAMP")
+loss_states <- c("HETD", "HOMD")
+
+sample_call_rank <- c(
+  "NEUT"  = 0,
+  "HETD"  = 1,
+  "HOMD"  = 2,
+  "GAIN"  = 1,
+  "AMP"   = 2,
+  "HLAMP" = 3
+)
+
+collapse_sample_gene <- function(x) {
+  x <- unique(na.omit(x))
+  if (length(x) == 0) return("NEUT")
+  if (all(x == "NEUT")) return("NEUT")
+
+  # if both gain and loss present within same sample/gene across segments
+  if (any(x %in% gain_states) & any(x %in% loss_states)) return("MIXED")
+
+  if (any(x == "HLAMP")) return("HLAMP")
+  if (any(x == "AMP"))   return("AMP")
+  if (any(x == "GAIN"))  return("GAIN")
+  if (any(x == "HOMD"))  return("HOMD")
+  if (any(x == "HETD"))  return("HETD")
+  return("NEUT")
+}
+
+collapse_case_gene <- function(x) {
+  x <- unique(na.omit(x))
+  if (length(x) == 0) return("NEUT")
+  if (all(x == "NEUT")) return("NEUT")
+
+  # if different samples from same case show gain and loss
+  if (any(x %in% c("GAIN","AMP","HLAMP")) & any(x %in% c("HETD","HOMD"))) return("MIXED")
+  if ("MIXED" %in% x) return("MIXED")
+
+  if (any(x == "HLAMP")) return("HLAMP")
+  if (any(x == "AMP"))   return("AMP")
+  if (any(x == "GAIN"))  return("GAIN")
+  if (any(x == "HOMD"))  return("HOMD")
+  if (any(x == "HETD"))  return("HETD")
+  return("NEUT")
+}
+
+# ===============================
+# Collapse to Sample-Gene first
+# ===============================
+sample_gene_calls <- cnr_long %>%
+  group_by(Sample, Case, gene) %>%
+  summarise(
+    Call = collapse_sample_gene(Corrected_Call),
+    .groups = "drop"
+  )
+
+# ===============================
+# Collapse Sample-Gene to Case-Gene
+# ===============================
+case_gene_calls <- sample_gene_calls %>%
+  group_by(Case, gene) %>%
+  summarise(
+    Call = collapse_case_gene(Call),
+    .groups = "drop"
+  )
+
+# ===============================
+# Make heatmap matrix
+# ===============================
+heatmap_df <- case_gene_calls %>%
+  pivot_wider(
+    names_from = Case,
+    values_from = Call,
+    values_fill = "NEUT"
+  )
+
+heatmap_mat <- as.matrix(heatmap_df[, -1])
+rownames(heatmap_mat) <- heatmap_df$gene
+
+# keep genes altered in at least one case
+heatmap_mat <- heatmap_mat[
+  apply(heatmap_mat, 1, function(x) any(x != "NEUT")),
+  ,
+  drop = FALSE
+]
+
+# order genes and cases by alteration burden
+gene_order <- order(apply(heatmap_mat, 1, function(x) sum(x != "NEUT")), decreasing = TRUE)
+case_order <- order(apply(heatmap_mat, 2, function(x) sum(x != "NEUT")), decreasing = TRUE)
+
+heatmap_mat <- heatmap_mat[gene_order, case_order, drop = FALSE]
+
+cat("Final heatmap dimensions:", nrow(heatmap_mat), "genes x", ncol(heatmap_mat), "cases\n")
+```
+
+
+```{r}
+# ===============================
+# Colors
+# ===============================
+cnv_colors <- c(
+  "HLAMP" = "#B2182B",
+  "AMP"   = "#EF8A62",
+  "GAIN"  = "#FDCC8A",
+  "NEUT"  = "white",
+  "HETD"  = "#A6BDDB",
+  "HOMD"  = "#2166AC",
+  "MIXED" = "#6A3D9A"
+)
+
+# ===============================
+# Plot
+# ===============================
+ht <- Heatmap(
+  heatmap_mat,
+  name = "CNV",
+  col = cnv_colors,
+  rect_gp = gpar(col = "grey90"),
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  show_row_names = TRUE,
+  show_column_names = FALSE,
+  row_names_gp = gpar(fontsize = 8),
+  column_title = "Case-wise CNV heatmap of OncoVar breast cancer genes",
+  heatmap_legend_param = list(
+    at = c("HLAMP", "AMP", "GAIN", "NEUT", "HETD", "HOMD", "MIXED"),
+    labels = c("HLAMP", "AMP", "GAIN", "NEUT", "HETD", "HOMD", "MIXED")
+  )
+)
+
+draw(ht)
+```
+```{r}
+# ===============================
+# Save as PDF
+# ===============================
+pdf("Casewise_OncoVar_CNV_heatmap.pdf", width = 16, height = 10)
+draw(ht)
+dev.off()
+
+# ===============================
+# Save as PNG
+# ===============================
+png("Casewise_OncoVar_CNV_heatmap.png", width = 16, height = 10, units = "in", res = 300)
+draw(ht)
+dev.off()
+
+```
+

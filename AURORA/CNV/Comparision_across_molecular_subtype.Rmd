@@ -1,0 +1,554 @@
+---
+title: "Comparision across molecular subtype"
+output: html_document
+date: "2026-04-16"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Gene list based on Pedram Razavi et.al. 2018
+# if all samples are NEUT → NEUT
+# if some samples show gain-side calls and some show loss-side calls for the same gene → MIXED
+# otherwise collapse to the strongest state:
+# HLAMP > AMP > GAIN
+# HOMD > HETD
+
+library(readxl)
+library(dplyr)
+library(stringr)
+
+# ===============================
+# Path
+# ===============================
+clinical_file <- "/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/AURORA/Clinical_data/Metasheet_Analysis.xlsx"
+
+# ===============================
+# Read file
+# ===============================
+clinical_df <- read_excel(clinical_file)
+
+# ===============================
+# Keep only needed columns
+# ===============================
+df <- clinical_df %>%
+  mutate(
+    Sample_ID = as.character(Collaborator_sample_id),
+    Molecular_subtype = as.character(Molecular_subtype),
+    Histological_subtype = as.character(Histological_subtype)
+  ) %>%
+  mutate(
+    Sample_ID = str_trim(Sample_ID),
+    Molecular_subtype = str_trim(Molecular_subtype),
+    Histological_subtype = str_trim(Histological_subtype)
+  ) %>%
+  filter(!is.na(Sample_ID), Sample_ID != "") %>%
+  mutate(
+    # Extract middle token as case ID
+    Case_ID = sub("^[^-]+-([^-]+)-.*$", "\\1", Sample_ID)
+  )
+```
+
+
+```{r}
+# ===============================
+# Print unique raw values
+# ===============================
+cat("\n===============================\n")
+cat("Unique raw values in Molecular_subtype\n")
+cat("===============================\n")
+print(sort(unique(df$Molecular_subtype)))
+
+cat("\n===============================\n")
+cat("Unique raw values in Histological_subtype\n")
+cat("===============================\n")
+print(sort(unique(df$Histological_subtype)))
+```
+
+
+```{r}
+# ===============================
+# Sample-level summary
+# ===============================
+cat("\n===============================\n")
+cat("Sample-level summary\n")
+cat("===============================\n")
+cat("Total unique samples:", n_distinct(df$Sample_ID), "\n")
+
+cat("\n-------------------------------\n")
+cat("Sample counts by raw Molecular_subtype\n")
+cat("-------------------------------\n")
+print(
+  df %>%
+    distinct(Sample_ID, Molecular_subtype) %>%
+    count(Molecular_subtype, sort = TRUE)
+)
+
+cat("\n-------------------------------\n")
+cat("Sample counts by raw Histological_subtype\n")
+cat("-------------------------------\n")
+print(
+  df %>%
+    distinct(Sample_ID, Histological_subtype) %>%
+    count(Histological_subtype, sort = TRUE)
+)
+```
+
+
+```{r}
+# ===============================
+# Case-level summary
+# Case = middle token in Collaborator_sample_id
+# Example: AUP-AL1Y-NB1 -> AL1Y
+# ===============================
+cat("\n===============================\n")
+cat("Case-level summary\n")
+cat("===============================\n")
+cat("Total unique cases:", n_distinct(df$Case_ID), "\n")
+
+cat("\n-------------------------------\n")
+cat("Case counts by raw Molecular_subtype\n")
+cat("-------------------------------\n")
+print(
+  df %>%
+    distinct(Case_ID, Molecular_subtype) %>%
+    count(Molecular_subtype, sort = TRUE)
+)
+
+cat("\n-------------------------------\n")
+cat("Case counts by raw Histological_subtype\n")
+cat("-------------------------------\n")
+print(
+  df %>%
+    distinct(Case_ID, Histological_subtype) %>%
+    count(Histological_subtype, sort = TRUE)
+)
+```
+```{r}
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(readxl)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+
+# ===============================
+# Paths
+# ===============================
+cnr_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/AURORA/CNVKit/Annotated_cnr_file"
+clinical_file <- "/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/AURORA/Clinical_data/Metasheet_Analysis.xlsx"
+
+# ===============================
+# Genes of interest
+# ===============================
+genes_of_interest <- c(
+  "ERBB2", "FGFR1", "NF1", "GNAS", "PAK1", "PIK3CA", "PTEN",
+  "AKT1", "GATA3", "ESR1", "FOXA1", "KMT2C", "ARID1A", "TBX3",
+  "MYC", "MCL1", "MAP3K1", "RECQL4", "RARA", "CCND1", "CDH1", "TP53"
+)
+
+# ===============================
+# Helper functions
+# ===============================
+
+# Collapse multiple segment-level calls within one sample-gene
+collapse_sample_gene <- function(x) {
+  x <- unique(na.omit(x))
+  if (length(x) == 0) return("NEUT")
+  if (all(x == "NEUT")) return("NEUT")
+
+  gain_states <- c("GAIN", "AMP", "HLAMP")
+  loss_states <- c("HETD", "HOMD")
+
+  # same sample/gene contains both gain-side and loss-side events
+  if (any(x %in% gain_states) & any(x %in% loss_states)) return("MIXED")
+
+  if ("HLAMP" %in% x) return("HLAMP")
+  if ("AMP"   %in% x) return("AMP")
+  if ("GAIN"  %in% x) return("GAIN")
+  if ("HOMD"  %in% x) return("HOMD")
+  if ("HETD"  %in% x) return("HETD")
+  return("NEUT")
+}
+
+# Collapse multiple samples within one case-gene
+collapse_case_gene <- function(x) {
+  x <- unique(na.omit(x))
+  if (length(x) == 0) return("NEUT")
+  if (all(x == "NEUT")) return("NEUT")
+
+  gain_states <- c("GAIN", "AMP", "HLAMP")
+  loss_states <- c("HETD", "HOMD")
+
+  if (any(x %in% gain_states) & any(x %in% loss_states)) return("MIXED")
+  if ("MIXED" %in% x) return("MIXED")
+
+  if ("HLAMP" %in% x) return("HLAMP")
+  if ("AMP"   %in% x) return("AMP")
+  if ("GAIN"  %in% x) return("GAIN")
+  if ("HOMD"  %in% x) return("HOMD")
+  if ("HETD"  %in% x) return("HETD")
+  return("NEUT")
+}
+
+```
+
+```{r}
+# Collapse case-level subtype
+collapse_case_subtype <- function(x) {
+  x <- unique(na.omit(x))
+  x <- x[x != ""]
+  if (length(x) == 0) return("Unknown")
+  if (length(x) == 1) return(x)
+  # if multiple subtype labels within same case
+  return("Unknown")
+}
+
+# Collapse case-level histology
+collapse_case_histology <- function(x) {
+  x <- unique(na.omit(x))
+  x <- x[x != ""]
+  if (length(x) == 0) return("other")
+  if (length(x) == 1) return(x)
+  # if multiple histology labels within same case
+  return("other")
+}
+
+# ===============================
+# Read all annotated CNR files
+# ===============================
+cnr_files <- list.files(
+  path = cnr_dir,
+  pattern = "\\.annotated\\.cnr$",
+  full.names = TRUE
+)
+
+cat("Total CNR files:", length(cnr_files), "\n")
+
+read_one_cnr <- function(f) {
+  dt <- fread(f)
+
+  sample_name <- basename(f) %>%
+    str_remove("\\.annotated\\.cnr$")
+
+  case_id <- sub("-.*", "", sample_name)
+
+  corrected_call_col <- grep("\\.Corrected_Call$", names(dt), value = TRUE)
+  if (length(corrected_call_col) == 0) return(NULL)
+
+  dt %>%
+    transmute(
+      Sample = sample_name,
+      Case = case_id,
+      gene = gene,
+      Corrected_Call = as.character(.data[[corrected_call_col[1]]])
+    )
+}
+
+all_cnr <- map_dfr(cnr_files, read_one_cnr)
+```
+
+```{r}
+# ===============================
+# Check case-level CNV presence
+# ===============================
+sample_status <- all_cnr %>%
+  group_by(Sample, Case) %>%
+  summarise(
+    has_CNV = any(!is.na(Corrected_Call) & Corrected_Call != "NEUT"),
+    .groups = "drop"
+  )
+
+case_status <- sample_status %>%
+  group_by(Case) %>%
+  summarise(
+    n_samples = n(),
+    has_CNV = any(has_CNV),
+    .groups = "drop"
+  )
+
+cat("Total cases:", nrow(case_status), "\n")
+cat("Cases with CNV:", sum(case_status$has_CNV), "\n")
+cat("Cases with NO CNV:", sum(!case_status$has_CNV), "\n")
+
+neutral_cases <- case_status %>%
+  filter(!has_CNV) %>%
+  pull(Case)
+
+cat("Excluding globally CNV-neutral cases:", paste(neutral_cases, collapse = ", "), "\n")
+
+# exclude AO92, APID, AQ3V
+all_cnr <- all_cnr %>%
+  filter(!Case %in% neutral_cases)
+
+```
+```{r}
+# ===============================
+# Keep only genes of interest
+# gene column may contain multiple comma-separated genes
+# ===============================
+cnr_long <- all_cnr %>%
+  separate_rows(gene, sep = ",") %>%
+  mutate(
+    gene = str_trim(gene),
+    Corrected_Call = str_trim(Corrected_Call)
+  ) %>%
+  filter(gene %in% genes_of_interest)
+
+# ===============================
+# Collapse segment -> sample-gene
+# ===============================
+sample_gene_calls <- cnr_long %>%
+  group_by(Sample, Case, gene) %>%
+  summarise(
+    Call = collapse_sample_gene(Corrected_Call),
+    .groups = "drop"
+  )
+
+# ===============================
+# Collapse sample -> case-gene
+# ===============================
+case_gene_calls <- sample_gene_calls %>%
+  group_by(Case, gene) %>%
+  summarise(
+    Call = collapse_case_gene(Call),
+    .groups = "drop"
+  )
+
+# Fill missing Case-gene combinations with NEUT
+case_gene_calls <- expand.grid(
+  Case = unique(case_gene_calls$Case),
+  gene = genes_of_interest,
+  stringsAsFactors = FALSE
+) %>%
+  as_tibble() %>%
+  left_join(case_gene_calls, by = c("Case", "gene")) %>%
+  mutate(Call = ifelse(is.na(Call), "NEUT", Call))
+
+```
+
+```{r}
+# ===============================
+# Read clinical data
+# ===============================
+clinical_df <- read_excel(clinical_file)
+
+clinical_case <- clinical_df %>%
+  mutate(
+    Collaborator_sample_id = as.character(Collaborator_sample_id),
+    Molecular_subtype = as.character(Molecular_subtype),
+    Histological_subtype = as.character(Histological_subtype)
+  ) %>%
+  mutate(
+    Collaborator_sample_id = str_trim(Collaborator_sample_id),
+    Molecular_subtype = str_trim(Molecular_subtype),
+    Histological_subtype = str_trim(Histological_subtype),
+
+    # Example: AUP-AL1Y-NB1 -> AL1Y
+    Case = sub("^[^-]+-([^-]+)-.*$", "\\1", Collaborator_sample_id),
+
+    Subtype_group = case_when(
+      Molecular_subtype == "HR+HER2-" ~ "HR+/HER2−",
+      Molecular_subtype == "HR+HER2+" ~ "HR+/HER2+",
+      Molecular_subtype == "HR-HER2+" ~ "HR−/HER2+",
+      Molecular_subtype == "TNBC"     ~ "TNBC",
+      TRUE                            ~ "Unknown"
+    ),
+
+    Histology_group = case_when(
+      Histological_subtype == "NST" ~ "ductal",
+      Histological_subtype == "ILC" ~ "lobular",
+      Histological_subtype %in% c("Other", "Unknown") ~ "other",
+      TRUE ~ "other"
+    )
+  )
+
+# Collapse clinical annotations to case level
+case_clinical <- clinical_case %>%
+  group_by(Case) %>%
+  summarise(
+    Subtype_group = collapse_case_subtype(Subtype_group),
+    Histology_group = collapse_case_histology(Histology_group),
+    .groups = "drop"
+  )
+
+# Merge clinical annotations
+case_gene_calls <- case_gene_calls %>%
+  left_join(case_clinical, by = "Case") %>%
+  mutate(
+    Subtype_group = ifelse(is.na(Subtype_group), "Unknown", Subtype_group),
+    Histology_group = ifelse(is.na(Histology_group), "other", Histology_group)
+  )
+
+# Order of subtype panels
+subtype_levels <- c("HR+/HER2−", "HR+/HER2+", "HR−/HER2+", "TNBC", "Unknown")
+```
+
+```{r}
+# ===============================
+# Colors
+# ===============================
+alter_col <- c(
+  "HLAMP" = "#FF9933",
+  "AMP"   = "#FFCC66",
+  "GAIN"  = "#FFEE99",
+  "HETD"  = "#A6BDDB",
+  "HOMD"  = "#2166AC",
+  "MIXED" = "#6A3D9A"
+)
+
+histology_col <- c(
+  "ductal" = "#0000FF",
+  "lobular" = "#FF0000",
+  "other" = "grey70"
+)
+
+alter_fun <- list(
+  background = function(x, y, w, h) {
+    grid.rect(x, y, w * 0.95, h * 0.95,
+              gp = gpar(fill = "white", col = "grey90"))
+  },
+  HLAMP = function(x, y, w, h) {
+    grid.rect(x, y, w * 0.95, h * 0.95,
+              gp = gpar(fill = alter_col["HLAMP"], col = NA))
+  },
+  AMP = function(x, y, w, h) {
+    grid.rect(x, y, w * 0.95, h * 0.95,
+              gp = gpar(fill = alter_col["AMP"], col = NA))
+  },
+  GAIN = function(x, y, w, h) {
+    grid.rect(x, y, w * 0.95, h * 0.95,
+              gp = gpar(fill = alter_col["GAIN"], col = NA))
+  },
+  HETD = function(x, y, w, h) {
+    grid.rect(x, y, w * 0.95, h * 0.95,
+              gp = gpar(fill = alter_col["HETD"], col = NA))
+  },
+  HOMD = function(x, y, w, h) {
+    grid.rect(x, y, w * 0.95, h * 0.95,
+              gp = gpar(fill = alter_col["HOMD"], col = NA))
+  },
+  MIXED = function(x, y, w, h) {
+    grid.rect(x, y, w * 0.95, h * 0.95,
+              gp = gpar(fill = alter_col["MIXED"], col = NA))
+  }
+)
+```
+
+```{r}
+# ===============================
+# Function to make one case-wise subtype oncoprint
+# ===============================
+make_oncoprint_by_subtype <- function(subtype_name, case_gene_calls, genes_of_interest) {
+
+  sub_df <- case_gene_calls %>%
+    filter(Subtype_group == subtype_name)
+
+  if (nrow(sub_df) == 0) {
+    cat("No cases found for subtype:", subtype_name, "\n")
+    return(NULL)
+  }
+
+  case_anno <- sub_df %>%
+    distinct(Case, Histology_group)
+
+  # matrix: rows = genes, columns = cases
+  mat_df <- sub_df %>%
+    select(Case, gene, Call) %>%
+    pivot_wider(names_from = Case, values_from = Call)
+
+  mat <- as.matrix(mat_df[, -1, drop = FALSE])
+  rownames(mat) <- mat_df$gene
+
+  # preserve requested gene order
+  mat <- mat[genes_of_interest, , drop = FALSE]
+
+  # order cases by number of altered genes
+  altered_per_case <- apply(mat, 2, function(x) sum(x != "NEUT"))
+  case_order <- names(sort(altered_per_case, decreasing = TRUE))
+  mat <- mat[, case_order, drop = FALSE]
+
+  case_anno <- case_anno %>%
+    mutate(Case = factor(Case, levels = case_order)) %>%
+    arrange(Case)
+
+  # Convert NEUT to blank for oncoPrint
+  mat_for_onco <- mat
+  mat_for_onco[mat_for_onco == "NEUT"] <- ""
+
+  top_ha <- HeatmapAnnotation(
+    Histology = case_anno$Histology_group,
+    col = list(Histology = histology_col),
+    annotation_name_gp = gpar(fontsize = 10)
+  )
+
+  ht <- oncoPrint(
+    mat_for_onco,
+    alter_fun = alter_fun,
+    alter_fun_is_vectorized = FALSE,
+    col = alter_col,
+    top_annotation = top_ha,
+    show_column_names = TRUE,
+    column_names_gp = gpar(fontsize = 8),
+    show_row_names = TRUE,
+    row_names_gp = gpar(fontsize = 10),
+    column_title = paste0(subtype_name, " (n = ", ncol(mat_for_onco), ")"),
+    pct_side = "left",      # avoid conflict
+    pct_gp = gpar(fontsize = 9),
+    show_pct = TRUE,
+    remove_empty_rows = FALSE,
+    remove_empty_columns = FALSE,
+    heatmap_legend_param = list(
+      title = "CNV",
+      at = c("HLAMP", "AMP", "GAIN", "HETD", "HOMD", "MIXED"),
+      labels = c("HLAMP", "AMP", "GAIN", "HETD", "HOMD", "MIXED")
+    )
+  )
+
+  return(ht)
+}
+draw(ht)
+```
+```{r}
+# ===============================
+# Create output folder
+# ===============================
+outdir <- "Comparision_Subtype"   # use "Comparison_Subtype" if you prefer
+if (!dir.exists(outdir)) {
+  dir.create(outdir, recursive = TRUE)
+}
+
+# ===============================
+# Save each subtype separately
+# ===============================
+for (st in subtype_levels) {
+  ht <- make_oncoprint_by_subtype(st, case_gene_calls, genes_of_interest)
+  if (is.null(ht)) next
+
+  safe_name <- st %>%
+    str_replace_all("\\+", "plus") %>%
+    str_replace_all("−|-", "minus") %>%
+    str_replace_all("/", "_")
+
+  # PDF
+  pdf(
+    file = file.path(outdir, paste0("CNV_oncoprint_casewise_", safe_name, ".pdf")),
+    width = 16, height = 6
+  )
+  draw(ht)
+  dev.off()
+
+  # PNG
+  png(
+    filename = file.path(outdir, paste0("CNV_oncoprint_casewise_", safe_name, ".png")),
+    width = 16, height = 6, units = "in", res = 300
+  )
+  draw(ht)
+  dev.off()
+}
+```

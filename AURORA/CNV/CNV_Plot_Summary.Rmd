@@ -1,0 +1,239 @@
+---
+title: "CNV_Plot_Summary"
+output: html_document
+date: "2026-04-16"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r}
+library(data.table)
+library(dplyr)
+library(stringr)
+library(purrr)
+
+# annotated CNR files
+cnr_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/AURORA/CNVKit/Annotated_cnr_file"
+
+# List all annotated cnr files
+files <- list.files(
+  path = cnr_dir,
+  pattern = "\\.annotated\\.cnr$",
+  full.names = FALSE
+)
+
+# Check total number of sample files
+num_samples <- length(files)
+cat("Total number of samples:", num_samples, "\n\n")
+
+# Extract sample names without extension
+sample_names <- sub("\\.annotated\\.cnr$", "", files)
+
+# case defined by first 4 letters
+case_ids <- substr(sample_names, 1, 4)
+
+# case defined by part before "-"
+# case_ids <- sub("-.*", "", sample_names)
+
+# Count unique cases
+unique_cases <- unique(case_ids)
+num_cases <- length(unique_cases)
+
+cat("Total number of cases:", num_cases, "\n\n")
+
+# Show case IDs
+cat("Unique case IDs:\n")
+print(unique_cases)
+
+# Count how many samples per case
+case_table <- table(case_ids)
+
+cat("\nNumber of samples per case:\n")
+print(case_table)
+
+```
+```{r}
+# ===============================
+# Function to extract event columns
+# ===============================
+read_event_info <- function(f) {
+  dt <- fread(f)
+
+  sample_name <- basename(f) %>%
+    str_remove("\\.annotated\\.cnr$")
+
+  corrected_call_col <- grep("\\.Corrected_Call$", names(dt), value = TRUE)
+  event_col          <- grep("\\.event$", names(dt), value = TRUE)
+
+  out <- data.frame()
+
+  if (length(corrected_call_col) > 0) {
+    tmp1 <- data.frame(
+      Sample = sample_name,
+      ColumnType = "Corrected_Call",
+      Value = as.character(dt[[corrected_call_col[1]]]),
+      stringsAsFactors = FALSE
+    )
+    out <- bind_rows(out, tmp1)
+  }
+
+  if (length(event_col) > 0) {
+    tmp2 <- data.frame(
+      Sample = sample_name,
+      ColumnType = "event",
+      Value = as.character(dt[[event_col[1]]]),
+      stringsAsFactors = FALSE
+    )
+    out <- bind_rows(out, tmp2)
+  }
+
+  out
+}
+
+# ===============================
+# Read all files
+# ===============================
+all_events <- map_dfr(cnr_files, read_event_info)
+
+# Clean values
+all_events <- all_events %>%
+  mutate(Value = str_trim(Value)) %>%
+  filter(!is.na(Value), Value != "")
+```
+
+
+```{r}
+# ===============================
+# Unique event types
+# ===============================
+cat("\n===============================\n")
+cat("Unique values in Corrected_Call\n")
+cat("===============================\n")
+unique_corrected <- all_events %>%
+  filter(ColumnType == "Corrected_Call") %>%
+  distinct(Value) %>%
+  arrange(Value)
+
+print(unique_corrected)
+
+cat("\n===============================\n")
+cat("Unique values in event\n")
+cat("===============================\n")
+unique_event <- all_events %>%
+  filter(ColumnType == "event") %>%
+  distinct(Value) %>%
+  arrange(Value)
+
+print(unique_event)
+```
+
+
+```{r}
+# ===============================
+# Count frequency
+# ===============================
+cat("\n===============================\n")
+cat("Counts for Corrected_Call\n")
+cat("===============================\n")
+corrected_counts <- all_events %>%
+  filter(ColumnType == "Corrected_Call") %>%
+  count(Value, sort = TRUE)
+
+print(corrected_counts)
+
+cat("\n===============================\n")
+cat("Counts for event\n")
+cat("===============================\n")
+event_counts <- all_events %>%
+  filter(ColumnType == "event") %>%
+  count(Value, sort = TRUE)
+
+print(event_counts)
+```
+```{r}
+# ===============================
+# Read Corrected_Call from each file
+# ===============================
+read_corrected_call <- function(f) {
+  dt <- fread(f)
+
+  sample_name <- basename(f) %>%
+    str_remove("\\.annotated\\.cnr$")
+
+  case_id <- sub("-.*", "", sample_name)
+
+  corrected_call_col <- grep("\\.Corrected_Call$", names(dt), value = TRUE)
+
+  if (length(corrected_call_col) == 0) {
+    return(data.frame(
+      Sample = sample_name,
+      Case = case_id,
+      Corrected_Call = NA_character_,
+      stringsAsFactors = FALSE
+    ))
+  }
+
+  data.frame(
+    Sample = sample_name,
+    Case = case_id,
+    Corrected_Call = as.character(dt[[corrected_call_col[1]]]),
+    stringsAsFactors = FALSE
+  )
+}
+
+all_calls <- map_dfr(cnr_files, read_corrected_call)
+
+# clean
+all_calls <- all_calls %>%
+  mutate(Corrected_Call = str_trim(Corrected_Call))
+
+# ===============================
+# Sample-level CNV status
+# ===============================
+sample_status <- all_calls %>%
+  group_by(Sample, Case) %>%
+  summarise(
+    has_CNV = any(!is.na(Corrected_Call) & Corrected_Call != "NEUT"),
+    .groups = "drop"
+  )
+
+cat("\n===============================\n")
+cat("Sample-level CNV summary\n")
+cat("===============================\n")
+cat("Total samples:", nrow(sample_status), "\n")
+cat("Samples with CNV alteration:", sum(sample_status$has_CNV), "\n")
+cat("Samples with NO CNV alteration:", sum(!sample_status$has_CNV), "\n")
+
+if (sum(!sample_status$has_CNV) > 0) {
+  cat("\nSamples with NO CNV alteration:\n")
+  print(sample_status %>% filter(!has_CNV))
+}
+
+# ===============================
+# Case-level CNV status
+# ===============================
+case_status <- sample_status %>%
+  group_by(Case) %>%
+  summarise(
+    n_samples = n(),
+    has_CNV = any(has_CNV),
+    .groups = "drop"
+  )
+
+cat("\n===============================\n")
+cat("Case-level CNV summary\n")
+cat("===============================\n")
+cat("Total cases:", nrow(case_status), "\n")
+cat("Cases with CNV alteration:", sum(case_status$has_CNV), "\n")
+cat("Cases with NO CNV alteration:", sum(!case_status$has_CNV), "\n")
+
+if (sum(!case_status$has_CNV) > 0) {
+  cat("\nCases with NO CNV alteration:\n")
+  print(case_status %>% filter(!has_CNV))
+}
+```
+```{r}
+
+```
+
