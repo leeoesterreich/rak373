@@ -39,7 +39,7 @@ OUT_DIR="${OUTPUT_BASE}/${SAMPLE_NAME}"
 mkdir -p "$OUT_DIR"
 
 # Run Trim Galore
-trim_galore --paired --cores 4 --gzip -o "$OUT_DIR" "$FQ1" "$FQ2"
+trim_galore --paired --cores 8 --gzip -o "$OUT_DIR" "$FQ1" "$FQ2"
 
 # Report completion
 if [[ $? -eq 0 ]]; then
