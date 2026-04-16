@@ -1,0 +1,10 @@
+vcf_pcgr/JC287-TP08-525.taf.vcf.gz
+vcf_pcgr/JC287-TP08-1447.taf.vcf.gz
+vcf_pcgr/JC287-TP09-71.taf.vcf.gz
+vcf_pcgr/JC287-TP10-705.taf.vcf.gz
+vcf_pcgr/JC287-TP14-385.taf.vcf.gz
+vcf_pcgr/JC287-TP14-490.taf.vcf.gz
+vcf_pcgr/JC287-TP15-M509.taf.vcf.gz
+vcf_pcgr/JC287-TP16-M241.taf.vcf.gz
+vcf_pcgr/JC287-TP16-M953.taf.vcf.gz
+vcf_pcgr/JC287-TP17-M11.taf.vcf.gz

@@ -1,0 +1,10 @@
+filtered_vcf/JC287-TP09-71.filtered.vcf.gz
+filtered_vcf/JC287-TP08-1447.filtered.vcf.gz
+filtered_vcf/JC287-TP17-M11.filtered.vcf.gz
+filtered_vcf/JC287-TP15-M509.filtered.vcf.gz
+filtered_vcf/JC287-TP16-M241.filtered.vcf.gz
+filtered_vcf/JC287-TP14-490.filtered.vcf.gz
+filtered_vcf/JC287-TP10-705.filtered.vcf.gz
+filtered_vcf/JC287-TP08-525.filtered.vcf.gz
+filtered_vcf/JC287-TP14-385.filtered.vcf.gz
+filtered_vcf/JC287-TP16-M953.filtered.vcf.gz

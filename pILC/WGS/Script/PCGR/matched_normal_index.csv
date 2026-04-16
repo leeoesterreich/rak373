@@ -1,0 +1,11 @@
+vcf,tpm,cna
+JC287-TP08-525.taf.vcf.gz,,JC287-TP08-525_TP08-446_hisens_cna.tsv
+JC287-TP08-1447.taf.vcf.gz,,JC287-TP08-1447_TP08-1335_hisens_cna.tsv
+JC287-TP09-71.taf.vcf.gz,,JC287-TP09-71_TP09-11_hisens_cna.tsv
+JC287-TP10-705.taf.vcf.gz,TP10-705_TPM.tsv,JC287-TP10-705_TP16-M397_hisens_cna.tsv
+JC287-TP14-385.taf.vcf.gz,,JC287-TP14-385_TP14-385_hisens_cna.tsv
+JC287-TP14-490.taf.vcf.gz,TP14-490_TPM.tsv,JC287-TP14-490_TP14-490_hisens_cna.tsv
+JC287-TP15-M509.taf.vcf.gz,TP15-M509_TPM.tsv,JC287-TP15-M509_TP15-M509_hisens_cna.tsv
+JC287-TP16-M241.taf.vcf.gz,,JC287-TP16-M241_TP16-M241_hisens_cna.tsv
+JC287-TP16-M953.taf.vcf.gz,,JC287-TP16-M953_TP16-M593_hisens_cna.tsv
+JC287-TP17-M11.taf.vcf.gz,TP17-M11_TPM.tsv,JC287-TP17-M11_TP17-M11_hisens_cna.tsv
