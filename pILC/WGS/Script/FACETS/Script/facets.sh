@@ -8,7 +8,7 @@
 #SBATCH --cpus-per-task=8
 
 # Load R if needed (depends on your environment)
-module load gcc/12.2.0 r/4.3.0
+module load gcc/12.2.0 r/4.4.0
 
 # Define input list
 INPUT_DIR="/ix1/alee/LO_LAB/Personal/Rahul/pILC/WGS/FACETS/snp-pileup"
