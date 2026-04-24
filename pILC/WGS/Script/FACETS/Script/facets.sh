@@ -23,7 +23,7 @@ SAMPLE_ID="${BASENAME//./_}"  # sanitize for output filenames
 OUTDIR=/ix1/alee/LO_LAB/Personal/Rahul/pILC/WGS/FACETS/Result/$SAMPLE_ID
 mkdir -pv $OUTDIR
 
-export R_LIBS=/ihome/alee/rak373/R/x86_64-pc-linux-gnu-library/4.3
+export R_LIBS=/ihome/alee/rak373/R/x86_64-pc-linux-gnu-library/4.4
 
 # Run wrapper
 Rscript $run_facets \
@@ -32,6 +32,6 @@ Rscript $run_facets \
     --purity-cval 150 \
     --cval 150 \
     --everything \
-    --facets-lib-path /ihome/alee/rak373/R/x86_64-pc-linux-gnu-library/4.3 \
+    --facets-lib-path /ihome/alee/rak373/R/x86_64-pc-linux-gnu-library/4.4 \
     --directory $OUTDIR
 
