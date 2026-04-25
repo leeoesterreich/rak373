@@ -1,0 +1,17 @@
+SAMPLE,TUMOR_BAM,NORMAL_BAM,TUMOR_BAM_PATH,NORMAL_BAM_PATH
+TP03-117,TP03-117_T,TP03-117_N,/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/4_BQSR/TP03-117_T/TP03-117_T.bqsr.bam,/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/4_BQSR/TP03-117_N/TP03-117_N.bqsr.bam
+TP04-104,TP04-104_T,TP04-104_N,/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/4_BQSR/TP04-104_T/TP04-104_T.bqsr.bam,/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/4_BQSR/TP04-104_N/TP04-104_N.bqsr.bam
+TP05-232,TP05-232_T,TP05-232_N,/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/4_BQSR/TP05-232_T/TP05-232_T.bqsr.bam,/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/4_BQSR/TP05-232_N/TP05-232_N.bqsr.bam
+TP05-668,TP05-668_T,TP05-668_N,/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/4_BQSR/TP05-668_T/TP05-668_T.bqsr.bam,/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/4_BQSR/TP05-668_N/TP05-668_N.bqsr.bam
+TP05-726,TP05-726_T,TP05-726_N,/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/4_BQSR/TP05-726_T/TP05-726_T.bqsr.bam,/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/4_BQSR/TP05-726_N/TP05-726_N.bqsr.bam
+TP08-356,TP08-356_T,TP08-356_N,/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/4_BQSR/TP08-356_T/TP08-356_T.bqsr.bam,/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/4_BQSR/TP08-356_N/TP08-356_N.bqsr.bam
+TP08-370,TP08-370_T,TP08-370_N,/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/4_BQSR/TP08-370_T/TP08-370_T.bqsr.bam,/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/4_BQSR/TP08-370_N/TP08-370_N.bqsr.bam
+TP08-517,TP08-517_T,TP08-517_N,/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/4_BQSR/TP08-517_T/TP08-517_T.bqsr.bam,/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/4_BQSR/TP08-517_N/TP08-517_N.bqsr.bam
+TP08-1319,TP08-1319_T,TP08-1319_N,/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/4_BQSR/TP08-1319_T/TP08-1319_T.bqsr.bam,/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/4_BQSR/TP08-1319_N/TP08-1319_N.bqsr.bam
+TP08-2202,TP08-2202_T,TP08-2202_N,/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/4_BQSR/TP08-2202_T/TP08-2202_T.bqsr.bam,/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/4_BQSR/TP08-2202_N/TP08-2202_N.bqsr.bam
+TP09-9,TP09-9_T,TP09-9_N,/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/4_BQSR/TP09-9_T/TP09-9_T.bqsr.bam,/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/4_BQSR/TP09-9_N/TP09-9_N.bqsr.bam
+TP10-S1190,TP10-S1190_T,TP10-S1190_N,/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/4_BQSR/TP10-S1190_T/TP10-S1190_T.bqsr.bam,/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/4_BQSR/TP10-S1190_N/TP10-S1190_N.bqsr.bam
+TP12-1864,TP12-1864_T,TP12-1864_N,/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/4_BQSR/TP12-1864_T/TP12-1864_T.bqsr.bam,/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/4_BQSR/TP12-1864_N/TP12-1864_N.bqsr.bam
+TP12-2045,TP12-2045_T,TP12-2045_N,/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/4_BQSR/TP12-2045_T/TP12-2045_T.bqsr.bam,/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/4_BQSR/TP12-2045_N/TP12-2045_N.bqsr.bam
+TP13-820,TP13-820_T,TP13-820_N,/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/4_BQSR/TP13-820_T/TP13-820_T.bqsr.bam,/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/4_BQSR/TP13-820_N/TP13-820_N.bqsr.bam
+TP13-1150,TP13-1150_T,TP13-1150_N,/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/4_BQSR/TP13-1150_T/TP13-1150_T.bqsr.bam,/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/4_BQSR/TP13-1150_N/TP13-1150_N.bqsr.bam
