@@ -173,7 +173,7 @@ and passes the R package library path using:
 
 ## Extract CNA segments from FACETS RDS output (For PCGR)
 
-The script `extract_cna_from_facets_rds.R` converts FACETS RDS output into a simple TSV file with the following columns:
+The script `extract_cna_from_facets_rds.R` converts FACETS RDS output into a PCGR-compatible TSV file with the following columns:
 
 ```text
 Chromosome
@@ -188,15 +188,6 @@ Usage:
 ```bash
 Rscript Script/extract_cna_from_facets_rds.R <input_facets.rds> <output_cna.tsv>
 ```
-
-Example:
-
-```bash
-Rscript Script/extract_cna_from_facets_rds.R \
-    Result/TP03-117/TP03-117.facets.rds \
-    Result/TP03-117/TP03-117.cna.tsv
-```
-
 The script calculates:
 
 ```r
