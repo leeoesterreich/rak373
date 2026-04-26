@@ -2,7 +2,7 @@
 #SBATCH --job-name=mutect2_pon_full
 #SBATCH --output=slurm_log/mutect2/with_pon/mutect2_pon_full_%A_%a.out
 #SBATCH --error=slurm_log/mutect2/with_pon/mutect2_pon_full_%A_%a.err
-#SBATCH --time=08:00:00
+#SBATCH --time=1-00:00:00
 #SBATCH --mem=32G
 #SBATCH --cpus-per-task=4
 #SBATCH --array=0-30
@@ -66,7 +66,7 @@ FILTERED_VCF="${OUT_DIR}/${SAMPLE}.vcf.gz"
 
 # Skip if already done
 [[ -f "$FILTERED_VCF" ]] && \
-    { log_success "$SAMPLE already processed — skipping."; exit 0; }
+    { log_success "$SAMPLE already processed â€” skipping."; exit 0; }
 
 # Step 1: Run Mutect2
 log_info "Running Mutect2 on $SAMPLE"
@@ -116,4 +116,4 @@ singularity exec $BIND $SIF gatk FilterMutectCalls \
   --f-score-beta 1.0 \
   -O "$FILTERED_VCF" || log_fail "FilterMutectCalls failed"
 
-log_success "$SAMPLE complete — Filtered VCF written to $FILTERED_VCF"
+log_success "$SAMPLE complete â€” Filtered VCF written to $FILTERED_VCF"
