@@ -19,7 +19,7 @@ log_success() { echo -e "\033[1;32m[$(date '+%F %T')] [DONE] $1\033[0m"; }
 
 # Paths
 BQSR_ROOT="/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/4_BQSR"
-OUT_ROOT="/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/5_Mutect2/Mutect2_with_PON"
+OUT_ROOT="/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/6_Mutect2_with_PON"
 
 # Update this to your actual final PoN filename
 PON="/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/5_Mutect2/pon_rak373_20260422_152132.vcf.gz"
@@ -56,7 +56,7 @@ ORIENT_PRIORS="${OUT_DIR}/${SAMPLE}.orientation-priors.tar.gz"
 PILEUP="${OUT_DIR}/${SAMPLE}.pileups.table"
 CONTAM_TABLE="${OUT_DIR}/${SAMPLE}.contamination.table"
 SEGMENTS_TABLE="${OUT_DIR}/${SAMPLE}.segments.table"
-FILTERED_VCF="${OUT_DIR}/${SAMPLE}.vcf.gz"
+FILTERED_VCF="${OUT_DIR}/${SAMPLE}.filtered.vcf.gz"
 
 # Checks
 [[ ! -f "$RECAL_BAM" ]] && log_fail "Missing input BAM: $RECAL_BAM"
@@ -66,7 +66,7 @@ FILTERED_VCF="${OUT_DIR}/${SAMPLE}.vcf.gz"
 
 # Skip if already done
 [[ -f "$FILTERED_VCF" ]] && \
-    { log_success "$SAMPLE already processed â€” skipping."; exit 0; }
+    { log_success "$SAMPLE already processed — skipping."; exit 0; }
 
 # Step 1: Run Mutect2
 log_info "Running Mutect2 on $SAMPLE"
@@ -116,4 +116,4 @@ singularity exec $BIND $SIF gatk FilterMutectCalls \
   --f-score-beta 1.0 \
   -O "$FILTERED_VCF" || log_fail "FilterMutectCalls failed"
 
-log_success "$SAMPLE complete â€” Filtered VCF written to $FILTERED_VCF"
+log_success "$SAMPLE complete — Filtered VCF written to $FILTERED_VCF"

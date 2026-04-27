@@ -1,0 +1,898 @@
+---
+title: "WGCNA_TILs"
+output: html_document
+date: "2026-04-27"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# to perform WGCNA across samples having low as well as high TILs 
+```
+```{r}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(DESeq2)
+  library(biomaRt)
+  library(data.table)
+  library(matrixStats)
+  library(tidyverse)
+  library(flashClust)
+  library(curl)
+  library(tibble)
+  library(WGCNA)
+  library(multiWGCNA)
+  library(SummarizedExperiment)
+})
+```
+
+```{r}
+# Read your file
+htseq_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/WCNA/cleaned_Htseq.csv"
+res_df <- read.csv(htseq_file, header = TRUE, row.names = 1, check.names = FALSE)
+head(res_df)
+ensembl_ids <- rownames(res_df)
+
+# Remove version numbers if present
+ensembl_ids_clean <- gsub("\\..*", "", ensembl_ids)
+
+# Use biomaRt to get gene symbols
+mart <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+gene_map <- getBM(
+  attributes = c("ensembl_gene_id", "hgnc_symbol"),
+  filters = "ensembl_gene_id",
+  values = unique(ensembl_ids_clean),
+  mart = mart
+)
+
+# Merge mapping with expression data
+res_df$ensembl_id <- ensembl_ids_clean
+out_df <- merge(res_df, gene_map, by.x = "ensembl_id", by.y = "ensembl_gene_id", all.x = TRUE)
+
+# Replace blank or NA symbols with Ensembl ID
+out_df$gene_name <- ifelse(out_df$hgnc_symbol == "" | is.na(out_df$hgnc_symbol),
+                           out_df$ensembl_id,
+                           out_df$hgnc_symbol)
+
+# Remove duplicates and problematic rows
+out_df_clean <- out_df[!duplicated(out_df$gene_name) & !is.na(out_df$gene_name) & out_df$gene_name != "", ]
+
+# Reorder and drop unnecessary columns
+gene_symbols <- out_df_clean$gene_name
+out_df_clean <- out_df_clean[, !(colnames(out_df_clean) %in% c("ensembl_id", "hgnc_symbol", "gene_name"))]
+out_df_clean <- cbind(Gene = gene_symbols, out_df_clean)
+
+# Save to file
+write.csv(out_df_clean, "htseq_with_gene_names.csv", row.names = FALSE)
+
+# Summary
+cat("Wrote htseq_with_gene_names.csv with", nrow(out_df_clean), "unique genes and",
+    ncol(out_df_clean) - 1, "samples.\n")
+
+cat("Original rows:", nrow(out_df), "\n")
+cat("After filtering:", nrow(out_df_clean), "\n")
+
+```
+```{r}
+# Remove genes with very low expression
+cat("Filtering low-expressed genes...\n")
+min_samples <- ceiling(ncol(out_df_clean) * 0.1)  # At least 10% of samples
+min_count <- 5  # Minimum read count
+keep_genes <- rowSums(out_df_clean >= min_count) >= min_samples
+counts_filtered <- out_df_clean[keep_genes, ]
+cat("After low expression filter:", dim(counts_filtered), "\n")
+
+```
+```{r}
+# Remove genes with very low variance (these won't contribute to co-expression)
+cat("Filtering low-variance genes...\n")
+gene_vars <- apply(counts_filtered[, -1], 1, var, na.rm = TRUE)  # Compute variance 
+var_threshold <- quantile(gene_vars, 0.1)  # Remove bottom 10% by variance
+counts_filtered <- counts_filtered[gene_vars > var_threshold, ]
+cat("After variance filter:", dim(counts_filtered), "\n")
+
+```
+```{r}
+# VST transformation for better correlation structure
+library(DESeq2)
+
+cat("Variance stabilizing transformation...\n")
+
+# Read sample metadata
+sample_table_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/WCNA/SampleTable.csv"
+sampleTable <- read.csv(sample_table_file, stringsAsFactors = TRUE)
+
+# Match row names to sample IDs
+rownames(sampleTable) <- sampleTable$sample
+
+# Ensure the sample table is ordered correctly
+expr_sample_ids <- colnames(counts_filtered)[-1]  # Exclude 'Gene' column
+sampleTable <- sampleTable[expr_sample_ids, , drop = FALSE]
+
+# Convert counts to numeric matrix (excluding 'Gene' column)
+count_matrix <- as.matrix(counts_filtered[, -1])
+rownames(count_matrix) <- counts_filtered$Gene
+```
+
+
+```{r}
+sampleTable <- read.csv(sample_table_file, header = TRUE, stringsAsFactors = TRUE, check.names = FALSE)
+
+# clean column names and sample names
+colnames(sampleTable) <- trimws(colnames(sampleTable))
+sampleTable$sample <- trimws(sampleTable$sample)
+
+# create matching sample ID in count matrix by removing _S number
+count_sample_ids <- sub("_S[0-9]+$", "", colnames(count_matrix))
+
+# replace count_matrix column names with clean sample IDs
+colnames(count_matrix) <- count_sample_ids
+
+# set rownames of sampleTable
+rownames(sampleTable) <- sampleTable$sample
+
+# reorder sampleTable to match count_matrix
+sampleTable <- sampleTable[colnames(count_matrix), , drop = FALSE]
+
+# check missing samples
+missing_in_metadata <- setdiff(colnames(count_matrix), rownames(sampleTable))
+print(missing_in_metadata)
+
+# final check
+stopifnot(identical(colnames(count_matrix), rownames(sampleTable)))
+# Create DESeq2 object with correct design, make sure SampleTable.csv have "sample" "subtype" "stage"
+dds <- DESeqDataSetFromMatrix(
+  countData = count_matrix,
+  colData = sampleTable,
+  design = ~ 1
+)
+
+# Apply VST
+vst_data <- vst(dds, blind = TRUE) # the transformation treats all samples equally without modeling any group-specific trends.
+vst <- assay(vst_data)
+
+cat("VST transformation complete. Data dimensions:", dim(vst), "\n")
+
+# Save VST for WGCNA
+vst_df <- as.data.frame(vst) # # Convert VST matrix to data frame
+vst_df <- cbind(Gene = rownames(vst_df), vst_df) # # Add gene names as a new column
+write.csv(vst_df, file = "vst_transformed_data.csv", row.names = FALSE)
+cat("VST data saved to 'vst_transformed_data.csv' with", nrow(vst_df), "genes and", ncol(vst_df) - 1, "samples.\n")
+
+```
+```{r}
+expr_path  <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/WCNA/TILs/vst_transformed_data.csv"
+expr_data <- read.csv(file = expr_path, stringsAsFactors = FALSE, header = TRUE) 
+head(expr_data)
+
+```
+```{r}
+# Move 'Gene' column into row names before transposing
+expr_matrix <- expr_data |>
+  column_to_rownames(var = "Gene") |>
+  as.matrix()
+
+# Transpose so rows = samples, columns = genes
+dat_expr <- t(expr_matrix)
+
+# Convert back to data.frame for WGCNA
+dat_expr <- as.data.frame(dat_expr)
+
+# Check structure
+dim(dat_expr)         # samples x genes
+dat_expr[1:5, 1:5]    # preview
+
+# Optional: test if all are numeric
+stopifnot(all(sapply(dat_expr, is.numeric)))
+
+```
+```{r}
+# -------------------------------
+# Identifying Outlier Genes 
+# -------------------------------
+gsg <-goodSamplesGenes(dat_expr)
+summary(gsg)
+gsg$allOK 
+
+## [1] TRUE, there are no outliers present; [1] FALSE, we need to filter out the outliers
+# To remove the outliers (no need, if the allOK object returns true)
+if (!gsg$allOK)
+{
+if (sum(!gsg$goodGenes)>0) 
+printFlush(paste("Removing genes:", paste(names(dat_expr)[!gsg$goodGenes], collapse = ", "))); #Identifies and prints outlier genes
+if (sum(!gsg$goodSamples)>0)
+printFlush(paste("Removing samples:", paste(rownames(expression.data)[!gsg$goodSamples], collapse = ", "))); #Identifies and prints oulier samples
+dat_expr <- dat_expr[gsg$goodSamples == TRUE, gsg$goodGenes == TRUE] # Removes the offending genes and samples from the data
+}
+
+```
+```{r}
+# Identifying outlier samples by using hierarchical clustering. 
+sampleTree <- hclust(dist(dat_expr), method = "average") #Clustering samples based on distance 
+
+#Setting the graphical parameters
+par(cex = 0.6);
+par(mar = c(0,4,2,0))
+
+# Save the cluster dendrogram as PNG
+png("sample_clustering_outliers.png", width = 1200, height = 800, res = 150)
+par(cex = 0.6)
+par(mar = c(0, 4, 2, 0))
+plot(
+  sampleTree,
+  main = "Sample clustering to detect outliers",
+  sub = "",
+  xlab = "",
+  cex.lab = 1.5,
+  cex.axis = 1.5,
+  cex.main = 2
+)
+dev.off() 
+
+```
+```{r}
+# Based on sample_clustering_outliers plot
+#Setting the graphical parameters
+par(cex = 0.6);
+par(mar = c(0,4,2,0))
+plot(sampleTree, main = "Sample clustering to detect outliers", sub="", xlab="", cex.lab = 1.5,
+cex.axis = 1.5, cex.main = 2)
+# draw on line to show cutoff height (h)
+# abline(h = 150, col = "red");
+# Remove the outlier using a cutree function, based on clustering tree
+# cut.sampleTree <- cutreeStatic(sampleTree, cutHeight = 150, minSize = 10) #returns numeric vector
+# Remove outlier
+# dat_expr <- dat_expr[cut.sampleTree==1, ]
+
+# Network Construction
+spt <- pickSoftThreshold(dat_expr) 
+spt
+
+```
+```{r}
+# Visualize this data to choose best Î² value
+# Maximizing the R2 value and minimizing mean connectivity lost
+
+# Plot the R2 values as a function of the soft thresholds
+png("scale_independence.png", width = 1000, height = 800, res = 150)
+par(mar=c(5, 5, 2, 2))
+
+plot(spt$fitIndices[,1], spt$fitIndices[,2],
+     xlab = "Soft Threshold (Power)",
+     ylab = "Scale Free Topology Model Fit (signed RÂ²)",
+     type = "n",
+     main = "Scale Independence")
+
+text(spt$fitIndices[,1], spt$fitIndices[,2],
+     labels = spt$fitIndices[,1],
+     col = "red")
+
+abline(h = 0.80, col = "red", lty = 2)
+dev.off()
+
+# Plot mean connectivity as a function of soft thresholds
+png("mean_connectivity.png", width = 1000, height = 800, res = 150)
+par(mar=c(5, 5, 2, 2))
+plot(spt$fitIndices[,1], spt$fitIndices[,5],
+     xlab = "Soft Threshold (Power)",
+     ylab = "Mean Connectivity",
+     type = "n",
+     main = "Mean Connectivity")
+
+text(spt$fitIndices[,1], spt$fitIndices[,5],
+     labels = spt$fitIndices[,1],
+     col = "red")
+dev.off() 
+
+```
+```{r}
+# Calling the Adjacency Function 
+# To calculates the similarity measurement and transforms the similarity by the adjacency function and generates a weighted network adjacency matrix.
+softPower <- 4
+adjacency <- adjacency(dat_expr, power = softPower)
+
+```
+
+```{r}
+# -------------------------------
+# Module Construction 
+# -------------------------------
+# To convert the adjacency matrix into a TOM (Topological Overlap Matrix) similarity matrix
+TOM <- TOMsimilarity(adjacency)
+# To convert this matrix into a dissimilarity matrix
+TOM.dissimilarity <- 1-TOM
+
+# Hierarchical Clustering Analysis
+# Creating the dendrogram 
+geneTree <- hclust(as.dist(TOM.dissimilarity), method = "average") 
+#plotting the dendrogram
+sizeGrWindow(12,9)
+plot(geneTree, xlab="", sub="", main = "Gene clustering on TOM-based dissimilarity", 
+labels = FALSE, hang = 0.04)
+Modules <- cutreeDynamic(dendro = geneTree, distM = TOM.dissimilarity, deepSplit = 2, pamRespectsDendro = FALSE, minClusterSize = 30)
+table(Modules)
+ModuleColors <- labels2colors(Modules) #assigns each module number a color
+table(ModuleColors) #returns the counts for each color
+
+#plots the gene dendrogram with the module colors
+plotDendroAndColors(geneTree, ModuleColors,"Module",
+dendroLabels = FALSE, hang = 0.03,
+addGuide = TRUE, guideHang = 0.05,
+main = "Gene dendrogram and module colors")
+
+# Save the gene dendrogram and module colors plot
+png("gene_dendrogram_modules.png", width = 1200, height = 800, res = 150)
+
+plotDendroAndColors(geneTree, ModuleColors, "Module",
+                    dendroLabels = FALSE,
+                    hang = 0.03,
+                    addGuide = TRUE,
+                    guideHang = 0.05,
+                    main = "Gene dendrogram and module colors")
+
+dev.off()
+```
+```{r}
+##### Module Eigengene Identification (standardized gene expression profile for a given module.)
+MElist <- moduleEigengenes(dat_expr, colors = ModuleColors) 
+MEs <- MElist$eigengenes 
+head(MEs)
+write.csv(MEs, file = "ModuleEigengenes.csv", row.names = TRUE)
+
+# -------------------------------
+# Module Merging
+# -------------------------------
+ME.dissimilarity = 1-cor(MElist$eigengenes, use="complete") #Calculate eigengene dissimilarity
+
+METree = hclust(as.dist(ME.dissimilarity), method = "average") #Clustering eigengenes 
+par(mar = c(0,4,2,0)) #seting margin sizes
+par(cex = 0.6);#scaling the graphic
+plot(METree)
+abline(h=.25, col = "red") #a height of .25 corresponds to correlation of .75
+merge <- mergeCloseModules(dat_expr, ModuleColors, cutHeight = .25)
+# The merged module colors, assigning one color to each module
+mergedColors = merge$colors
+# Eigengenes of the new merged modules
+mergedMEs = merge$newMEs
+
+# Plot and save dendrogram which shows both the original and merged module colors.
+png("Module_Dendrogram_with_Colors.png", width = 1600, height = 1200, res = 150)
+plotDendroAndColors(
+  dendro = geneTree, 
+  colors = cbind(ModuleColors, mergedColors),
+  groupLabels = c("Original Module", "Merged Module"),
+  dendroLabels = FALSE, 
+  hang = 0.03,
+  addGuide = TRUE, 
+  guideHang = 0.05,
+  main = "Gene dendrogram and module colors for original and merged modules"
+)
+dev.off()
+
+cat("Modules with more than 75% similarity (correlation of eigengenes > 0.75) have been merged.\n")
+
+# Count all module colors
+n_before_all <- length(unique(ModuleColors))
+n_after_all  <- length(unique(mergedColors))
+cat("Modules before :", n_before_all, "\n")
+cat("Modules after :",  n_after_all,  "\n")
+
+# sizes for each module color
+sizes_before <- sort(table(ModuleColors), decreasing = TRUE)
+sizes_after  <- sort(table(mergedColors),  decreasing = TRUE)
+print(sizes_before)
+print(sizes_after)
+
+```
+```{r}
+# -------------------------------
+# Align external TILs traits to dat_expr
+# -------------------------------
+
+sample_table_path <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/WCNA/TILs/TILs_Table.csv"
+
+sampleTable <- read.csv(sample_table_path, stringsAsFactors = FALSE, check.names = FALSE)
+
+# Trim column names and character values
+names(sampleTable) <- trimws(names(sampleTable))
+sampleTable[] <- lapply(sampleTable, function(x) if (is.character(x)) trimws(x) else x)
+
+# Normalize sample IDs
+# dat_expr rownames may look like TP03.117
+# TILs table may look like TP03-117_S25
+rownames(dat_expr) <- gsub("\\.", "-", rownames(dat_expr))
+sampleTable$sample <- gsub("\\.", "-", sampleTable$sample)
+sampleTable$sample <- sub("_S[0-9]+$", "", sampleTable$sample)
+
+# Align samples
+Samples <- rownames(dat_expr)
+traitRows <- match(Samples, sampleTable$sample)
+
+if (anyNA(traitRows)) {
+  cat("Missing samples in TILs table:\n")
+  print(Samples[is.na(traitRows)])
+
+  cat("\nExample TILs table sample IDs:\n")
+  print(head(sampleTable$sample, 20))
+
+  stop("Mismatch persists. Check sample IDs.")
+}
+
+# Build aligned trait frame
+datTraits <- sampleTable[traitRows, c("subtype", "TILs"), drop = FALSE]
+rownames(datTraits) <- Samples
+
+# -------------------------------
+# Convert TILs to numeric
+# -------------------------------
+
+datTraits$TILs_numeric <- datTraits$TILs
+
+# Treat <5 as midpoint value
+datTraits$TILs_numeric[datTraits$TILs_numeric == "<5"] <- "2.5"
+
+# Convert blank values to NA
+datTraits$TILs_numeric[datTraits$TILs_numeric == ""] <- NA
+datTraits$TILs_numeric[is.na(datTraits$TILs_numeric)] <- NA
+
+# Convert to numeric
+datTraits$TILs_numeric <- as.numeric(datTraits$TILs_numeric)
+
+# -------------------------------
+# Define High vs Low TILs using 10% cutoff (Ref: https://www.nature.com/articles/s41523-021-00346-1)
+# Low  = <10
+# High = >=10
+# -------------------------------
+
+datTraits$TILs_group <- ifelse(
+  is.na(datTraits$TILs_numeric),
+  NA,
+  ifelse(datTraits$TILs_numeric >= 10, "High_TILs", "Low_TILs")
+)
+
+datTraits$TILs_group <- factor(
+  datTraits$TILs_group,
+  levels = c("Low_TILs", "High_TILs")
+)
+
+# Binary numeric trait for WGCNA correlation
+# Low = 0, High = 1
+datTraits$TILs_binary <- ifelse(
+  datTraits$TILs_group == "High_TILs", 1,
+  ifelse(datTraits$TILs_group == "Low_TILs", 0, NA)
+)
+
+# -------------------------------
+# Build numeric trait matrix safely
+# Keeps all samples, including missing TILs
+# -------------------------------
+
+datTraitsNum <- data.frame(
+  Low_TILs = ifelse(
+    datTraits$TILs_group == "Low_TILs", 1,
+    ifelse(datTraits$TILs_group == "High_TILs", 0, NA)
+  ),
+
+  High_TILs = ifelse(
+    datTraits$TILs_group == "High_TILs", 1,
+    ifelse(datTraits$TILs_group == "Low_TILs", 0, NA)
+  )
+)
+
+rownames(datTraitsNum) <- rownames(datTraits)
+
+# -------------------------------
+# Sanity checks
+# -------------------------------
+
+stopifnot(all(rownames(dat_expr) == rownames(datTraitsNum)))
+
+cat("TILs group counts:\n")
+print(table(datTraits$TILs_group, useNA = "ifany"))
+
+cat("\nDimensions:\n")
+cat("dat_expr:", dim(dat_expr), "\n")
+cat("datTraitsNum:", dim(datTraitsNum), "\n")
+
+head(datTraits)
+head(datTraitsNum)
+```
+```{r}
+# -------------------------------
+# Module–Trait associations using mergedMEs
+# -------------------------------
+
+# Normalize rownames
+rownames(mergedMEs) <- gsub("\\.", "-", rownames(mergedMEs))
+rownames(datTraitsNum) <- gsub("\\.", "-", rownames(datTraitsNum))
+rownames(dat_expr) <- gsub("\\.", "-", rownames(dat_expr))
+
+# Standardize ME order
+MEs <- orderMEs(mergedMEs)
+
+# Final alignment checks
+stopifnot(identical(rownames(dat_expr), rownames(MEs)))
+stopifnot(identical(rownames(dat_expr), rownames(datTraitsNum)))
+
+nGenes   <- ncol(dat_expr)
+nSamples <- nrow(dat_expr)
+
+# -------------------------------
+# Correlation with pairwise complete samples
+# -------------------------------
+
+module.trait.correlation <- cor(
+  MEs,
+  datTraitsNum,
+  use = "pairwise.complete.obs"
+)
+
+# Function to calculate pairwise p-values
+corPvaluePairwise <- function(x, y) {
+  pMat <- matrix(NA, nrow = ncol(x), ncol = ncol(y))
+  rownames(pMat) <- colnames(x)
+  colnames(pMat) <- colnames(y)
+
+  nMat <- matrix(NA, nrow = ncol(x), ncol = ncol(y))
+  rownames(nMat) <- colnames(x)
+  colnames(nMat) <- colnames(y)
+
+  for (i in seq_len(ncol(x))) {
+    for (j in seq_len(ncol(y))) {
+      ok <- complete.cases(x[, i], y[, j])
+      n <- sum(ok)
+      nMat[i, j] <- n
+
+      if (n >= 3) {
+        r <- cor(x[ok, i], y[ok, j])
+        t <- r * sqrt((n - 2) / (1 - r^2))
+        pMat[i, j] <- 2 * pt(abs(t), df = n - 2, lower.tail = FALSE)
+      }
+    }
+  }
+
+  return(list(pvalue = pMat, n = nMat))
+}
+
+pairwise_results <- corPvaluePairwise(MEs, datTraitsNum)
+
+module.trait.Pvalue <- pairwise_results$pvalue
+module.trait.N      <- pairwise_results$n
+
+# FDR correction
+module.trait.FDR <- apply(module.trait.Pvalue, 2, p.adjust, method = "BH")
+colnames(module.trait.FDR) <- colnames(datTraitsNum)
+rownames(module.trait.FDR) <- rownames(module.trait.Pvalue)
+
+# Save results
+write.csv(module.trait.correlation, "Module_Trait_Correlations_TILs.csv")
+write.csv(module.trait.Pvalue,      "Module_Trait_Pvalues_TILs.csv")
+write.csv(module.trait.FDR,         "Module_Trait_FDR_TILs.csv")
+write.csv(module.trait.N,           "Module_Trait_SampleN_TILs.csv")
+
+# -------------------------------
+# Heatmap
+# -------------------------------
+
+textMatrix <- paste0(
+  signif(module.trait.correlation, 2),
+  "\n(",
+  signif(module.trait.Pvalue, 2),
+  ")"
+)
+
+dim(textMatrix) <- dim(module.trait.correlation)
+
+png("Module_Trait_Relationships_TILs.png", width = 2200, height = 1600, res = 200)
+
+par(mfrow = c(1,1))
+par(oma = c(0,0,0,0))
+par(mar = c(7, 9, 3, 2))
+
+labeledHeatmap(
+  Matrix = module.trait.correlation,
+  xLabels = colnames(datTraitsNum),
+  yLabels = names(MEs),
+  ySymbols = names(MEs),
+  colorLabels = FALSE,
+  colors = blueWhiteRed(50),
+  textMatrix = textMatrix,
+  cex.text = 0.7,
+  cex.lab.x = 0.9,
+  cex.lab.y = 0.9,
+  zlim = c(-1, 1),
+  main = "Module–Trait Relationships with TILs"
+)
+
+dev.off()
+
+cat("Saved: Module_Trait_Relationships_TILs.png\n")
+cat("Saved: Module_Trait_Correlations_TILs.csv\n")
+cat("Saved: Module_Trait_Pvalues_TILs.csv\n")
+cat("Saved: Module_Trait_FDR_TILs.csv\n")
+cat("Saved: Module_Trait_SampleN_TILs.csv\n")
+```
+```{r}
+# -------------------------------
+# Target Gene Identification
+# -------------------------------
+modNames <- substring(names(MEs), 3)
+# Calculate the module membership and the associated p-values
+geneModuleMembership <- as.data.frame(cor(dat_expr, MEs, use = "p"))
+MMPvalue             <- as.data.frame(corPvalueStudent(as.matrix(geneModuleMembership), nSamples))
+# rownames(geneModuleMembership) <- colnames(dat_expr)
+# rownames(MMPvalue)             <- colnames(dat_expr)
+names(geneModuleMembership)    <- paste0("kME_", modNames)
+names(MMPvalue)                <- paste0("p.kME_", modNames)
+
+# Calculate the gene significance and associated p-values
+geneTraitSignificance <- as.data.frame(cor(dat_expr, datTraitsNum, use = "p"))
+GSPvalue              <- as.data.frame(corPvalueStudent(as.matrix(geneTraitSignificance), nSamples))
+# rownames(geneTraitSignificance) <- colnames(dat_expr)
+# rownames(GSPvalue)              <- colnames(dat_expr)
+names(geneTraitSignificance)    <- paste0("GS_", colnames(datTraitsNum))
+names(GSPvalue)                 <- paste0("p.GS_", colnames(datTraitsNum))
+head(GSPvalue)
+
+# Combine into one gene-level table
+geneInfo <- data.frame(
+  Gene   = colnames(dat_expr),
+  Module = mergedColors,
+  geneModuleMembership,
+  MMPvalue,
+  geneTraitSignificance,
+  GSPvalue,
+  check.names = FALSE,
+  row.names = NULL
+)
+
+# Save the full table
+write.csv(geneInfo, "WGCNA_GeneLevel_kME_GS.csv", row.names = FALSE)
+```
+
+
+```{r}
+# -------------------------------
+# Identify top module
+# -------------------------------
+
+# Make a long table: Module (color), Trait, r, p, FDR
+mods   <- sub("^ME", "", rownames(module.trait.correlation))
+traits <- colnames(module.trait.correlation)
+
+long <- do.call(rbind, lapply(seq_len(nrow(module.trait.correlation)), function(i){
+  data.frame(
+    Module = mods[i],
+    Trait  = traits,
+    r      = unname(module.trait.correlation[i, ]),
+    p      = unname(module.trait.Pvalue[i, ]),
+    FDR    = unname(module.trait.FDR[i, ]),
+    stringsAsFactors = FALSE
+  )
+}))
+long$abs_r     <- abs(long$r)
+long$direction <- ifelse(long$r >= 0, "pos", "neg")
+
+# Top module per trait by |r|
+top_idx <- tapply(seq_len(nrow(long)), long$Trait, function(s) s[which.max(long$abs_r[s])])
+top_per_trait <- long[unlist(top_idx), ]
+row.names(top_per_trait) <- NULL
+print(top_per_trait)
+# write.csv(top_per_trait, "Top_Module_Per_Trait.csv", row.names = FALSE)
+
+## ----- top positive and top negative per trait -----
+top_pos_idx <- tapply(seq_len(nrow(long)), long$Trait, function(s){
+  s_pos <- s[long$r[s] >= 0]
+  if (length(s_pos) == 0) NA_integer_ else s_pos[which.max(long$r[s_pos])]
+})
+top_neg_idx <- tapply(seq_len(nrow(long)), long$Trait, function(s){
+  s_neg <- s[long$r[s] < 0]
+  if (length(s_neg) == 0) NA_integer_ else s_neg[which.min(long$r[s_neg])]  # most negative
+})
+top_pos <- na.omit(long[unlist(top_pos_idx), ])
+top_neg <- na.omit(long[unlist(top_neg_idx), ])
+
+write.csv(top_pos, "Top_Positive_Module_Per_Trait.csv", row.names = FALSE)
+write.csv(top_neg, "Top_Negative_Module_Per_Trait.csv", row.names = FALSE)
+
+cat("Saved:\n - Top_Positive_Module_Per_Trait.csv\n  - Top_Negative_Module_Per_Trait.csv\n")
+```
+```{r}
+# Extract Genes in the desired Module- navajowhite2, coral2
+# Assign gene names to mergedColors
+names(mergedColors) <- colnames(dat_expr)
+
+# Extract gene names in "" module
+genes_in_navajowhite2 <- names(mergedColors)[mergedColors == "navajowhite2"]
+
+print(genes_in_navajowhite2)
+
+# Extract their expression profiles
+expr_navajowhite2 <- dat_expr[, genes_in_navajowhite2, drop = FALSE]
+
+# Save
+write.csv(expr_navajowhite2, "navajowhite2_Module_Gene_Expression.csv", row.names = TRUE)
+cat("Saved:", nrow(expr_navajowhite2), "genes and", ncol(expr_navajowhite2), "samples.\n")
+
+# -------------------------------
+# To extract top hub genes for "***"
+# -------------------------------
+library(dplyr)
+
+top50_hub_genes <- geneInfo %>%
+  dplyr::filter(Module == target_module) %>%
+  dplyr::arrange(desc(.data[[paste0("kME_", target_module)]])) %>%
+  dplyr::select(
+    Gene,
+    Module,
+    dplyr::all_of(paste0("kME_", target_module)),
+    dplyr::all_of(paste0("p.kME_", target_module)),
+    GS_High_TILs,
+    p.GS_High_TILs
+  ) %>%
+  dplyr::slice(1:50)
+
+# Preview
+print(top50_hub_genes)
+
+# Save
+write.csv(top50_hub_genes, "Top50_Hub_Genes_navajowhite2.csv", row.names = FALSE)
+```
+```{r}
+# -------------------------------
+# ORA for selected WGCNA module genes
+# -------------------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  library(msigdbr)
+  library(ReactomePA)
+  library(enrichplot)
+  library(ggplot2)
+})
+
+target_module <- "coral2"  # coral2 or navajowhite2
+
+# -------------------------------
+# Extract module genes automatically
+# -------------------------------
+
+names(mergedColors) <- colnames(dat_expr)
+
+module_genes <- names(mergedColors)[mergedColors == target_module]
+module_genes <- module_genes[!is.na(module_genes) & module_genes != ""]
+
+background_genes <- colnames(dat_expr)
+
+cat("Target module:", target_module, "\n")
+cat("Module genes:", length(module_genes), "\n")
+cat("Background genes:", length(background_genes), "\n")
+
+write.csv(
+  data.frame(Gene = module_genes),
+  paste0(target_module, "_module_genes.csv"),
+  row.names = FALSE
+)
+
+# -------------------------------
+# Convert SYMBOL to ENTREZID
+# -------------------------------
+
+module_gene_map <- bitr(
+  module_genes,
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = org.Hs.eg.db
+)
+
+background_gene_map <- bitr(
+  background_genes,
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = org.Hs.eg.db
+)
+
+module_entrez <- unique(module_gene_map$ENTREZID)
+background_entrez <- unique(background_gene_map$ENTREZID)
+
+cat("Mapped module genes:", length(module_entrez), "\n")
+cat("Mapped background genes:", length(background_entrez), "\n")
+
+# -------------------------------
+# GO Biological Process ORA
+# -------------------------------
+
+ego_bp <- enrichGO(
+  gene          = module_entrez,
+  universe      = background_entrez,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 1,
+  qvalueCutoff  = 1,
+  readable      = TRUE
+)
+
+go_bp_df <- as.data.frame(ego_bp)
+go_bp_df <- go_bp_df[order(go_bp_df$p.adjust), ]
+
+write.csv(
+  go_bp_df,
+  paste0(target_module, "_ORA_GO_BP.csv"),
+  row.names = FALSE
+)
+
+if (nrow(go_bp_df) > 0) {
+  png(paste0(target_module, "_ORA_GO_BP_dotplot.png"), width = 1800, height = 1400, res = 200)
+  print(dotplot(ego_bp, showCategory = 20) + ggtitle(paste0(target_module, " module: GO BP ORA")))
+  dev.off()
+}
+
+# -------------------------------
+# Reactome ORA
+# -------------------------------
+
+reactome_ora <- enrichPathway(
+  gene          = module_entrez,
+  universe      = background_entrez,
+  organism      = "human",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 1,
+  qvalueCutoff  = 1,
+  readable      = TRUE
+)
+
+reactome_df <- as.data.frame(reactome_ora)
+reactome_df <- reactome_df[order(reactome_df$p.adjust), ]
+
+write.csv(
+  reactome_df,
+  paste0(target_module, "_ORA_Reactome.csv"),
+  row.names = FALSE
+)
+
+if (nrow(reactome_df) > 0) {
+  png(paste0(target_module, "_ORA_Reactome_dotplot.png"), width = 1800, height = 1400, res = 200)
+  print(dotplot(reactome_ora, showCategory = 20) + ggtitle(paste0(target_module, " module: Reactome ORA")))
+  dev.off()
+}
+
+# -------------------------------
+# Hallmark ORA
+# -------------------------------
+
+hallmark_df <- msigdbr(
+  species = "Homo sapiens",
+  category = "H"
+) %>%
+  dplyr::select(gs_name, gene_symbol)
+
+hallmark_ora <- enricher(
+  gene          = module_genes,
+  universe      = background_genes,
+  TERM2GENE     = hallmark_df,
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 1,
+  qvalueCutoff  = 1
+)
+
+hallmark_out <- as.data.frame(hallmark_ora)
+hallmark_out <- hallmark_out[order(hallmark_out$p.adjust), ]
+
+write.csv(
+  hallmark_out,
+  paste0(target_module, "_ORA_Hallmark.csv"),
+  row.names = FALSE
+)
+
+if (nrow(hallmark_out) > 0) {
+  png(paste0(target_module, "_ORA_Hallmark_dotplot.png"), width = 1800, height = 1200, res = 200)
+  print(dotplot(hallmark_ora, showCategory = 20) + ggtitle(paste0(target_module, " module: Hallmark ORA")))
+  dev.off()
+}
+
+cat("ORA complete for module:", target_module, "\n")
+```

@@ -100,10 +100,10 @@ WES/
 |-- 2_TrimGalore/
 |-- 3_Alignment/
 |-- 4_BQSR/
-`-- 5_Mutect2/
+|-- 5_Mutect2/
     |-- PON_normals/
     |-- PON/
-    `-- Mutect2_with_PON/
+|-- 6_Mutect2_with_PON/
 ```
 
 ---
@@ -303,7 +303,7 @@ PoN is generated in two steps:
 Input:
 
 - normal-only Mutect2 VCFs from `PON_normals/`
-- 40 additional PoN-compatible normal VCFs from PDO landscape similar WES datasets
+- optionally additional PoN-compatible normal VCFs from other technically similar WES datasets
 
 Output:
 
