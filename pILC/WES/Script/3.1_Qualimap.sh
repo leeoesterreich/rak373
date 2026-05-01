@@ -2,10 +2,10 @@
 #SBATCH --job-name=qualimap_only
 #SBATCH --output=slurm_log/qualimap/qualimap_%A_%a.out
 #SBATCH --error=slurm_log/qualimap/qualimap_%A_%a.err
-#SBATCH --time=02:00:00
+#SBATCH --time=06:00:00
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
-#SBATCH --array=0-47
+#SBATCH --array=0-49
 
 set -euo pipefail
 
@@ -16,6 +16,7 @@ module load gcc/8.2.0 samtools/1.22.1 qualimap/2.3
 # ==== File paths ====
 align_base="/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/3_Alignment"
 qualimap_base="${align_base}/Qualimap"
+Feature_BED="/ix1/alee/LO_LAB/General/References/GATK_resource_bundle_hg38_060325_bts76/v0/Illumina_Exome_TargetedRegions_v1.2.hg38.bed"
 
 mkdir -p "slurm_log/qualimap" "$qualimap_base"
 
@@ -61,6 +62,7 @@ qualimap bamqc \
     -outdir "$out_dir" \
     -outformat HTML \
     -nt "${SLURM_CPUS_PER_TASK}" \
+    --feature-file "${Feature_BED}" \
     --java-mem-size=128G
 
 # ==== Confirm output ====

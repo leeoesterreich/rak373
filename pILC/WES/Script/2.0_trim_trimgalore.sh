@@ -78,9 +78,10 @@ echo "[INFO] Merging lane FASTQs..."
 cat "${R1_FILES[@]}" > "$MERGED_R1"
 cat "${R2_FILES[@]}" > "$MERGED_R2"
 
-# Run Trim Galore
+# Run Trim Galore, use Illumina instead of the default auto-detection of adapter sequence.
 trim_galore \
     --paired \
+    --illumina \
     --gzip \
     --cores 8 \
     -o "$OUT_DIR" \
