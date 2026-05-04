@@ -15,7 +15,7 @@ module load r/4.4.0
 
 CSV_PATH="/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/FACETS/Paired_samples.csv"
 RSCRIPT_PATH="/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/FACETS/Script/snp-pileup-wrapper.R"
-SNP_PILEUP_PATH="/ihome/alee/rak373/R/x86_64-pc-linux-gnu-library/4.3/facets/extcode/snp-pileup"
+SNP_PILEUP_PATH="/ihome/alee/rak373/R/x86_64-pc-linux-gnu-library/4.4/facets/extcode/snp-pileup"
 VCF_FILE="/ix1/alee/LO_LAB/Personal/Rahul/Reference_genome/Human/00-common_all.vcf.gz"
 PILEUP_DIR="/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/FACETS/snp-pileup"
 
