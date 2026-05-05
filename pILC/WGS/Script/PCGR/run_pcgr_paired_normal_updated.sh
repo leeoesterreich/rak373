@@ -27,7 +27,7 @@ SIF="/ix1/alee/LO_LAB/Personal/Rahul/Reference_genome/env/pcgr_2.2.3.sif"
 # Input data
 INPUT_DIR="/ix1/alee/LO_LAB/Personal/Rahul/pILC/WGS/PCGR"
 VCF_DIR="$INPUT_DIR/vcf_pcgr"
-TPM_DIR="$INPUT_DIR/tpm_counts"
+TPM_DIR="$INPUT_DIR/tpm_pcgr"
 CNA_DIR="$INPUT_DIR/cna_segs"
 INDEX_FILE="$INPUT_DIR/matched_normal_index.csv"
 
