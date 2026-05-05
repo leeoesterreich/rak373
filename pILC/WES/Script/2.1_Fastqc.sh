@@ -3,7 +3,7 @@
 #SBATCH --job-name=Trim_fastqc
 #SBATCH --output=slurm_log/Trim_fastqc/Trim_fastqc_%A_%a.out
 #SBATCH --error=slurm_log/Trim_fastqc/Trim_fastqc_%A_%a.err
-#SBATCH --time=02:00:00
+#SBATCH --time=04:00:00
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --array=0-47

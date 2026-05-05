@@ -2,10 +2,10 @@
 #SBATCH --job-name=mutect2_pon_full
 #SBATCH --output=slurm_log/mutect2/with_pon/mutect2_pon_full_%A_%a.out
 #SBATCH --error=slurm_log/mutect2/with_pon/mutect2_pon_full_%A_%a.err
-#SBATCH --time=1-00:00:00
+#SBATCH --time=2-00:00:00
 #SBATCH --mem=32G
 #SBATCH --cpus-per-task=4
-#SBATCH --array=0-30
+#SBATCH --array=0-31
 
 set -euo pipefail
 

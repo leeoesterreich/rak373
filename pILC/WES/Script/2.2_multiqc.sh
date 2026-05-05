@@ -3,7 +3,7 @@
 #SBATCH --job-name=MultiQC
 #SBATCH --output=slurm_log/multiqc/multiqc_%j.out
 #SBATCH --error=slurm_log/multiqc/multiqc_%j.err
-#SBATCH --time=01:00:00
+#SBATCH --time=04:00:00
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
 

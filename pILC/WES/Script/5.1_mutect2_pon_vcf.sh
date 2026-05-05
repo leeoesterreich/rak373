@@ -54,7 +54,7 @@ fi
 
 # Skip if output already exists
 if [[ -f "$OUT_VCF" ]]; then
-    log_success "$SAMPLE VCF already exists â€” skipping."
+    log_success "$SAMPLE VCF already exists — skipping."
     exit 0
 fi
 

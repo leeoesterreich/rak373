@@ -11,7 +11,7 @@ set -euo pipefail
 
 # Load required modules
 module purge
-module load gcc/8.2.0 samtools/1.22.1 bwa/0.7.17 qualimap/2.3
+module load gcc/8.2.0 samtools/1.22.1 bwa/0.7.17
 
 # ==== File paths ====
 trim_base="/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/2_TrimGalore"

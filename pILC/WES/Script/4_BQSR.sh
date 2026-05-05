@@ -41,8 +41,8 @@ WORKDIR="${OUTPUT_DIR}/${SAMPLE}"
 mkdir -p "$WORKDIR"
 
 TMP_RG_BAM="${WORKDIR}/${SAMPLE}.rg.bam"
-DEDUP_BAM="${WORKDIR}/${SAMPLE}.dedup.bam"
-METRICS="${WORKDIR}/${SAMPLE}.dedup.metrics.txt"
+MKDUP_BAM="${WORKDIR}/${SAMPLE}.mkdup.bam"
+METRICS="${WORKDIR}/${SAMPLE}.mkdup.metrics.txt"
 BQSR_TABLE="${WORKDIR}/${SAMPLE}.recal.table"
 RECAL_BAM="${WORKDIR}/${SAMPLE}.bqsr.bam"
 
@@ -86,7 +86,7 @@ echo "[INFO] Marking duplicates for $SAMPLE"
 singularity exec $BIND $SIF \
     gatk MarkDuplicates \
     -I "$TMP_RG_BAM" \
-    -O "$DEDUP_BAM" \
+    -O "$MKDUP_BAM" \
     -M "$METRICS" \
     --CREATE_INDEX true
 
@@ -95,7 +95,7 @@ echo "[INFO] Running BaseRecalibrator for $SAMPLE"
 singularity exec $BIND $SIF \
     gatk BaseRecalibrator \
     -R "$REF" \
-    -I "$DEDUP_BAM" \
+    -I "$MKDUP_BAM" \
     --known-sites "$INDELS_GOLD" \
     --known-sites "$SNPS_1000G" \
     -O "$BQSR_TABLE"
@@ -105,14 +105,11 @@ echo "[INFO] Applying BQSR for $SAMPLE"
 singularity exec $BIND $SIF \
     gatk ApplyBQSR \
     -R "$REF" \
-    -I "$DEDUP_BAM" \
+    -I "$MKDUP_BAM" \
     --bqsr-recal-file "$BQSR_TABLE" \
     -O "$RECAL_BAM"
 
-# === Index final BAM ===
-samtools index "$RECAL_BAM"
-
-# === Optional cleanup of intermediate RG BAM ===
-rm -f "$TMP_RG_BAM" "${TMP_RG_BAM}.bai"
+# === Cleanup of intermediate RG BAM and index ===
+rm -f "$TMP_RG_BAM" "${TMP_RG_BAM%.bam}.bai"
 
 echo "[DONE] AddOrReplaceReadGroups, MarkDuplicates, BaseRecalibrator, and ApplyBQSR completed for $SAMPLE"
