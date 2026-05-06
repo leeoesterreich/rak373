@@ -8,7 +8,7 @@ This repository documents the WES downstream workflow used for **PCGR annotation
 The workflow has two major parts:
 
 ```text
-Part 1: Tumor-only / With_PON" VCF preparation and PCGR annotation
+Part 1: Tumor-only / With_PON VCF preparation and PCGR annotation
 Part 2: Tumor-only vs With_PON PCGR PASS VCF comparison
 ```
 
