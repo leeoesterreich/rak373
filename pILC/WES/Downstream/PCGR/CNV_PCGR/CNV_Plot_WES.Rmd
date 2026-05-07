@@ -1,0 +1,591 @@
+---
+title: "CNV_Plot_WES"
+output: html_document
+date: "2026-05-07"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# ============================================================
+# PCGR CNV Plotting Script for WES
+#
+# Purpose:
+#   1. Read merged per-sample PCGR CNV CSV files
+#   2. Check column consistency
+#   3. Count recurrent CNV genes
+#   4. Generate recurrent CNV heatmap
+#
+# Input:
+#   /ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/CNV_PCGR/Plot/
+#
+# Output:
+#   PNG/PDF heatmap and recurrent gene tables
+# ============================================================
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(readr)
+  library(dplyr)
+  library(purrr)
+  library(stringr)
+  library(tibble)
+  library(tidyr)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(grid)
+})
+
+# ============================================================
+# Define input and output directories
+# ============================================================
+
+CNV_DIR <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/CNV_PCGR/Plot"
+OUT_DIR <- file.path(CNV_DIR, "Figures")
+
+dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+cat("[INFO] CNV input directory:", CNV_DIR, "\n")
+cat("[INFO] Output directory:", OUT_DIR, "\n\n")
+```
+```{r}
+# ============================================================
+# Find sample-level CNV CSV files
+# ============================================================
+# Important:
+#   We only keep files like TP03-117_T.csv
+#   This avoids reading summary files such as:
+#     CNV_merge_summary.csv
+#     CNV_file_grouping_summary.csv
+
+files <- sort(list.files(
+  CNV_DIR,
+  pattern = "^TP.*_T\\.csv$",
+  full.names = TRUE
+))
+
+cat("[INFO] Sample CNV CSV files found:", length(files), "\n")
+
+if (length(files) == 0) {
+  stop("[ERROR] No sample-level CNV CSV files found. Check CNV_DIR or filename pattern.")
+}
+
+cat("[INFO] Files used:\n")
+print(basename(files))
+
+```
+```{r}
+# ============================================================
+# Sanity check column structure
+# ============================================================
+
+get_cols <- function(f) {
+  hdr <- read_lines(f, n_max = 1)
+
+  if (length(hdr) == 0 || nchar(hdr[1]) == 0) {
+    return(tibble(
+      file = basename(f),
+      empty = TRUE,
+      ncol = NA_integer_,
+      cols = list(character())
+    ))
+  }
+
+  cols <- str_split(hdr[1], ",", simplify = FALSE)[[1]] %>%
+    str_replace_all('"', "") %>%
+    str_trim()
+
+  tibble(
+    file = basename(f),
+    empty = FALSE,
+    ncol = length(cols),
+    cols = list(cols)
+  )
+}
+
+hdr_df <- map_dfr(files, get_cols)
+
+cat("\n====================================================\n")
+cat("[SANITY] File count + column count\n")
+cat("====================================================\n")
+
+print(hdr_df %>% select(file, empty, ncol))
+
+if (any(hdr_df$empty)) {
+  cat("\n[WARN] Empty files detected:\n")
+  print(hdr_df %>% filter(empty) %>% select(file))
+}
+
+# Use first non-empty file as reference
+ref_cols <- hdr_df %>%
+  filter(!empty) %>%
+  slice(1) %>%
+  pull(cols) %>%
+  .[[1]]
+
+ref_file <- hdr_df %>%
+  filter(!empty) %>%
+  slice(1) %>%
+  pull(file)
+
+cmp_df <- hdr_df %>%
+  mutate(
+    same_as_ref = map_lgl(cols, ~ identical(.x, ref_cols)),
+    missing_vs_ref = map_chr(cols, ~ paste(setdiff(ref_cols, .x), collapse = ";")),
+    extra_vs_ref   = map_chr(cols, ~ paste(setdiff(.x, ref_cols), collapse = ";"))
+  )
+
+cat("\n====================================================\n")
+cat("[SANITY] Column matching vs reference\n")
+cat("====================================================\n")
+cat("[INFO] Reference file:", ref_file, "\n")
+cat("[INFO] Reference columns:\n")
+cat(paste(ref_cols, collapse = ", "), "\n\n")
+
+print(cmp_df %>% select(file, same_as_ref))
+
+mismatch <- cmp_df %>% filter(!empty, !same_as_ref)
+
+if (nrow(mismatch) == 0) {
+  cat("\n[DONE] All non-empty files have identical column names and order.\n")
+} else {
+  cat("\n[WARN] Mismatched files detected:\n")
+
+  print(
+    mismatch %>%
+      transmute(
+        file,
+        ncol,
+        missing_vs_ref = ifelse(missing_vs_ref == "", "NONE", missing_vs_ref),
+        extra_vs_ref   = ifelse(extra_vs_ref == "", "NONE", extra_vs_ref)
+      )
+  )
+}
+
+write_csv(
+  cmp_df %>% select(file, empty, ncol, same_as_ref, missing_vs_ref, extra_vs_ref),
+  file.path(OUT_DIR, "WES_CNV_column_sanity.csv")
+)
+
+```
+
+```{r}
+# ============================================================
+# Helper function to read and clean one CNV file
+# ============================================================
+
+read_cnv_clean <- function(f) {
+
+  sample_name <- str_replace(basename(f), "\\.csv$", "")
+
+  df <- read_csv(
+    f,
+    show_col_types = FALSE,
+    progress = FALSE,
+    name_repair = "minimal"
+  )
+
+  # Drop first blank row-name column if present
+  # Original PCGR header may begin with:
+  # "","SYMBOL","GENENAME",...
+  if (ncol(df) > 0 && names(df)[1] %in% c("", "...1", "X1")) {
+    df <- df[, -1, drop = FALSE]
+  }
+
+  required_cols <- c("SYMBOL", "VARIANT_CLASS")
+
+  missing_required <- setdiff(required_cols, names(df))
+
+  if (length(missing_required) > 0) {
+    stop(
+      paste0(
+        "[ERROR] Missing required columns in ",
+        basename(f),
+        ": ",
+        paste(missing_required, collapse = ", ")
+      )
+    )
+  }
+
+  df <- df %>%
+    mutate(
+      Sample = sample_name,
+      Merged_File = basename(f),
+      .before = 1
+    )
+
+  return(df)
+}
+```
+
+
+```{r}
+# ============================================================
+# Read all WES CNV files
+# ============================================================
+
+cnv_all <- map_dfr(files, read_cnv_clean)
+
+cat("\n====================================================\n")
+cat("[INFO] Combined CNV table\n")
+cat("====================================================\n")
+cat("[INFO] Total rows:", nrow(cnv_all), "\n")
+cat("[INFO] Total samples:", n_distinct(cnv_all$Sample), "\n")
+cat("[INFO] Total unique genes:", n_distinct(cnv_all$SYMBOL), "\n")
+
+write_tsv(
+  cnv_all,
+  file.path(OUT_DIR, "WES_PCGR_CNV_combined_long.tsv")
+)
+
+# ============================================================
+# Count unique genes per sample
+# ============================================================
+
+per_sample_genes <- cnv_all %>%
+  transmute(
+    Sample,
+    SYMBOL = str_trim(as.character(SYMBOL))
+  ) %>%
+  filter(!is.na(SYMBOL), SYMBOL != "") %>%
+  distinct(Sample, SYMBOL) %>%
+  group_by(Sample) %>%
+  summarise(unique_genes = n_distinct(SYMBOL), .groups = "drop") %>%
+  arrange(desc(unique_genes))
+
+cat("\n====================================================\n")
+cat("[SUMMARY] Unique CNV genes per sample\n")
+cat("====================================================\n")
+print(per_sample_genes)
+
+write_tsv(
+  per_sample_genes,
+  file.path(OUT_DIR, "WES_unique_CNV_genes_per_sample.tsv")
+)
+```
+
+
+```{r}
+# ============================================================
+# Find recurrent CNV genes
+# ============================================================
+
+gene_frequency <- cnv_all %>%
+  transmute(
+    Sample,
+    SYMBOL = str_trim(as.character(SYMBOL))
+  ) %>%
+  filter(!is.na(SYMBOL), SYMBOL != "") %>%
+  distinct(Sample, SYMBOL) %>%
+  group_by(SYMBOL) %>%
+  summarise(n_samples = n_distinct(Sample), .groups = "drop") %>%
+  arrange(desc(n_samples), SYMBOL)
+
+all_unique_genes <- gene_frequency %>%
+  select(SYMBOL, n_samples)
+
+# Change this threshold if needed
+min_samples <- 8
+
+recurrent_genes <- gene_frequency %>%
+  filter(n_samples >= min_samples)
+
+cat("\n====================================================\n")
+cat("[SUMMARY] Recurrent CNV genes\n")
+cat("====================================================\n")
+cat("[INFO] Minimum samples threshold:", min_samples, "\n")
+cat("[INFO] Total recurrent genes:", nrow(recurrent_genes), "\n")
+print(recurrent_genes)
+
+write_tsv(
+  all_unique_genes,
+  file.path(OUT_DIR, "WES_all_unique_CNV_genes.tsv")
+)
+
+write_tsv(
+  recurrent_genes,
+  file.path(OUT_DIR, paste0("WES_recurrent_CNV_genes_min", min_samples, ".tsv"))
+)
+```
+
+
+```{r}
+# ============================================================
+# Normalize CNV variant classes
+# ============================================================
+# PCGR commonly uses classes such as:
+#   Gain, Hetdel, Homdel
+#
+# This function is slightly flexible in case values appear as:
+#   HETD, HOMD, AMP, HLAMP, etc.
+
+normalize_class <- function(x) {
+
+  x <- str_to_lower(str_trim(as.character(x)))
+
+  case_when(
+    x %in% c("hetdel", "het_del", "hetd", "heterozygous deletion", "het deletion") ~ "Hetdel",
+    x %in% c("homdel", "hom_del", "homd", "homozygous deletion", "hom deletion") ~ "Homdel",
+    x %in% c("gain", "amp", "amplification", "hlamp", "high-level amplification") ~ "Gain",
+    TRUE ~ NA_character_
+  )
+}
+
+# Severity priority if one gene has multiple CNV calls in the same sample
+# Most severe call will be used for heatmap
+priority <- c(
+  "Homdel" = 3,
+  "Hetdel" = 2,
+  "Gain"   = 1,
+  "None"   = 0
+)
+
+# ============================================================
+# Prepare CNV table for heatmap
+# ============================================================
+
+cnv_long <- cnv_all %>%
+  transmute(
+    Sample = as.character(Sample),
+    SYMBOL = str_trim(as.character(SYMBOL)),
+    VARIANT_CLASS = normalize_class(VARIANT_CLASS)
+  ) %>%
+  filter(
+    !is.na(Sample), Sample != "",
+    !is.na(SYMBOL), SYMBOL != "",
+    !is.na(VARIANT_CLASS)
+  )
+
+cat("\n====================================================\n")
+cat("[INFO] CNV classes after normalization\n")
+cat("====================================================\n")
+print(table(cnv_long$VARIANT_CLASS))
+
+# Collapse to one CNV class per Sample × Gene
+cnv_onecall <- cnv_long %>%
+  mutate(score = unname(priority[VARIANT_CLASS])) %>%
+  group_by(Sample, SYMBOL) %>%
+  slice_max(order_by = score, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(Sample, SYMBOL, VARIANT_CLASS)
+
+write_tsv(
+  cnv_onecall,
+  file.path(OUT_DIR, "WES_PCGR_CNV_onecall_per_gene_sample.tsv")
+)
+
+# Keep genes recurrent in >= min_samples
+gene_freq_plot <- cnv_onecall %>%
+  distinct(Sample, SYMBOL) %>%
+  count(SYMBOL, name = "n_samples") %>%
+  filter(n_samples >= min_samples) %>%
+  arrange(desc(n_samples), SYMBOL)
+
+genes_keep <- gene_freq_plot$SYMBOL
+
+cat("\n====================================================\n")
+cat("[INFO] Genes kept for heatmap\n")
+cat("====================================================\n")
+cat("[INFO] Genes kept >= ", min_samples, " samples: ", length(genes_keep), "\n", sep = "")
+
+if (length(genes_keep) == 0) {
+  stop("[ERROR] No recurrent genes found for heatmap. Try lowering min_samples.")
+}
+```
+
+
+```{r}
+# ============================================================
+# Create heatmap matrix
+# ============================================================
+
+samples <- sort(unique(cnv_onecall$Sample))
+
+heat_df <- cnv_onecall %>%
+  filter(SYMBOL %in% genes_keep) %>%
+  transmute(SYMBOL, Sample, VAR = VARIANT_CLASS)
+
+mat_chr <- heat_df %>%
+  pivot_wider(names_from = Sample, values_from = VAR) %>%
+  as.data.frame()
+
+rownames(mat_chr) <- mat_chr$SYMBOL
+mat_chr$SYMBOL <- NULL
+
+# Ensure all sample columns exist
+missing_cols <- setdiff(samples, colnames(mat_chr))
+
+if (length(missing_cols) > 0) {
+  mat_chr[missing_cols] <- NA_character_
+}
+
+mat_chr <- mat_chr[, samples, drop = FALSE]
+
+# Fill missing values as None
+mat_chr[is.na(mat_chr)] <- "None"
+
+# Order genes by recurrence
+mat_chr <- mat_chr[genes_keep, , drop = FALSE]
+
+mat_chr <- as.matrix(mat_chr)
+storage.mode(mat_chr) <- "character"
+
+mat_fac <- matrix(
+  factor(
+    as.vector(mat_chr),
+    levels = c("None", "Hetdel", "Homdel", "Gain")
+  ),
+  nrow = nrow(mat_chr),
+  ncol = ncol(mat_chr),
+  dimnames = dimnames(mat_chr)
+)
+```
+
+
+```{r}
+# ============================================================
+# Define colors
+# ============================================================
+
+class_cols <- c(
+  "Hetdel" = "#8C6D31",  # brown
+  "Homdel" = "#D7301F",  # red
+  "Gain"   = "#31A354",  # green
+  "None"   = "#FFFFFF"   # white
+)
+```
+
+
+```{r}
+# ============================================================
+# Row annotation - CNV class counts per gene
+# ============================================================
+
+count_mat <- sapply(
+  c("Hetdel", "Homdel", "Gain"),
+  function(cl) rowSums(mat_chr == cl)
+)
+
+colnames(count_mat) <- c("Hetdel", "Homdel", "Gain")
+
+# Maximum total CNV count per gene across classes
+max_count <- max(rowSums(count_mat), na.rm = TRUE)
+
+# Round up to nearest multiple of 3
+max_axis <- ceiling(max_count / 3) * 3
+
+axis_ticks <- seq(0, max_axis, by = 3)
+
+row_ha <- rowAnnotation(
+  `Class counts` = anno_barplot(
+    count_mat,
+    gp = gpar(
+      fill = class_cols[colnames(count_mat)],
+      col = NA
+    ),
+    border = FALSE,
+    bar_width = 0.95,
+    xlim = c(0, max_axis),
+    axis_param = list(
+      at = axis_ticks,
+      labels = axis_ticks,
+      gp = gpar(fontsize = 9)
+    )
+  ),
+  width = unit(2.8, "cm")
+)
+```
+
+
+```{r}
+# ============================================================
+# Generate heatmap
+# ============================================================
+
+show_x_names <- TRUE
+column_names_rot <- if (show_x_names) 45 else 0
+
+# font settings
+txt_gp_row <- gpar(fontsize = 10, col = "black", fontfamily = "sans")
+txt_gp_col <- gpar(fontsize = 10, col = "black", fontfamily = "sans")
+
+
+ht_w <- unit(8, "cm")
+ht_h <- unit(0.15 * nrow(mat_fac), "in")
+
+
+ht <- Heatmap(
+  mat_fac,
+  name = "CNV class",
+  col = class_cols,
+
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  show_row_dend = FALSE,
+  show_column_dend = FALSE,
+
+  show_column_names = show_x_names,
+  column_names_rot = column_names_rot,
+
+  row_names_side = "left",
+  column_names_side = "bottom",
+  row_names_gp = txt_gp_row,
+  column_names_gp = txt_gp_col,
+  
+  rect_gp = gpar(col = "grey80", lwd = 0.6),
+  na_col = class_cols["None"],
+
+  width = ht_w,
+  height = ht_h,
+
+  heatmap_legend_param = list(
+    at = c("Hetdel", "Homdel", "Gain"),
+    labels = c("Hetdel", "Homdel", "Gain"),
+    labels_gp = gpar(col = "black", fontsize = 10),
+    title_gp  = gpar(col = "black", fontsize = 11, fontface = "bold")
+  )
+)
+
+draw(
+  ht + row_ha,
+  heatmap_legend_side = "right",
+  annotation_legend_side = "right",
+  padding = unit(c(25, 10, 25, 10), "mm")
+)
+```
+
+
+```{r}
+# ============================================================
+# Save heatmap
+# ============================================================
+
+out_png <- file.path(OUT_DIR, sprintf("WES_PCGR_CNV_heatmap_min%d.png", min_samples))
+
+png(out_png, width = 1800, height = 2500, res = 300)
+draw(
+  ht + row_ha,
+  heatmap_legend_side = "right",
+  annotation_legend_side = "right",
+  padding = unit(c(25, 10, 25, 10), "mm")
+)
+dev.off()
+
+# ----- Save PDF (vector quality for publication) -----
+out_pdf <- file.path(OUT_DIR, sprintf("WES_PCGR_CNV_heatmap_min%d.pdf", min_samples))
+
+pdf(out_pdf, width = 10, height = 12)  # size in inches
+draw(
+  ht + row_ha,
+  heatmap_legend_side = "right",
+  annotation_legend_side = "right",
+  padding = unit(c(25, 10, 25, 10), "mm")
+)
+dev.off()
+
+cat("[INFO] Saved PNG:", out_png, "\n")
+cat("[INFO] Saved PDF:", out_pdf, "\n")
+
+```
+
+

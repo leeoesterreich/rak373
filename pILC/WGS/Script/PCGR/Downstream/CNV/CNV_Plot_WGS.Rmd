@@ -1,0 +1,444 @@
+---
+title: "CNV_Plot_WGS"
+output: html_document
+date: "2026-03-02"
+---
+
+```{r setup}
+suppressPackageStartupMessages({
+  library(readr)
+  library(dplyr)
+  library(purrr)
+  library(stringr)
+  library(tibble)
+})
+
+CNV_DIR <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WGS/PCGR/Downstream/CNV"
+files <- sort(list.files(CNV_DIR, pattern = "\\.csv$", full.names = TRUE))
+
+cat("[INFO] CNV_DIR:", CNV_DIR, "\n")
+cat("[INFO] CSV files found:", length(files), "\n\n")
+if (length(files) == 0) stop("[ERROR] No CSV files found.")
+
+# ---- Read only header line (fast; avoids full parsing) ----
+get_cols <- function(f) {
+  hdr <- read_lines(f, n_max = 1)
+  if (length(hdr) == 0 || nchar(hdr[1]) == 0) {
+    return(tibble(file = basename(f), empty = TRUE, ncol = NA_integer_, cols = list(character())))
+  }
+  cols <- str_split(hdr[1], ",", simplify = FALSE)[[1]] %>% str_trim()
+  tibble(file = basename(f), empty = FALSE, ncol = length(cols), cols = list(cols))
+}
+
+hdr_df <- map_dfr(files, get_cols)
+
+cat("====================================================\n")
+cat("[SANITY] File count + column count\n")
+cat("====================================================\n")
+print(hdr_df %>% dplyr::select(file, empty, ncol))
+
+if (any(hdr_df$empty)) {
+  cat("\n[WARN] Empty files detected:\n")
+  print(hdr_df %>% filter(empty) %>% select(file))
+}
+
+# ---- Column match check (exact: names + order) ----
+ref_cols <- hdr_df %>% dplyr::filter(!empty) %>% dplyr::slice(1) %>% dplyr::pull(cols) %>% .[[1]]
+ref_file <- hdr_df %>% dplyr::filter(!empty) %>% dplyr::slice(1) %>% dplyr::pull(file)
+
+cmp_df <- hdr_df %>%
+  mutate(
+    same_as_ref = map_lgl(cols, ~ identical(.x, ref_cols)),
+    missing_vs_ref = map_chr(cols, ~ paste(setdiff(ref_cols, .x), collapse = ";")),
+    extra_vs_ref   = map_chr(cols, ~ paste(setdiff(.x, ref_cols), collapse = ";"))
+  )
+
+cat("\n====================================================\n")
+cat("[SANITY] Column matching vs reference\n")
+cat("====================================================\n")
+cat("[INFO] Reference file:", ref_file, "\n")
+cat("[INFO] Reference columns (ordered):\n")
+cat(paste(ref_cols, collapse = ", "), "\n\n")
+
+print(cmp_df %>% dplyr::select(file, same_as_ref))
+
+# Show mismatches with details
+mismatch <- cmp_df %>% filter(!empty, !same_as_ref)
+
+if (nrow(mismatch) == 0) {
+  cat("\n All non-empty files have identical column names AND order.\n")
+} else {
+  cat("\n Mismatched files detected (details below):\n\n")
+  print(
+    mismatch %>%
+      transmute(
+        file,
+        ncol,
+        missing_vs_ref = ifelse(missing_vs_ref == "", "NONE", missing_vs_ref),
+        extra_vs_ref   = ifelse(extra_vs_ref == "", "NONE", extra_vs_ref)
+      )
+  )
+  cat("\n[NOTE] If column order differs, bind_rows() can still work if names match,\n")
+  cat("       but it's safest to standardize order before merging.\n")
+}
+```
+
+
+```{r}
+# ====================================================
+# SANITY: unique gene counts across all CNV CSV files
+#   - genes per file (unique SYMBOL)
+#   - total unique genes across cohort
+#   - genes shared across ALL files
+# ====================================================
+
+# Read only what we need (SYMBOL), keep robust trimming
+gene_list <- purrr::map(files, function(f) {
+  df <- readr::read_csv(f, show_col_types = FALSE, progress = FALSE)
+
+  if (!"SYMBOL" %in% names(df)) {
+    stop(paste0("[ERROR] SYMBOL column missing in: ", basename(f)))
+  }
+
+  df %>%
+    transmute(SYMBOL = stringr::str_trim(as.character(SYMBOL))) %>%
+    filter(!is.na(SYMBOL), SYMBOL != "") %>%
+    distinct() %>%
+    mutate(file = basename(f)) %>%
+    select(file, SYMBOL)
+})
+
+# ---- Genes per file ----
+per_file_genes <- bind_rows(gene_list) %>%
+  group_by(file) %>%
+  summarise(unique_genes = n_distinct(SYMBOL), .groups = "drop") %>%
+  arrange(desc(unique_genes))
+```
+
+
+```{r}
+# ---- Total unique genes across all files ----
+all_unique_genes <- bind_rows(gene_list) %>%
+  distinct(SYMBOL)
+
+cat("\n====================================================\n")
+cat("[SUMMARY] Unique genes across ALL files\n")
+cat("====================================================\n")
+cat("Total unique genes across cohort:", nrow(all_unique_genes), "\n")
+
+# ---- Genes shared in ALL files ----
+shared_genes <- Reduce(intersect, lapply(gene_list, function(x) x$SYMBOL))
+
+cat("Genes present in ALL files:", length(shared_genes), "\n")
+print(shared_genes)
+
+# ====================================================
+# Genes present in at least 5 samples
+# ====================================================
+
+# Count in how many samples each gene appears
+gene_frequency <- bind_rows(gene_list) %>%
+  group_by(SYMBOL) %>%
+  summarise(n_samples = n_distinct(file), .groups = "drop") %>%
+  arrange(desc(n_samples))
+
+# Filter genes present in >= 5 samples
+recurrent_genes_5 <- gene_frequency %>%
+  filter(n_samples >= 5)
+
+cat("\n====================================================\n")
+cat("[RECURSIVE CNV GENES] Present in ≥ 5 samples\n")
+cat("====================================================\n")
+
+print(recurrent_genes_5)
+
+cat("\nTotal genes present in ≥ 5 samples:", nrow(recurrent_genes_5), "\n")
+
+# save lists for downstream
+write_tsv(all_unique_genes, file.path(CNV_DIR, "ALL_unique_genes.tsv"))
+write_tsv(recurrent_genes_5, file.path(CNV_DIR, "recurrent_genes_min5.tsv"))
+```
+
+```{r}
+# ====================================================
+# DEBUG specific files for gene count discrepancy
+# ====================================================
+
+debug_files <- c(
+  "JC287-TP17-M11.csv",
+  "JC287-TP08-525.csv"
+)
+
+for (fname in debug_files) {
+  
+  cat("\n====================================================\n")
+  cat("[DEBUG] File:", fname, "\n")
+  cat("====================================================\n")
+  
+  fpath <- file.path(CNV_DIR, fname)
+  df <- readr::read_csv(fpath, show_col_types = FALSE)
+  
+  cat("Total rows in file:", nrow(df), "\n")
+  
+  # Raw unique SYMBOL (no cleaning)
+  raw_unique <- length(unique(df$SYMBOL))
+  cat("Unique SYMBOL (raw):", raw_unique, "\n")
+  
+  # Cleaned SYMBOL (trim + remove NA/empty)
+  clean_symbols <- df$SYMBOL %>%
+    as.character() %>%
+    stringr::str_trim()
+  
+  clean_symbols <- clean_symbols[!is.na(clean_symbols) & clean_symbols != ""]
+  
+  clean_unique <- length(unique(clean_symbols))
+  cat("Unique SYMBOL (trimmed, no NA/empty):", clean_unique, "\n")
+  
+  # Check duplicates
+  dup_count <- sum(duplicated(clean_symbols))
+  cat("Number of duplicated SYMBOL rows:", dup_count, "\n")
+  
+  # Show duplicated genes (if any)
+  dup_genes <- clean_symbols[duplicated(clean_symbols)] %>% unique()
+  
+  if (length(dup_genes) > 0) {
+    cat("Duplicated genes:\n")
+    print(head(dup_genes, 10))
+  }
+}
+```
+
+
+```{r setup}
+# Heat map of recurrent Copy-Number Alterations 
+suppressPackageStartupMessages({
+  library(readr)
+  library(dplyr)
+  library(purrr)
+  library(stringr)
+  library(tidyr)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(grid)
+})
+# ====================================================
+# INPUTS
+# ====================================================
+CNV_DIR <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WGS/PCGR/Downstream/CNV/"
+files <- sort(list.files(CNV_DIR, pattern = "\\.csv$", full.names = TRUE))
+if (length(files) == 0) stop("[ERROR] No CSV files found in CNV_DIR")
+
+min_samples <- 5
+
+# Colors (as you requested)
+class_cols <- c(
+  "Hetdel" = "#8C6D31",  # brown
+  "Homdel" = "#D7301F",  # red
+  "Gain"   = "#31A354",  # green
+  "None"   = "#FFFFFF"   # white background
+)
+
+# Priority: most severe wins for multiple rows per gene×sample
+priority <- c("Homdel" = 3, "Hetdel" = 2, "Gain" = 1, "None" = 0)
+
+normalize_class <- function(x) {
+  x <- str_to_lower(str_trim(as.character(x)))
+  dplyr::case_when(
+    x %in% c("hetdel") ~ "Hetdel",
+    x %in% c("homdel") ~ "Homdel",
+    x %in% c("gain")   ~ "Gain",
+    TRUE               ~ NA_character_
+  )
+}
+
+```
+
+```{r}
+# ====================================================
+# Read all CNV files 
+# ====================================================
+
+cnv_long <- purrr::map_dfr(files, function(f) {
+  df <- readr::read_csv(f, show_col_types = FALSE, progress = FALSE)
+
+  if (!all(c("SYMBOL", "VARIANT_CLASS") %in% names(df))) {
+    stop(paste0("[ERROR] Missing required columns in: ", basename(f)))
+  }
+
+  df %>%
+    transmute(
+      Sample = str_replace(basename(f), "\\.csv$", ""),
+      SYMBOL = str_trim(as.character(SYMBOL)),
+      VARIANT_CLASS = normalize_class(VARIANT_CLASS)
+    ) %>%
+    filter(!is.na(SYMBOL), SYMBOL != "", !is.na(VARIANT_CLASS))
+})
+
+```
+```{r}
+# ====================================================
+# Collapse to ONE class per gene×sample using severity priority
+# ====================================================
+cnv_onecall <- cnv_long %>%
+  mutate(score = unname(priority[VARIANT_CLASS])) %>%
+  group_by(Sample, SYMBOL) %>%
+  slice_max(order_by = score, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  dplyr::select(Sample, SYMBOL, VARIANT_CLASS)
+
+# ====================================================
+# Keep genes present in >= min_samples samples
+# ====================================================
+gene_freq <- cnv_onecall %>%
+  distinct(Sample, SYMBOL) %>%
+  count(SYMBOL, name = "n_samples") %>%
+  filter(n_samples >= min_samples) %>%
+  arrange(desc(n_samples), SYMBOL)
+
+genes_keep <- gene_freq$SYMBOL
+cat("[INFO] Genes kept (>= ", min_samples, " samples): ", length(genes_keep), "\n", sep = "")
+```
+```{r}
+# ====================================================
+# Make heatmap matrix (genes x samples) with "None" for missing
+# ====================================================
+samples <- sort(unique(cnv_onecall$Sample))
+
+heat_df <- cnv_onecall %>%
+  filter(SYMBOL %in% genes_keep) %>%
+  transmute(SYMBOL, Sample, VAR = VARIANT_CLASS)
+
+mat_chr <- heat_df %>%
+  tidyr::pivot_wider(names_from = Sample, values_from = VAR) %>%
+  as.data.frame()
+
+rownames(mat_chr) <- mat_chr$SYMBOL
+mat_chr$SYMBOL <- NULL
+
+# Ensure all sample columns exist and in desired order
+missing_cols <- setdiff(samples, colnames(mat_chr))
+if (length(missing_cols) > 0) mat_chr[missing_cols] <- NA_character_
+mat_chr <- mat_chr[, samples, drop = FALSE]
+
+# Fill missing as "None"
+mat_chr[is.na(mat_chr)] <- "None"
+
+# Order genes (most recurrent at top)
+mat_chr <- mat_chr[genes_keep, , drop = FALSE]
+
+# Convert to matrix + make factor matrix for ComplexHeatmap
+mat_chr <- as.matrix(mat_chr)
+storage.mode(mat_chr) <- "character"
+
+mat_fac <- matrix(
+  factor(as.vector(mat_chr), levels = c("None", "Hetdel", "Homdel", "Gain")),
+  nrow = nrow(mat_chr),
+  ncol = ncol(mat_chr),
+  dimnames = dimnames(mat_chr)
+)
+```
+
+```{r}
+# ====================================================
+# Row annotation: stacked barplot counts per gene
+# ====================================================
+count_mat <- sapply(c("Hetdel", "Homdel", "Gain"), function(cl) rowSums(mat_chr == cl))
+colnames(count_mat) <- c("Hetdel", "Homdel", "Gain")
+
+row_ha <- rowAnnotation(
+  `Class counts` = anno_barplot(
+    count_mat,
+    gp = gpar(
+      fill = class_cols[colnames(count_mat)],
+      col = NA
+    ),
+    border = FALSE,
+    bar_width = 0.95
+  ),
+  width = unit(2.8, "cm")
+)
+
+```
+
+```{r}
+# ====================================================
+# Heatmap
+# ====================================================
+show_x_names <- FALSE     # set TRUE to show sample names
+column_names_rot <- if (show_x_names) 45 else 0
+
+# Make cells closer to square by matching aspect ratio (rows/cols)
+ht_w <- unit(6, "cm")
+ht_h <- unit(3 * nrow(mat_fac) / ncol(mat_fac), "cm")
+
+txt_gp_row <- gpar(fontsize = 9, col = "black", fontfamily = "sans")
+txt_gp_col <- gpar(fontsize = 9, col = "black", fontfamily = "sans")
+
+ht <- Heatmap(
+  mat_fac,
+  name = "VARIANT_CLASS",
+  col = class_cols,
+
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  show_row_dend = FALSE,
+  show_column_dend = FALSE,
+
+  show_column_names = show_x_names,
+  column_names_rot = column_names_rot,
+
+  row_names_side = "left",
+  column_names_side = "bottom",
+  row_names_gp = txt_gp_row,
+  column_names_gp = txt_gp_col,
+
+  rect_gp = gpar(col = "grey80", lwd = 0.6),
+  na_col = class_cols["None"],
+
+  width = ht_w,
+  height = ht_h,
+
+  heatmap_legend_param = list(
+    at = c("Hetdel", "Homdel", "Gain"),
+    labels = c("Hetdel", "Homdel", "Gain"),
+    labels_gp = gpar(col = "black", fontsize = 10),
+    title_gp  = gpar(col = "black", fontsize = 11, fontface = "bold")
+  )
+)
+
+draw(
+  ht + row_ha,
+  heatmap_legend_side = "right",
+  annotation_legend_side = "right",
+  padding = unit(c(25, 10, 25, 10), "mm")
+)
+```
+```{r}
+# ----- Save PNG (for PPT) -----
+out_png <- file.path(CNV_DIR, sprintf("PCGR_CNV_heatmap_min%d.png", min_samples))
+
+png(out_png, width = 1800, height = 2500, res = 300)
+draw(
+  ht + row_ha,
+  heatmap_legend_side = "right",
+  annotation_legend_side = "right",
+  padding = unit(c(25, 10, 25, 10), "mm")
+)
+dev.off()
+
+# ----- Save PDF (vector quality for publication) -----
+out_pdf <- file.path(CNV_DIR, sprintf("PCGR_CNV_heatmap_min%d.pdf", min_samples))
+
+pdf(out_pdf, width = 10, height = 12)  # size in inches
+draw(
+  ht + row_ha,
+  heatmap_legend_side = "right",
+  annotation_legend_side = "right",
+  padding = unit(c(25, 10, 25, 10), "mm")
+)
+dev.off()
+
+cat("[INFO] Saved PNG:", out_png, "\n")
+cat("[INFO] Saved PDF:", out_pdf, "\n")
+```
+

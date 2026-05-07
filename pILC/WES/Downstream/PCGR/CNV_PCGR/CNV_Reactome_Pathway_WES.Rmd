@@ -1,0 +1,150 @@
+---
+title: "CNV_Reactome_Pathway_WES"
+output: html_document
+date: "2026-05-07"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Reactome ORA Using 348 Genes that have altered CN profiles (Genome-wide Background)
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(stringr)
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  library(ReactomePA)
+  library(enrichplot)
+  library(ggplot2)
+})
+
+```
+
+```{r}
+# ====================================================
+# Define paths
+# ====================================================
+CNV_DIR <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/CNV_PCGR/Plot/Figures"
+
+all_unique_file <- file.path(CNV_DIR, "WES_all_unique_CNV_genes.tsv")
+
+all_unique_genes <- read.delim(all_unique_file, stringsAsFactors = FALSE)
+
+# =========================================
+# Prepare 348 gene list
+# =========================================
+
+genes_348 <- unique(all_unique_genes$SYMBOL)
+
+cat("[INFO] Total CNV genes (input):", length(genes_348), "\n")
+
+```
+```{r}
+# =========================================
+# SYMBOL -> ENTREZ mapping
+# =========================================
+
+map348 <- suppressMessages(
+  bitr(
+    genes_348,
+    fromType = "SYMBOL",
+    toType   = "ENTREZID",
+    OrgDb    = org.Hs.eg.db
+  )
+)
+
+mapped_entrez_348 <- unique(map348$ENTREZID)
+
+cat("[INFO] Mapped to ENTREZ:", length(mapped_entrez_348), "of", length(genes_348), "\n")
+
+```
+```{r}
+# =========================================
+# Reactome ORA (Genome-wide background)
+# =========================================
+# Get only protein-coding genes
+gene_info <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = keys(org.Hs.eg.db, keytype = "ENTREZID"),
+  columns = c("ENTREZID", "GENETYPE"),
+  keytype = "ENTREZID"
+)
+
+all_entrez_ids <- gene_info %>%
+  dplyr::filter(GENETYPE == "protein-coding") %>%
+  dplyr::pull(ENTREZID) %>%
+  unique()
+
+cat("[INFO] Universe size (protein-coding only):", length(all_entrez_ids), "\n")
+
+er_348 <- enrichPathway(
+  gene          = mapped_entrez_348,
+  universe      = all_entrez_ids,
+  organism      = "human",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.25,
+  readable      = TRUE
+)
+
+if (is.null(er_348) || nrow(as.data.frame(er_348)) == 0) {
+  stop("No significant Reactome enrichment detected.")
+}
+
+res_df_348 <- as.data.frame(er_348) %>%
+  dplyr::arrange(p.adjust)
+
+```
+```{r}
+# =========================================
+# Print top pathways
+# =========================================
+
+cat("\n[TOP REACTOME TERMS]\n")
+
+print(
+  res_df_348 %>%
+    dplyr::select(ID, Description, GeneRatio, Count, pvalue, p.adjust) %>%
+    head(10)
+)
+
+```
+```{r}
+# =========================================
+# Save results
+# =========================================
+
+# ---- Save enrichment table ----
+out_tsv <- file.path(CNV_DIR, "Reactome_ORA_genomeBG_all348.tsv")
+write.table(res_df_348, out_tsv, sep = "\t", quote = FALSE, row.names = FALSE)
+
+# ---- Save high-resolution PNG ----
+p <- dotplot(er_348, showCategory = 15) +
+  ggtitle("Reactome ORA (Genome-wide background)- All CNV genes (n=348)")
+
+print(p)
+
+ggsave(
+  filename = file.path(CNV_DIR, "Reactome_ORA_genomeBG_all348_dotplot.png"),
+  plot = p,
+  width = 10,
+  height = 10,
+  dpi = 300
+)
+
+ggsave(
+  filename = file.path(CNV_DIR, "Reactome_ORA_genomeBG_all348_dotplot.pdf"),
+  plot = p,
+  width = 10,
+  height = 10
+)
+
+```
+```{r}
+
+
+```
+

@@ -1,0 +1,158 @@
+---
+title: "merge_pcgr_cnv_by_sample_for_plotting"
+output: html_document
+date: "2026-05-07"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(readr)
+  library(dplyr)
+  library(purrr)
+  library(stringr)
+  library(tibble)
+})
+
+# ===============================
+# Input and output directories
+# ===============================
+CNV_DIR <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/CNV_PCGR/CNV"
+OUT_DIR <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/CNV_PCGR/Plot"
+
+dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# ===============================
+# Find CSV files
+# ===============================
+files <- sort(list.files(CNV_DIR, pattern = "\\.csv$", full.names = TRUE))
+
+cat("[INFO] CNV input directory:", CNV_DIR, "\n")
+cat("[INFO] Output directory:", OUT_DIR, "\n")
+cat("[INFO] CSV files found:", length(files), "\n\n")
+
+if (length(files) == 0) {
+  stop("[ERROR] No CSV files found in CNV_DIR.")
+}
+
+# ===============================
+# Create file map
+# Strip _Tier1 / _Tier2 to get base sample name
+# ===============================
+file_map <- tibble(
+  file_path = files,
+  file_name = basename(files),
+  file_stem = str_remove(file_name, "\\.csv$")
+) %>%
+  mutate(
+    Source_Tier = case_when(
+      str_detect(file_stem, "_Tier1$") ~ "Tier1",
+      str_detect(file_stem, "_Tier2$") ~ "Tier2",
+      TRUE ~ "Main"
+    ),
+    Sample = str_remove(file_stem, "_Tier[0-9]+$")
+  )
+
+cat("====================================================\n")
+cat("[INFO] Files grouped by sample\n")
+cat("====================================================\n")
+
+group_summary <- file_map %>%
+  group_by(Sample) %>%
+  summarise(
+    n_files = n(),
+    files = paste(file_name, collapse = "; "),
+    .groups = "drop"
+  )
+
+print(group_summary)
+
+write_csv(
+  group_summary,
+  file.path(OUT_DIR, "CNV_file_grouping_summary.csv")
+)
+
+# ===============================
+# Function to read one CNV CSV file
+# ===============================
+read_cnv_file <- function(f, sample, source_tier, file_name) {
+
+  df <- read_csv(f, show_col_types = FALSE, name_repair = "unique")
+
+  # Drop first blank column if present
+  # Your header starts with: "","SYMBOL","GENENAME",...
+  if (ncol(df) > 0 && names(df)[1] %in% c("", "...1", "X1")) {
+    df <- df %>% select(-1)
+  }
+
+  df <- df %>%
+    mutate(
+      Sample = sample,
+      Source_Tier = source_tier,
+      Source_File = file_name,
+      .before = 1
+    )
+
+  return(df)
+}
+
+# ===============================
+# Merge files for one sample
+# No deduplication
+# ===============================
+merge_one_sample <- function(sample_name, sample_files) {
+
+  cat("\n[INFO] Merging sample:", sample_name, "\n")
+  cat("[INFO] Number of files:", nrow(sample_files), "\n")
+  cat("[INFO] Files:", paste(sample_files$file_name, collapse = ", "), "\n")
+
+  combined <- pmap_dfr(
+    list(
+      sample_files$file_path,
+      sample_files$Sample,
+      sample_files$Source_Tier,
+      sample_files$file_name
+    ),
+    read_cnv_file
+  )
+
+  out_file <- file.path(OUT_DIR, paste0(sample_name, ".csv"))
+
+  write_csv(combined, out_file)
+
+  cat("[INFO] Total rows merged:", nrow(combined), "\n")
+  cat("[DONE] Saved:", out_file, "\n")
+
+  tibble(
+    Sample = sample_name,
+    n_input_files = nrow(sample_files),
+    input_files = paste(sample_files$file_name, collapse = "; "),
+    total_rows_merged = nrow(combined),
+    output_file = out_file
+  )
+}
+
+# ===============================
+# Run merge per sample
+# ===============================
+merge_summary <- file_map %>%
+  group_by(Sample) %>%
+  group_split() %>%
+  map_dfr(~ merge_one_sample(unique(.x$Sample), .x))
+
+# ===============================
+# Save final summary
+# ===============================
+summary_file <- file.path(OUT_DIR, "CNV_merge_summary.csv")
+write_csv(merge_summary, summary_file)
+
+cat("\n====================================================\n")
+cat("[DONE] All sample-level CNV files created without deduplication\n")
+cat("====================================================\n")
+cat("[INFO] Total samples:", nrow(merge_summary), "\n")
+cat("[INFO] Summary saved:", summary_file, "\n")
+```
+

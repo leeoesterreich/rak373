@@ -1,0 +1,308 @@
+---
+title: "WGS_CNV_ORA_Reactome_Pathway"
+output: html_document
+date: "2026-03-02"
+---
+
+```{r}
+# Reactome ORA Using 273 Genes that have altered CN profiles (Genome-wide Background)
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(stringr)
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  library(ReactomePA)
+  library(enrichplot)
+  library(ggplot2)
+})
+
+# ====================================================
+# Define paths
+# ====================================================
+CNV_DIR <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WGS/PCGR/Downstream/CNV"
+
+all_unique_file <- file.path(CNV_DIR, "ALL_unique_genes.tsv")
+
+all_unique_genes <- read.delim(all_unique_file, stringsAsFactors = FALSE)
+
+# =========================================
+# Prepare 273 gene list
+# =========================================
+
+genes_273 <- unique(all_unique_genes$SYMBOL)
+
+cat("[INFO] Total CNV genes (input):", length(genes_273), "\n")
+
+```
+```{r}
+# =========================================
+# SYMBOL -> ENTREZ mapping
+# =========================================
+
+map273 <- suppressMessages(
+  bitr(
+    genes_273,
+    fromType = "SYMBOL",
+    toType   = "ENTREZID",
+    OrgDb    = org.Hs.eg.db
+  )
+)
+
+mapped_entrez_273 <- unique(map273$ENTREZID)
+
+cat("[INFO] Mapped to ENTREZ:", length(mapped_entrez_273), "of", length(genes_273), "\n")
+```
+```{r}
+# =========================================
+# Reactome ORA (Genome-wide background)
+# =========================================
+# Get only protein-coding genes
+gene_info <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = keys(org.Hs.eg.db, keytype = "ENTREZID"),
+  columns = c("ENTREZID", "GENETYPE"),
+  keytype = "ENTREZID"
+)
+
+all_entrez_ids <- gene_info %>%
+  dplyr::filter(GENETYPE == "protein-coding") %>%
+  dplyr::pull(ENTREZID) %>%
+  unique()
+
+cat("[INFO] Universe size (protein-coding only):", length(all_entrez_ids), "\n")
+
+er_273 <- enrichPathway(
+  gene          = mapped_entrez_273,
+  universe      = all_entrez_ids,
+  organism      = "human",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.25,
+  readable      = TRUE
+)
+
+if (is.null(er_273) || nrow(as.data.frame(er_273)) == 0) {
+  stop("No significant Reactome enrichment detected.")
+}
+
+res_df_273 <- as.data.frame(er_273) %>%
+  dplyr::arrange(p.adjust)
+```
+
+```{r}
+# =========================================
+# Print annotation coverage (ANY pathway)
+# =========================================
+
+reactome_universe <- unique(er_273@universe)
+
+genes_in_reactome_any <- intersect(mapped_entrez_273, reactome_universe)
+
+cat("\n====================================================\n")
+cat("[INFO] Reactome annotation coverage (273 genes)\n")
+cat("====================================================\n")
+cat("Input genes:", length(mapped_entrez_273), "\n")
+cat("Annotated in Reactome:", length(genes_in_reactome_any), "\n")
+cat("Not annotated:", length(setdiff(mapped_entrez_273, genes_in_reactome_any)), "\n")
+```
+```{r}
+# =========================================
+# Print top pathways
+# =========================================
+
+cat("\n[TOP REACTOME TERMS]\n")
+
+print(
+  res_df_273 %>%
+    dplyr::select(ID, Description, GeneRatio, Count, pvalue, p.adjust) %>%
+    head(10)
+)
+```
+```{r}
+# =========================================
+# Save results
+# =========================================
+
+# ---- Save enrichment table ----
+out_tsv <- file.path(CNV_DIR, "Reactome_ORA_genomeBG_all273.tsv")
+write.table(res_df_273, out_tsv, sep = "\t", quote = FALSE, row.names = FALSE)
+
+# ---- Save high-resolution PNG ----
+p <- dotplot(er_273, showCategory = 15) +
+  ggtitle("Reactome ORA (Genome-wide background) — All CNV genes (n=273)")
+
+print(p)
+
+ggsave(
+  filename = file.path(CNV_DIR, "Reactome_ORA_genomeBG_all273_dotplot.png"),
+  plot = p,
+  width = 10,
+  height = 10,
+  dpi = 300
+)
+
+ggsave(
+  filename = file.path(CNV_DIR, "Reactome_ORA_genomeBG_all273_dotplot.pdf"),
+  plot = p,
+  width = 10,
+  height = 10
+)
+```
+```{r}
+# Reactome ORA (Genome-wide background) - Recurrent CNV genes (n=66)
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(stringr)
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  library(ReactomePA)
+  library(enrichplot)
+  library(ggplot2)
+})
+
+# ====================================================
+# Define paths
+# ====================================================
+
+CNV_DIR <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WGS/PCGR/Downstream/CNV"
+
+recurrent_file <- file.path(CNV_DIR, "recurrent_genes_min5.tsv")
+
+recurrent_genes_5 <- read.delim(recurrent_file, stringsAsFactors = FALSE)
+```
+
+```{r}
+# =========================================
+# Prepare recurrent 66 gene list
+# =========================================
+genes_66 <- recurrent_genes_5$SYMBOL %>%
+  as.character() %>%
+  str_trim() %>%
+  unique()
+
+cat("[INFO] Recurrent CNV genes (input):", length(genes_66), "\n")
+
+# =========================================
+# SYMBOL -> ENTREZ mapping
+# =========================================
+map66 <- suppressMessages(
+  bitr(
+    genes_66,
+    fromType = "SYMBOL",
+    toType   = "ENTREZID",
+    OrgDb    = org.Hs.eg.db
+  )
+)
+
+mapped_entrez_66 <- unique(map66$ENTREZID)
+mapped_symbols_66 <- unique(map66$SYMBOL)
+
+cat("[INFO] Mapped SYMBOLs:", length(mapped_symbols_66), "of", length(genes_66), "\n")
+cat("[INFO] Unique ENTREZIDs:", length(mapped_entrez_66), "\n")
+
+unmapped <- setdiff(genes_66, mapped_symbols_66)
+if (length(unmapped) > 0) {
+  cat("[WARN] Unmapped symbols (showing up to 30):\n")
+  print(head(unmapped, 30))
+}
+```
+```{r}
+# =========================================
+# Reactome ORA (Genome-wide background)
+# =========================================
+# Get only protein-coding genes
+gene_info <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = keys(org.Hs.eg.db, keytype = "ENTREZID"),
+  columns = c("ENTREZID", "GENETYPE"),
+  keytype = "ENTREZID"
+)
+
+all_entrez_ids <- gene_info %>%
+  dplyr::filter(GENETYPE == "protein-coding") %>%
+  dplyr::pull(ENTREZID) %>%
+  unique()
+
+cat("[INFO] Universe size (protein-coding only):", length(all_entrez_ids), "\n")
+
+er_66 <- enrichPathway(
+  gene          = mapped_entrez_66,
+  organism      = "human",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.25,
+  readable      = TRUE
+)
+
+if (is.null(er_66) || nrow(as.data.frame(er_66)) == 0) {
+  stop("[ERROR] No significant Reactome enrichment detected for recurrent 66 genes.")
+}
+
+res_df_66 <- as.data.frame(er_66) %>%
+  dplyr::arrange(p.adjust)
+
+```
+
+```{r}
+# =========================================
+# Print annotation coverage (ANY Reactome pathway)
+# =========================================
+reactome_universe <- unique(er_66@universe)
+genes_in_reactome_any <- intersect(mapped_entrez_66, reactome_universe)
+
+cat("\n====================================================\n")
+cat("[INFO] Reactome annotation coverage (recurrent 66)\n")
+cat("====================================================\n")
+cat("Input genes (ENTREZ):", length(mapped_entrez_66), "\n")
+cat("Annotated in Reactome:", length(genes_in_reactome_any), "\n")
+cat("Not annotated:", length(setdiff(mapped_entrez_66, genes_in_reactome_any)), "\n")
+
+# Optional: list not-annotated SYMBOLs
+missing_entrez <- setdiff(mapped_entrez_66, genes_in_reactome_any)
+if (length(missing_entrez) > 0) {
+  missing_symbols <- map66 %>%
+    dplyr::filter(ENTREZID %in% missing_entrez) %>%
+    dplyr::distinct(SYMBOL) %>%
+    dplyr::pull(SYMBOL)
+  cat("\n[INFO] Symbols not annotated in Reactome:\n")
+  print(missing_symbols)
+}
+```
+```{r}
+# =========================================
+# Print top pathways
+# =========================================
+cat("\n[TOP REACTOME TERMS]\n")
+print(
+  res_df_66 %>%
+    dplyr::select(ID, Description, GeneRatio, Count, pvalue, p.adjust) %>%
+    head(10)
+)
+
+# =========================================
+# Save results
+# =========================================
+out_tsv <- file.path(CNV_DIR, "Reactome_ORA_genomeBG_recurrent66.tsv")
+write.table(res_df_66, out_tsv, sep = "\t", quote = FALSE, row.names = FALSE)
+p <- dotplot(er_66, showCategory = 15) +
+  ggtitle("Reactome ORA (Genome-wide background) — Recurrent CNV genes (n=66)")
+
+print(p)
+
+ggsave(
+  filename = file.path(CNV_DIR, "Reactome_ORA_genomeBG_recurrent66_dotplot.png"),
+  plot = p,
+  width = 10,
+  height = 10,
+  dpi = 300
+)
+
+ggsave(
+  filename = file.path(CNV_DIR, "Reactome_ORA_genomeBG_recurrent66_dotplot.pdf"),
+  plot = p,
+  width = 10,
+  height = 10
+)
+```

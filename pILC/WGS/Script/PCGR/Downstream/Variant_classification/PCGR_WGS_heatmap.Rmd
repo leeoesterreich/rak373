@@ -1,0 +1,388 @@
+---
+title: "PCGR_WGS_heatmap"
+output: html_document
+date: "2026-03-03"
+---
+
+
+```{r header_check, echo=TRUE, results='markup'}
+knitr::opts_chunk$set(echo = TRUE)
+# ==========================================================
+# Check header consistency across CSVs
+# - Print header for 1 sample (reference)
+# - Detect mismatched columns in other samples
+# ==========================================================
+
+base_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WGS/PCGR/Downstream/Variant_classification"
+
+csv_files <- list.files(
+  path = base_dir,
+  pattern = "\\.csv$",
+  full.names = TRUE
+)
+
+if (length(csv_files) == 0) stop("No CSV files found in directory.")
+
+ref_file <- csv_files[1]
+ref_header <- names(read.csv(ref_file, nrows = 1, check.names = FALSE))
+
+cat("============================================\n")
+cat("Reference Sample:", basename(ref_file), "\n")
+cat("============================================\n")
+print(ref_header)
+cat("\nTotal columns:", length(ref_header), "\n\n")
+
+mismatch_found <- FALSE
+
+for (file in csv_files[-1]) {
+
+  hdr <- names(read.csv(file, nrows = 1, check.names = FALSE))
+
+  missing_cols <- setdiff(ref_header, hdr)
+  extra_cols   <- setdiff(hdr, ref_header)
+
+  if (length(missing_cols) > 0 || length(extra_cols) > 0) {
+
+    mismatch_found <- TRUE
+
+    cat("============================================\n")
+    cat("Mismatch in:", basename(file), "\n")
+    cat("============================================\n")
+
+    if (length(missing_cols) > 0) {
+      cat("Missing columns:\n")
+      print(missing_cols)
+    }
+
+    if (length(extra_cols) > 0) {
+      cat("Extra columns:\n")
+      print(extra_cols)
+    }
+
+    cat("\n")
+  }
+}
+
+if (!mismatch_found) {
+  cat("All files have identical columns.\n")
+}
+
+# ==========================================================
+# PCGR CSV quick summaries
+# ==========================================================
+
+BASE_DIR <- base_dir
+csv_files <- sort(list.files(BASE_DIR, pattern="\\.csv$", full.names=TRUE))
+
+ref_file <- csv_files[1]
+ref_df <- read.csv(ref_file, check.names = FALSE)
+
+cat("============================================================\n")
+cat("Reference file: quick summaries for SYMBOL/CONSEQUENCE/ONCOGENICITY\n")
+cat("File:", ref_file, "\n")
+cat("============================================================\n")
+
+top_n <- function(x, n = 12) {
+  x <- x[!is.na(x) & x != ""]
+  tab <- sort(table(x), decreasing = TRUE)
+  tab[seq_len(min(n, length(tab)))]
+}
+
+cat("\n[Counts]\n")
+cat("Rows:", nrow(ref_df), "\n")
+cat("Unique SYMBOL:", length(unique(ref_df$SYMBOL)), "\n")
+cat("Unique CONSEQUENCE:", length(unique(ref_df$CONSEQUENCE)), "\n")
+cat("Unique ONCOGENICITY:", length(unique(ref_df$ONCOGENICITY)), "\n")
+
+cat("\n[Top CONSEQUENCE]\n")
+print(top_n(ref_df$CONSEQUENCE))
+
+cat("\n[Top ONCOGENICITY]\n")
+print(top_n(ref_df$ONCOGENICITY))
+```
+
+
+```{r setup}
+# Variant classification (Only coding variants)
+suppressPackageStartupMessages({
+  library(ComplexHeatmap)
+  library(circlize)
+  library(dplyr)
+  library(tools)
+  library(grid)   # for gpar()
+})
+
+BASE_DIR  <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WGS/PCGR/Downstream/Variant_classification"
+META_FILE <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WGS/PCGR/Downstream/WGS_TMB_Grade.csv"
+
+# ==========================================================
+# Helper functions
+# ==========================================================
+
+collapse_consequence <- function(consequence) {
+  if (is.na(consequence) || consequence == "") return("Other")
+
+  x <- tolower(trimws(consequence))
+  x <- gsub("\\s+", "", x)
+  terms <- unlist(strsplit(x, ","))
+
+  has <- function(pat) any(grepl(pat, terms, fixed = TRUE))
+
+  if (has("splice_acceptor_variant") || has("splice_donor_variant"))
+    return("Splice_Site")
+
+  if (has("stop_gained") || has("stop_lost"))
+    return("Nonsense_Mutation")
+
+  if (has("frameshift_variant"))
+    return("Frame_Shift")
+
+  if (has("inframe_insertion"))
+    return("In_Frame_Ins")
+
+  if (has("inframe_deletion"))
+    return("In_Frame_Del")
+
+  if (has("missense_variant") || has("protein_altering_variant"))
+    return("Missense_Mutation")
+
+  return("Other")
+}
+
+collapse_onco <- function(x) {
+  x <- trimws(x)
+  if (is.na(x) || x == "") return(NA_character_)
+  if (x %in% c("Oncogenic", "Likely_Oncogenic")) return("Oncogenic")
+  if (x == "VUS") return("VUS")
+  if (x == "Likely_Benign") return("Likely_Benign")
+  return(NA_character_)
+}
+```
+
+```{r}
+# ==========================================================
+# Load all samples
+# ==========================================================
+
+csv_files <- sort(list.files(BASE_DIR, pattern="\\.csv$", full.names=TRUE))
+if (length(csv_files) == 0) stop("No CSV files found in: ", BASE_DIR)
+
+sample_names <- file_path_sans_ext(basename(csv_files))
+
+gene_list <- list()
+full_data <- list()
+
+for (i in seq_along(csv_files)) {
+  df <- read.csv(csv_files[i], check.names = FALSE)
+
+  # --- Normalize SYMBOL to avoid whitespace mismatch ---
+  df$SYMBOL <- trimws(df$SYMBOL)
+  df$SYMBOL[df$SYMBOL == ""] <- NA
+  df <- df[!is.na(df$SYMBOL), ]
+
+  df$Sample <- sample_names[i]
+  full_data[[sample_names[i]]] <- df
+  gene_list[[sample_names[i]]] <- unique(df$SYMBOL)
+}
+```
+
+```{r}
+# ==========================================================
+# Identify shared genes (>=3 samples)
+# ==========================================================
+
+gene_freq <- table(unlist(gene_list))
+shared_genes <- names(gene_freq[gene_freq >= 3])
+shared_genes <- trimws(shared_genes)
+
+cat("Shared genes (>=3 samples):", length(shared_genes), "\n")
+cat("Shared genes:\n")
+print(shared_genes)
+```
+```{r}
+# ==========================================================
+# Build mutation matrix
+# ==========================================================
+
+# Use NA for "no mutation call" cells (cleaner than "")
+mat <- matrix(NA_character_,
+              nrow = length(shared_genes),
+              ncol = length(sample_names),
+              dimnames = list(shared_genes, sample_names))
+
+for (s in sample_names) {
+
+  df <- full_data[[s]]
+  df$SYMBOL <- trimws(df$SYMBOL)
+  df <- df[df$SYMBOL %in% shared_genes, ]
+
+  if (nrow(df) == 0) next
+
+  for (g in unique(df$SYMBOL)) {
+
+    sub <- df[df$SYMBOL == g, ]
+
+    # If multiple variants in same gene/sample -> Multi_Hit (black)
+    if (nrow(sub) > 1) {
+      mat[g, s] <- "Multi_Hit"
+    } else {
+      mat[g, s] <- collapse_consequence(sub$CONSEQUENCE[1])
+    }
+  }
+}  # close sample loop
+
+# Quick sanity checks (optional, keep during development)
+cat("\nFilled cells per sample:\n")
+print(colSums(!is.na(mat)))
+
+cat("\nVariant classes present:\n")
+print(sort(table(na.omit(as.vector(mat))), decreasing = TRUE))
+```
+
+```{r}
+# ==========================================================
+# ORDER GENES BY FREQUENCY (highest -> lowest)
+# ==========================================================
+pct_altered <- rowMeans(!is.na(mat)) * 100
+ord <- order(pct_altered, decreasing = TRUE)
+
+mat <- mat[ord, , drop = FALSE]
+pct_altered <- pct_altered[ord]
+pct_labels  <- paste0(round(pct_altered), "%")
+
+# Right-side labels (text, not barplot)
+right_anno <- rowAnnotation(
+  "Altered" = anno_text(pct_labels, just = "left", gp = gpar(fontsize = 10)),
+  annotation_name_side = "top",
+  width = unit(12, "mm")
+)
+
+# ==========================================================
+# STAR matrix
+# ==========================================================
+star_mat <- matrix("", nrow = nrow(mat), ncol = ncol(mat),
+                   dimnames = dimnames(mat))
+
+for (s in sample_names) {
+  df <- full_data[[s]]
+  df$SYMBOL <- trimws(df$SYMBOL)
+  df <- df[df$SYMBOL %in% rownames(mat), ]
+
+  if (nrow(df) == 0) next
+
+  for (g in unique(df$SYMBOL)) {
+    sub <- df[df$SYMBOL == g, ]
+    if (any(sub$ONCOGENICITY %in% c("Oncogenic", "Likely_Oncogenic"), na.rm = TRUE)) {
+      star_mat[g, s] <- "*"
+    }
+  }
+}
+
+cat("Total oncogenic stars:", sum(star_mat == "*"), "\n")
+```
+
+```{r}
+# ==========================================================
+# Load TMB and Grade metadata
+# ==========================================================
+
+meta <- read.csv(META_FILE, check.names = FALSE)
+meta$Sample <- trimws(meta$Sample)
+rownames(meta) <- meta$Sample
+
+# keep only relevant samples, in the same order as heatmap columns
+meta <- meta[sample_names, , drop = FALSE]
+```
+
+```{r}
+# ==========================================================
+# Define colors
+# ==========================================================
+
+variant_colors <- c(
+  "Missense_Mutation" = "#1f78b4",
+  "Nonsense_Mutation" = "#e31a1c",
+  "Frame_Shift"       = "#ff7f00",
+  "Splice_Site"       = "#6a3d9a",
+  "In_Frame_Ins"      = "#33a02c",
+  "In_Frame_Del"      = "#b2df8a",
+  "Other"             = "grey70",
+  "Multi_Hit"         = "#666666"
+)
+
+grade_colors <- c(
+  "II"  = "#fc8d62",
+  "III" = "#8da0cb"
+)
+
+```
+
+```{r}
+# ==========================================================
+# Top Annotation
+# ==========================================================
+
+top_anno <- HeatmapAnnotation(
+  TMB = anno_barplot(meta$TMB, border = FALSE, gp = gpar(fill = "grey40")),
+  Grade = factor(meta$Grade,
+                 levels = c(2, 3),
+                 labels = c("II", "III")),
+  col = list(
+    Grade = grade_colors
+  ),
+  annotation_name_side = "left"
+)
+
+```
+
+```{r}
+# ==========================================================
+# 8. Draw Heatmap
+# ==========================================================
+
+ht <- Heatmap(
+  mat,
+  name = "Variant",
+  col = variant_colors,
+  na_col = "grey90",
+  top_annotation = top_anno,
+  right_annotation = right_anno,
+  row_names_side = "left",
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  rect_gp = gpar(col = "white"),
+
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    if (!is.na(star_mat[i, j]) && star_mat[i, j] == "*") {
+      grid.text("*", x, y, gp = gpar(fontsize = 14, fontface = "bold"))
+    }
+  }
+)
+
+star_lgd <- Legend(
+  labels = "Oncogenic",
+  type = "points",
+  pch = "*",
+  legend_gp = gpar(fontsize = 12, fontface = "bold"),
+  title = "Oncogenicity"
+)
+
+
+draw(ht, annotation_legend_list = list(star_lgd))
+```
+
+
+```{r}
+# ---- Save as PDF ----
+pdf("pILC_shared_genes_heatmap.pdf", width = 10, height = 8)
+draw(ht, annotation_legend_list = list(star_lgd), newpage = TRUE)
+dev.off()
+
+# ---- Save as PNG ----
+png("pILC_shared_genes_heatmap.png", width = 3000, height = 2400, res = 300)
+draw(ht, annotation_legend_list = list(star_lgd), newpage = TRUE)
+dev.off()
+```
+

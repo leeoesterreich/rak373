@@ -1,0 +1,363 @@
+---
+title: "WES_maf_plot"
+output: html_document
+date: "2026-05-07"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+suppressPackageStartupMessages({
+  library(data.table)
+  library(maftools)
+})
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 12,
+  fig.height = 8
+)
+```
+
+```{r}
+input_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Compare_TumorOnly_vs_WithPON/mafs/Tier_1_common"
+
+out_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Compare_TumorOnly_vs_WithPON/maftools/Tier_1_common"
+
+combined_dir <- file.path(out_dir, "Combined_MAF")
+plot_dir <- file.path(out_dir, "plots")
+table_dir <- file.path(out_dir, "tables")
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(combined_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(table_dir, recursive = TRUE, showWarnings = FALSE)
+
+combined_maf_file <- file.path(combined_dir, "Tier_1_common_all_samples.combined.maf")
+
+input_dir
+out_dir
+```
+```{r}
+maf_files <- list.files(
+  input_dir,
+  pattern = "\\.tier1\\.common\\.maf$",
+  full.names = TRUE
+)
+
+length(maf_files)
+
+head(maf_files)
+```
+```{r}
+# Combine per-sample Tier 1 MAF files
+maf_list <- list()
+
+for (maf_file in maf_files) {
+  sample_name <- basename(maf_file)
+  sample_name <- sub("\\.tier1\\.common\\.maf$", "", sample_name)
+
+  message("Reading: ", maf_file)
+
+  dt <- tryCatch(
+    {
+      fread(
+        maf_file,
+        sep = "\t",
+        header = TRUE,
+        data.table = TRUE,
+        skip = "Hugo_Symbol",
+        fill = TRUE,
+        quote = ""
+      )
+    },
+    error = function(e) {
+      message("WARNING: Could not read MAF: ", maf_file)
+      message("Reason: ", e$message)
+      return(NULL)
+    }
+  )
+
+  if (is.null(dt)) {
+    next
+  }
+
+  if (nrow(dt) == 0) {
+    message("WARNING: Empty MAF file: ", maf_file)
+    next
+  }
+
+  if (!"Tumor_Sample_Barcode" %in% colnames(dt)) {
+    dt[, Tumor_Sample_Barcode := sample_name]
+  }
+
+  dt[
+    is.na(Tumor_Sample_Barcode) | Tumor_Sample_Barcode == "",
+    Tumor_Sample_Barcode := sample_name
+  ]
+
+  dt[, Source_MAF_File := basename(maf_file)]
+
+  maf_list[[sample_name]] <- dt
+}
+
+if (length(maf_list) == 0) {
+  stop("No non-empty MAF files were successfully read.")
+}
+
+combined_maf <- rbindlist(maf_list, fill = TRUE)
+
+nrow(combined_maf)
+length(unique(combined_maf$Tumor_Sample_Barcode))
+```
+```{r}
+# Remove duplicate variant rows
+dedup_cols <- c(
+  "Tumor_Sample_Barcode",
+  "Chromosome",
+  "Start_Position",
+  "End_Position",
+  "Reference_Allele",
+  "Tumor_Seq_Allele2"
+)
+
+dedup_cols_present <- dedup_cols[dedup_cols %in% colnames(combined_maf)]
+
+n_before <- nrow(combined_maf)
+
+if (length(dedup_cols_present) >= 5) {
+  combined_maf <- unique(combined_maf, by = dedup_cols_present)
+}
+
+n_after <- nrow(combined_maf)
+
+data.table(
+  Rows_before_duplicate_removal = n_before,
+  Rows_after_duplicate_removal = n_after,
+  Duplicates_removed = n_before - n_after
+)
+```
+```{r}
+# Save combined MAF
+fwrite(
+  combined_maf,
+  file = combined_maf_file,
+  sep = "\t",
+  quote = FALSE,
+  na = ""
+)
+
+combined_maf_file
+```
+```{r}
+# MAF checks
+dim(combined_maf)
+
+head(combined_maf[, .(
+  Hugo_Symbol,
+  Chromosome,
+  Start_Position,
+  End_Position,
+  Variant_Classification,
+  Variant_Type,
+  Tumor_Sample_Barcode
+)])
+```
+```{r}
+maf_nonsilent <- read.maf(
+  maf = combined_maf_file,
+  useAll = TRUE,
+  verbose = TRUE
+)
+maf_all <- maf_nonsilent
+
+gene_summary <- getGeneSummary(maf_nonsilent)
+sample_summary <- getSampleSummary(maf_nonsilent)
+```
+
+```{r}
+# MAF summary plot
+
+pdf(file.path(plot_dir, "Tier1_common_maf_summary.pdf"), width = 12, height = 8)
+plotmafSummary(
+  maf = maf_nonsilent,
+  rmOutlier = TRUE,
+  addStat = "median",
+  dashboard = TRUE,
+  titvRaw = FALSE
+)
+dev.off()
+
+png(
+  filename = file.path(plot_dir, "Tier1_common_maf_summary.png"),
+  width = 12,
+  height = 8,
+  units = "in",
+  res = 300
+)
+plotmafSummary(
+  maf = maf_nonsilent,
+  rmOutlier = TRUE,
+  addStat = "median",
+  dashboard = TRUE,
+  titvRaw = FALSE
+)
+dev.off()
+
+
+plotmafSummary(
+  maf = maf_nonsilent,
+  rmOutlier = TRUE,
+  addStat = "median",
+  dashboard = TRUE,
+  titvRaw = FALSE
+)
+
+
+```
+```{r}
+# Oncoplot: top 30 mutated genes
+
+pdf(file.path(plot_dir, "Tier1_common_oncoplot_top30.pdf"), width = 16, height = 10)
+oncoplot(
+  maf = maf_nonsilent,
+  top = 30,
+  removeNonMutated = FALSE,
+  showTumorSampleBarcodes = FALSE,
+  fontSize = 0.8,
+  titleText = "Tier 1 Common Variants: Top 30 Mutated Genes"
+)
+dev.off()
+
+png(
+  filename = file.path(plot_dir, "Tier1_common_oncoplot_top30.png"),
+  width = 16,
+  height = 10,
+  units = "in",
+  res = 300
+)
+oncoplot(
+  maf = maf_nonsilent,
+  top = 30,
+  removeNonMutated = FALSE,
+  showTumorSampleBarcodes = FALSE,
+  fontSize = 0.8,
+  titleText = "Tier 1 Common Variants: Top 30 Mutated Genes"
+)
+dev.off()
+
+# 
+oncoplot(
+  maf = maf_nonsilent,
+  top = 30,
+  removeNonMutated = FALSE,
+  showTumorSampleBarcodes = FALSE,
+  fontSize = 0.8,
+  titleText = "Tier 1 Common Variants: Top 30 Mutated Genes"
+)
+```
+```{r}
+# Breast cancer gene-focused oncoplot (from Pedram Razavi et.al. 2018)
+
+breast_genes <- c(
+  "ERBB2", "FGFR1", "NF1", "GNAS", "PAK1", "PIK3CA", "PTEN",
+  "AKT1", "GATA3", "ESR1", "FOXA1", "ARID1A", "TBX3", "MYC",
+  "MCL1", "MAP3K1", "RECQL4", "RARA", "CCND1", "CDH1", "TP53",
+  "BRCA1", "RICTOR", "FAT1", "JAK3", "CIC", "ARID2"
+)
+
+present_breast_genes <- breast_genes[breast_genes %in% gene_summary$Hugo_Symbol]
+
+
+
+if (length(present_breast_genes) > 0) {
+
+  pdf(file.path(plot_dir, "Tier1_common_oncoplot_breast_genes.pdf"), width = 14, height = 8)
+  oncoplot(
+    maf = maf_nonsilent,
+    genes = present_breast_genes,
+    removeNonMutated = FALSE,
+    showTumorSampleBarcodes = TRUE,
+    fontSize = 0.8,
+    titleText = "Tier 1 Common Variants: Breast Cancer Genes"
+  )
+  dev.off()
+
+  png(
+    filename = file.path(plot_dir, "Tier1_common_oncoplot_breast_genes.png"),
+    width = 14,
+    height = 8,
+    units = "in",
+    res = 300
+  )
+  oncoplot(
+    maf = maf_nonsilent,
+    genes = present_breast_genes,
+    removeNonMutated = FALSE,
+    showTumorSampleBarcodes = TRUE,
+    fontSize = 0.8,
+    titleText = "Tier 1 Common Variants: Breast Cancer Genes"
+  )
+  dev.off()
+
+  # show in Rmd output
+  oncoplot(
+    maf = maf_nonsilent,
+    genes = present_breast_genes,
+    removeNonMutated = FALSE,
+    showTumorSampleBarcodes = TRUE,
+    fontSize = 0.8,
+    titleText = "Tier 1 Common Variants: Breast Cancer Genes"
+  )
+}
+```
+```{r}
+if (nrow(gene_summary) >= 5) {
+
+  # Save PDF
+  pdf(
+    file.path(plot_dir, "Tier1_common_somatic_interactions_top25.pdf"),
+    width = 12,
+    height = 10
+  )
+  try(
+    somaticInteractions(
+      maf = maf_nonsilent,
+      top = 25,
+      pvalue = c(0.05, 0.01)
+    ),
+    silent = TRUE
+  )
+  dev.off()
+
+  # Save PNG
+  png(
+    filename = file.path(plot_dir, "Tier1_common_somatic_interactions_top25.png"),
+    width = 12,
+    height = 10,
+    units = "in",
+    res = 300
+  )
+  try(
+    somaticInteractions(
+      maf = maf_nonsilent,
+      top = 25,
+      pvalue = c(0.05, 0.01)
+    ),
+    silent = TRUE
+  )
+  dev.off()
+
+  # Show in Rmd output
+  try(
+    somaticInteractions(
+      maf = maf_nonsilent,
+      top = 25,
+      pvalue = c(0.05, 0.01)
+    ),
+    silent = TRUE
+  )
+}
+```
+

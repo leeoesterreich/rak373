@@ -1,0 +1,196 @@
+---
+title: "SBS_Mutational_Sign"
+output: html_document
+date: "2026-03-03"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+  library(scales)
+})
+
+PCGR_DIR <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WGS/PCGR/pcgr_outputs"
+DIR  <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WGS/PCGR/Downstream/Mutational_Signature"
+OUTFILE  <- file.path(DIR, "msigs.csv")
+
+dir.create(OUTDIR, recursive = TRUE, showWarnings = FALSE)
+
+# Find all msigs TSVs (one per sample directory)
+files <- list.files(
+  path = PCGR_DIR,
+  pattern = "\\.pcgr\\.grch38\\.msigs\\.tsv$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+if (length(files) == 0) {
+  stop("No *.pcgr.grch38.msigs.tsv files found under: ", PCGR_DIR)
+}
+
+message("[INFO] Found ", length(files), " msigs files")
+
+# Read + keep only needed columns
+all_dt <- rbindlist(lapply(files, function(f) {
+  dt <- fread(f, sep = "\t", header = TRUE, data.table = TRUE)
+  needed <- c("sample_id", "signature_id", "prop_signature")
+  missing <- setdiff(needed, names(dt))
+  if (length(missing) > 0) {
+    stop("Missing columns in ", f, ": ", paste(missing, collapse = ", "))
+  }
+  dt[, ..needed]
+}), use.names = TRUE, fill = FALSE)
+
+# Optional: sort nicely
+setorder(all_dt, sample_id, signature_id)
+
+fwrite(all_dt, OUTFILE)
+message("[DONE] Wrote: ", OUTFILE)
+
+```
+
+```{r}
+INFILE <- file.path(DIR, "msigs.csv")
+OUTFILE <- file.path(DIR, "SBS_Merged_Categories.csv")
+
+if (!file.exists(INFILE)) {
+  stop("Input file not found: ", INFILE)
+}
+
+dt <- fread(INFILE)
+
+# Ensure correct types
+dt[, prop_signature := as.numeric(prop_signature)]
+
+# --------------------------------
+# 7 Biological Bucket Mapping
+# --------------------------------
+bucket_map <- function(sig) {
+  sig <- toupper(sig)
+
+  if (sig %in% c("SBS1", "SBS5")) return("Clock-like/Aging")
+  if (sig %in% c("SBS2", "SBS13")) return("APOBEC/AID")
+  if (sig == "SBS3") return("HR deficiency")
+  if (sig %in% c("SBS6", "SBS15", "SBS21", "SBS26", "SBS44")) return("MMR deficiency")
+  if (sig %in% c("SBS10A", "SBS10B")) return("POLE proofreading defect")
+  if (sig %in% c("SBS7A", "SBS29", "SBS90", "SBS18", "SBS9")) return("Exposure-related")
+
+  return("Unknown/Uncharacterized")
+}
+
+dt[, Biological_Categories := vapply(signature_id, bucket_map, character(1))]
+
+# --------------------------------
+# Sum per sample per bucket
+# --------------------------------
+bucket_sum <- dt[
+  , .(bucket_prop = sum(prop_signature, na.rm = TRUE)),
+  by = .(sample_id, Biological_Categories)
+]
+
+# --------------------------------
+# Convert to relative contribution
+# --------------------------------
+bucket_sum[, total := sum(bucket_prop), by = sample_id]
+bucket_sum[, Relative_contribution := bucket_prop / total]
+
+# Ensure all 7 categories present for every sample
+all_cats <- c(
+  "Clock-like/Aging",
+  "APOBEC/AID",
+  "HR deficiency",
+  "MMR deficiency",
+  "POLE proofreading defect",
+  "Exposure-related",
+  "Unknown/Uncharacterized"
+)
+
+complete_dt <- CJ(
+  sample_id = unique(bucket_sum$sample_id),
+  Biological_Categories = all_cats,
+  unique = TRUE
+)
+
+final_dt <- merge(
+  complete_dt,
+  bucket_sum[, .(sample_id, Biological_Categories, Relative_contribution)],
+  by = c("sample_id", "Biological_Categories"),
+  all.x = TRUE
+)
+
+final_dt[is.na(Relative_contribution), Relative_contribution := 0]
+
+# Order nicely
+final_dt[, Biological_Categories := factor(Biological_Categories, levels = all_cats)]
+setorder(final_dt, sample_id, Biological_Categories)
+
+# Write
+fwrite(final_dt, OUTFILE)
+
+cat("[DONE] Written:", OUTFILE, "\n")
+```
+```{r}
+INFILE <- file.path(DIR, "SBS_Merged_Categories.csv")
+
+OUT_PNG <- file.path(DIR, "SBS_Merged_Categories_stackedbar.png")
+OUT_PDF <- file.path(DIR, "SBS_Merged_Categories_stackedbar.pdf")
+
+dt <- fread(INFILE)
+
+# ---- safety checks ----
+req <- c("sample_id", "Biological_Categories", "Relative_contribution")
+miss <- setdiff(req, names(dt))
+if (length(miss) > 0) stop("Missing columns: ", paste(miss, collapse = ", "))
+
+dt[, Relative_contribution := as.numeric(Relative_contribution)]
+dt[is.na(Relative_contribution), Relative_contribution := 0]
+
+# ---- enforce consistent category order ----
+cat_levels <- c(
+  "Clock-like/Aging",
+  "APOBEC/AID",
+  "HR deficiency",
+  "MMR deficiency",
+  "POLE proofreading defect",
+  "Exposure-related",
+  "Unknown/Uncharacterized"
+)
+dt[, Biological_Categories := factor(Biological_Categories, levels = cat_levels)]
+
+# ---- optional: order samples by Unknown (or any category) ----
+# This makes the plot easier to read (comment out if you want original order)
+ord <- dt[Biological_Categories == "Unknown/Uncharacterized",
+          .(unk = sum(Relative_contribution)), by = sample_id][order(-unk), sample_id]
+dt[, sample_id := factor(sample_id, levels = ord)]
+
+# ---- plot ----
+p <- ggplot(dt, aes(x = sample_id, y = Relative_contribution, fill = Biological_Categories)) +
+  geom_col(width = 0.9) +
+  scale_y_continuous(labels = percent_format(accuracy = 1), expand = c(0, 0)) +
+  labs(
+    title = "Merged SBS biological categories (relative contribution per sample)",
+    x = "Sample",
+    y = "Relative contribution",
+    fill = "Biological category"
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 60, hjust = 1, vjust = 1),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(hjust = 0.5)
+  )
+
+# Print to screen
+print(p)
+
+# Save high-res PNG
+ggsave(OUT_PNG, p, width = max(10, length(unique(dt$sample_id)) * 0.35), height = 6, dpi = 300)
+
+# Save PDF (vector)
+ggsave(OUT_PDF, p, width = max(10, length(unique(dt$sample_id)) * 0.35), height = 6)
+
+cat("[DONE] Wrote:\n", OUT_PNG, "\n", OUT_PDF, "\n")
+```
