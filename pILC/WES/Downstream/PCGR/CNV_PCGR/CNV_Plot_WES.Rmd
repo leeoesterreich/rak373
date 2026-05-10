@@ -458,7 +458,7 @@ class_cols <- c(
 
 ```{r}
 # ============================================================
-# Row annotation - CNV class counts per gene
+# Row annotation - % altered + CNV class counts per gene
 # ============================================================
 
 count_mat <- sapply(
@@ -467,6 +467,12 @@ count_mat <- sapply(
 )
 
 colnames(count_mat) <- c("Hetdel", "Homdel", "Gain")
+
+# ------------------------------------------------------------
+# Percent of samples altered for each gene
+# ------------------------------------------------------------
+pct_altered <- rowSums(mat_chr != "None") / ncol(mat_chr) * 100
+pct_labels <- paste0(round(pct_altered), "%")
 
 # Maximum total CNV count per gene across classes
 max_count <- max(rowSums(count_mat), na.rm = TRUE)
@@ -477,6 +483,17 @@ max_axis <- ceiling(max_count / 3) * 3
 axis_ticks <- seq(0, max_axis, by = 3)
 
 row_ha <- rowAnnotation(
+
+  # % labels immediately next to heatmap
+  `% altered` = anno_text(
+    pct_labels,
+    gp = gpar(fontsize = 9, col = "black"),
+    just = "right",
+    location = unit(0.95, "npc"),
+    width = unit(0.7, "cm")
+  ),
+
+  # right-side stacked class-count barplot
   `Class counts` = anno_barplot(
     count_mat,
     gp = gpar(
@@ -490,9 +507,11 @@ row_ha <- rowAnnotation(
       at = axis_ticks,
       labels = axis_ticks,
       gp = gpar(fontsize = 9)
-    )
+    ),
+    width = unit(2.8, "cm")
   ),
-  width = unit(2.8, "cm")
+
+  show_annotation_name = FALSE
 )
 ```
 
@@ -562,7 +581,7 @@ draw(
 
 out_png <- file.path(OUT_DIR, sprintf("WES_PCGR_CNV_heatmap_min%d.png", min_samples))
 
-png(out_png, width = 1800, height = 2500, res = 300)
+png(out_png, width = 2000, height = 2400, res = 300)
 draw(
   ht + row_ha,
   heatmap_legend_side = "right",
@@ -574,7 +593,7 @@ dev.off()
 # ----- Save PDF (vector quality for publication) -----
 out_pdf <- file.path(OUT_DIR, sprintf("WES_PCGR_CNV_heatmap_min%d.pdf", min_samples))
 
-pdf(out_pdf, width = 10, height = 12)  # size in inches
+pdf(out_pdf, width = 12, height = 12)  # size in inches
 draw(
   ht + row_ha,
   heatmap_legend_side = "right",

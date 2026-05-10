@@ -315,23 +315,63 @@ if (length(present_breast_genes) > 0) {
 ```{r}
 if (nrow(gene_summary) >= 5) {
 
+  # ============================================================
+  # Run somatic interaction
+  # ============================================================
+
+  interaction_table <- tryCatch(
+    {
+      somaticInteractions(
+        maf = maf_nonsilent,
+        top = 25,
+        pvalue = c(0.05, 0.01),
+        returnAll = TRUE
+      )
+    },
+    error = function(e) {
+      message("[ERROR] somaticInteractions failed: ", e$message)
+      return(NULL)
+    }
+  )
+
+  # Save interaction table if returned
+  if (!is.null(interaction_table)) {
+
+    write.csv(
+      interaction_table,
+      file = file.path(plot_dir, "Tier1_common_somatic_interactions_top25_table.csv"),
+      row.names = FALSE
+    )
+
+    message(file.path(plot_dir, "Tier1_common_somatic_interactions_top25_table.csv"))
+  }
+
+  # ============================================================
   # Save PDF
+  # ============================================================
+
   pdf(
     file.path(plot_dir, "Tier1_common_somatic_interactions_top25.pdf"),
     width = 12,
     height = 10
   )
+
   try(
     somaticInteractions(
       maf = maf_nonsilent,
       top = 25,
-      pvalue = c(0.05, 0.01)
+      pvalue = c(0.05, 0.01),
+      returnAll = TRUE
     ),
     silent = TRUE
   )
+
   dev.off()
 
+  # ============================================================
   # Save PNG
+  # ============================================================
+
   png(
     filename = file.path(plot_dir, "Tier1_common_somatic_interactions_top25.png"),
     width = 12,
@@ -339,25 +379,550 @@ if (nrow(gene_summary) >= 5) {
     units = "in",
     res = 300
   )
+
   try(
     somaticInteractions(
       maf = maf_nonsilent,
       top = 25,
-      pvalue = c(0.05, 0.01)
+      pvalue = c(0.05, 0.01),
+      returnAll = TRUE
+    ),
+    silent = TRUE
+  )
+
+  dev.off()
+}
+```
+```{r}
+## Breast cancer-relevant somatic interaction analysis
+
+# ============================================================
+# Somatic interaction analysis restricted to breast cancer genes
+# ============================================================
+
+# This uses the breast_genes list already defined above for the
+# breast cancer gene-focused oncoplot.
+
+present_breast_genes <- breast_genes[breast_genes %in% gene_summary$Hugo_Symbol]
+missing_breast_genes <- setdiff(breast_genes, present_breast_genes)
+
+# Summary of breast cancer genes used
+breast_gene_summary <- data.table(
+  Total_breast_cancer_genes_in_list = length(breast_genes),
+  Breast_cancer_genes_mutated_in_cohort = length(present_breast_genes),
+  Possible_pairwise_tests = ifelse(
+    length(present_breast_genes) >= 2,
+    choose(length(present_breast_genes), 2),
+    0
+  )
+)
+
+print(breast_gene_summary)
+
+cat("\nBreast cancer genes present in MAF:\n")
+print(present_breast_genes)
+
+cat("\nBreast cancer genes absent/not mutated in MAF:\n")
+print(missing_breast_genes)
+
+# Save gene-level summary
+fwrite(
+  breast_gene_summary,
+  file = file.path(table_dir, "Tier1_common_breast_gene_somatic_interaction_summary.csv")
+)
+
+fwrite(
+  data.table(Breast_cancer_genes_present = present_breast_genes),
+  file = file.path(table_dir, "Tier1_common_breast_genes_present_for_interaction.csv")
+)
+
+fwrite(
+  data.table(Breast_cancer_genes_missing = missing_breast_genes),
+  file = file.path(table_dir, "Tier1_common_breast_genes_missing_for_interaction.csv")
+)
+
+
+# ============================================================
+# Run somatic interaction only if at least 2 breast genes present
+# ============================================================
+
+if (length(present_breast_genes) >= 2) {
+
+  breast_interaction_table <- tryCatch(
+    {
+      somaticInteractions(
+        maf = maf_nonsilent,
+        genes = present_breast_genes,
+        pvalue = c(0.05, 0.01),
+        returnAll = TRUE
+      )
+    },
+    error = function(e) {
+      message("[ERROR] Breast cancer gene somaticInteractions failed: ", e$message)
+      return(NULL)
+    }
+  )
+
+  # ============================================================
+  # Save full interaction table
+  # ============================================================
+
+  if (!is.null(breast_interaction_table)) {
+
+    breast_interaction_table <- as.data.table(breast_interaction_table)
+
+    fwrite(
+      breast_interaction_table,
+      file = file.path(
+        table_dir,
+        "Tier1_common_somatic_interactions_breast_genes_all_pairs.csv"
+      )
+    )
+
+    message(
+      file.path(
+        table_dir,
+        "Tier1_common_somatic_interactions_breast_genes_all_pairs.csv"
+      )
+    )
+
+    # ------------------------------------------------------------
+    # Save significant pairs only
+    # ------------------------------------------------------------
+
+    p_col <- intersect(
+      c("pValue", "p.value", "pvalue", "P.value", "PValue"),
+      colnames(breast_interaction_table)
+    )
+
+    if (length(p_col) > 0) {
+
+      p_col <- p_col[1]
+
+      breast_interaction_table[
+        ,
+        FDR := p.adjust(get(p_col), method = "BH")
+      ]
+
+      breast_sig_interactions <- breast_interaction_table[
+        get(p_col) < 0.05
+      ]
+
+      fwrite(
+        breast_sig_interactions,
+        file = file.path(
+          table_dir,
+          "Tier1_common_somatic_interactions_breast_genes_significant_pairs_p005.csv"
+        )
+      )
+
+      breast_fdr_sig_interactions <- breast_interaction_table[
+        FDR < 0.05
+      ]
+
+      fwrite(
+        breast_fdr_sig_interactions,
+        file = file.path(
+          table_dir,
+          "Tier1_common_somatic_interactions_breast_genes_FDR005_pairs.csv"
+        )
+      )
+
+      cat("\nNumber of nominally significant breast cancer gene pairs, p < 0.05:\n")
+      print(nrow(breast_sig_interactions))
+
+      cat("\nNumber of FDR-significant breast cancer gene pairs, FDR < 0.05:\n")
+      print(nrow(breast_fdr_sig_interactions))
+
+      if (nrow(breast_sig_interactions) > 0) {
+        cat("\nNominally significant breast cancer gene interaction pairs:\n")
+        print(breast_sig_interactions)
+      }
+
+    } else {
+      message("[WARNING] Could not identify p-value column in interaction table.")
+    }
+  }
+
+
+  # ============================================================
+  # Save PDF plot
+  # ============================================================
+
+  pdf(
+    file.path(
+      plot_dir,
+      "Tier1_common_somatic_interactions_breast_genes.pdf"
+    ),
+    width = 12,
+    height = 10
+  )
+
+  try(
+    somaticInteractions(
+      maf = maf_nonsilent,
+      genes = present_breast_genes,
+      pvalue = c(0.05, 0.01),
+      returnAll = TRUE
+    ),
+    silent = TRUE
+  )
+
+  dev.off()
+
+
+  # ============================================================
+  # Save PNG plot
+  # ============================================================
+
+  png(
+    filename = file.path(
+      plot_dir,
+      "Tier1_common_somatic_interactions_breast_genes.png"
+    ),
+    width = 12,
+    height = 10,
+    units = "in",
+    res = 300
+  )
+
+  try(
+    somaticInteractions(
+      maf = maf_nonsilent,
+      genes = present_breast_genes,
+      pvalue = c(0.05, 0.01),
+      returnAll = TRUE
+    ),
+    silent = TRUE
+  )
+
+  dev.off()
+
+
+  # ============================================================
+  # Show plot in Rmd output
+  # ============================================================
+
+  try(
+    somaticInteractions(
+      maf = maf_nonsilent,
+      genes = present_breast_genes,
+      pvalue = c(0.05, 0.01),
+      returnAll = TRUE
+    ),
+    silent = TRUE
+  )
+
+} else {
+  message(
+    "[INFO] Fewer than 2 breast cancer genes are mutated in this cohort; ",
+    "somatic interaction analysis cannot be performed."
+  )
+}
+```
+
+
+```{r}
+## TCGA/ICGC breast cancer gene somatic interactions
+
+tcga_icgc_gene_file <- "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Reference/Unique_genes_TCGA_ICGC.txt"
+
+# Read TCGA/ICGC gene list: one gene per line
+tcga_icgc_genes <- fread(tcga_icgc_gene_file, header = FALSE)$V1
+tcga_icgc_genes <- unique(toupper(trimws(tcga_icgc_genes)))
+tcga_icgc_genes <- tcga_icgc_genes[tcga_icgc_genes != "" & !is.na(tcga_icgc_genes)]
+
+# Keep only genes mutated in this cohort
+gene_summary_dt <- as.data.table(gene_summary)
+gene_summary_dt[, Hugo_upper := toupper(Hugo_Symbol)]
+
+tcga_icgc_genes_present <- unique(
+  gene_summary_dt[Hugo_upper %in% tcga_icgc_genes, Hugo_Symbol]
+)
+
+cat("\nTotal TCGA/ICGC genes:", length(tcga_icgc_genes), "\n")
+cat("TCGA/ICGC genes mutated in cohort:", length(tcga_icgc_genes_present), "\n")
+cat("Possible pairwise tests:", choose(length(tcga_icgc_genes_present), 2), "\n")
+
+if (length(tcga_icgc_genes_present) < 2) {
+  stop("Fewer than 2 TCGA/ICGC genes are mutated; cannot run somatic interaction analysis.")
+}
+
+# ------------------------------------------------------------
+# Run somaticInteractions
+# ------------------------------------------------------------
+
+tmp_pdf <- tempfile(fileext = ".pdf")
+pdf(tmp_pdf)
+
+tcga_icgc_interactions <- somaticInteractions(
+  maf = maf_nonsilent,
+  genes = tcga_icgc_genes_present,
+  pvalue = c(0.05, 0.01),
+  returnAll = TRUE
+)
+
+dev.off()
+unlink(tmp_pdf)
+
+tcga_icgc_interactions <- as.data.table(tcga_icgc_interactions)
+
+# Add FDR
+tcga_icgc_interactions[, FDR := p.adjust(pValue, method = "BH")]
+
+# Significant pairs
+sig_p005 <- tcga_icgc_interactions[pValue < 0.05]
+sig_fdr005 <- tcga_icgc_interactions[FDR < 0.05]
+
+cat("\nNominally significant pairs, p < 0.05:", nrow(sig_p005), "\n")
+cat("FDR-significant pairs, FDR < 0.05:", nrow(sig_fdr005), "\n")
+
+# Save tables
+fwrite(
+  tcga_icgc_interactions,
+  file.path(table_dir, "TCGA_ICGC_somatic_interactions_all_pairs_with_FDR.csv")
+)
+
+fwrite(
+  sig_p005,
+  file.path(table_dir, "TCGA_ICGC_somatic_interactions_significant_pairs_p005.csv")
+)
+
+fwrite(
+  sig_fdr005,
+  file.path(table_dir, "TCGA_ICGC_somatic_interactions_significant_pairs_FDR005.csv")
+)
+
+# ------------------------------------------------------------
+# Extract genes involved in nominally significant pairs
+# ------------------------------------------------------------
+
+sig_pair_genes <- unique(c(sig_p005$gene1, sig_p005$gene2))
+sig_pair_genes <- sig_pair_genes[!is.na(sig_pair_genes) & sig_pair_genes != ""]
+
+cat("Nominal significant pairs:", nrow(sig_p005), "\n")
+cat("Unique genes in those pairs:", length(sig_pair_genes), "\n")
+cat("Pairwise tests in focused plot:", choose(length(sig_pair_genes), 2), "\n")
+
+fwrite(
+  data.table(Gene = sig_pair_genes),
+  file.path(table_dir, "TCGA_ICGC_genes_in_nominal_significant_pairs_for_plot.csv")
+)
+
+# ------------------------------------------------------------
+# Save focused plot only
+# ------------------------------------------------------------
+
+pdf(
+  file.path(plot_dir, "TCGA_ICGC_somatic_interactions_nominal_sig_genes_only.pdf"),
+  width = 12,
+  height = 10
+)
+
+somaticInteractions(
+  maf = maf_nonsilent,
+  genes = sig_pair_genes,
+  pvalue = c(0.05, 0.01)
+)
+
+dev.off()
+
+png(
+  file.path(plot_dir, "TCGA_ICGC_somatic_interactions_nominal_sig_genes_only.png"),
+  width = 12,
+  height = 10,
+  units = "in",
+  res = 300
+)
+
+somaticInteractions(
+  maf = maf_nonsilent,
+  genes = sig_pair_genes,
+  pvalue = c(0.05, 0.01)
+)
+
+dev.off()
+
+# ------------------------------------------------------------
+# Display only final focused plot
+# ------------------------------------------------------------
+
+somaticInteractions(
+  maf = maf_nonsilent,
+  genes = sig_pair_genes,
+  pvalue = c(0.05, 0.01)
+)
+```
+
+
+```{r}
+# ============================================================
+# Detecting cancer driver genes based on positional clustering
+# maftools::oncodrive / OncodriveCLUST-style analysis
+# ============================================================
+
+oncodrive_dir <- file.path(out_dir, "Oncodrive_Positional_Clustering")
+dir.create(oncodrive_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Candidate amino-acid/protein-change columns commonly present in PCGR/vcf2maf/MAF files.
+aa_candidates <- c(
+  "Protein_Change",
+  "HGVSp_Short",
+  "HGVSp",
+  "AAChange",
+  "Amino_Acid_Change"
+)
+
+aa_col <- aa_candidates[aa_candidates %in% colnames(combined_maf)][1]
+
+if (is.na(aa_col) || length(aa_col) == 0) {
+  stop(
+    "No amino-acid change column found. oncodrive requires a protein-change column such as ",
+    "Protein_Change, HGVSp_Short, HGVSp, AAChange, or Amino_Acid_Change.\n",
+    "Available columns are:\n",
+    paste(colnames(combined_maf), collapse = ", ")
+  )
+}
+
+message("Using amino-acid change column for oncodrive: ", aa_col)
+
+# Minimum mutation count per gene.
+# For small cohorts, 3 is useful as exploratory.
+# For stricter/default maftools behavior, change this to 5.
+min_mut_oncodrive <- 3
+
+# Optional: ignore very large / frequently polymorphic genes.
+ignore_genes_oncodrive <- c(
+  "TTN", "MUC16", "MUC4", "MUC5B", "MUC6", "MUC17",
+  "OBSCN", "RYR1", "RYR2", "RYR3", "DNAH5", "DNAH7", "DNAH9"
+)
+
+ignore_genes_oncodrive <- intersect(ignore_genes_oncodrive, gene_summary$Hugo_Symbol)
+
+# ============================================================
+# Run oncodrive
+# ============================================================
+
+oncodrive_res <- tryCatch(
+  {
+    oncodrive(
+      maf = maf_nonsilent,
+      AACol = aa_col,
+      minMut = min_mut_oncodrive,
+      pvalMethod = "zscore",
+      ignoreGenes = ignore_genes_oncodrive
+    )
+  },
+  error = function(e) {
+    message("[ERROR] oncodrive failed: ", e$message)
+    return(NULL)
+  }
+)
+
+if (!is.null(oncodrive_res) && nrow(oncodrive_res) > 0) {
+
+  oncodrive_res_dt <- as.data.table(oncodrive_res)
+
+  sort_cols <- intersect(c("fdr", "pval"), colnames(oncodrive_res_dt))
+  if (length(sort_cols) > 0) {
+    setorderv(oncodrive_res_dt, cols = sort_cols, order = rep(1, length(sort_cols)))
+  }
+
+  # Save full result table
+  fwrite(
+    oncodrive_res_dt,
+    file = file.path(table_dir, "Tier1_common_oncodrive_positional_clustering_all_results.tsv"),
+    sep = "\t",
+    quote = FALSE,
+    na = ""
+  )
+
+  write.csv(
+    oncodrive_res_dt,
+    file = file.path(table_dir, "Tier1_common_oncodrive_positional_clustering_all_results.csv"),
+    row.names = FALSE
+  )
+
+  # Save significant/candidate driver genes
+  if ("fdr" %in% colnames(oncodrive_res_dt)) {
+    oncodrive_sig <- oncodrive_res_dt[fdr <= 0.10]
+  } else if ("pval" %in% colnames(oncodrive_res_dt)) {
+    oncodrive_sig <- oncodrive_res_dt[pval <= 0.05]
+  } else {
+    oncodrive_sig <- oncodrive_res_dt[0]
+  }
+
+
+  write.csv(
+    oncodrive_sig,
+    file = file.path(table_dir, "Tier1_common_oncodrive_positional_clustering_significant_candidates.csv"),
+    row.names = FALSE
+  )
+
+  message("Saved oncodrive all-results table: ",
+          file.path(table_dir, "Tier1_common_oncodrive_positional_clustering_all_results.csv"))
+
+  message("Saved oncodrive significant/candidate table: ",
+          file.path(table_dir, "Tier1_common_oncodrive_positional_clustering_significant_candidates.csv"))
+
+  print(head(oncodrive_res_dt, 20))
+  message("Number of FDR <= 0.10 positional-clustering candidates: ", nrow(oncodrive_sig))
+
+  # ============================================================
+  # Save oncodrive plots
+  # ============================================================
+
+  pdf(
+    file.path(plot_dir, "Tier1_common_oncodrive_positional_clustering_FDR0.10.pdf"),
+    width = 10,
+    height = 8
+  )
+  try(
+    plotOncodrive(
+      res = oncodrive_res_dt,
+      fdrCutOff = 0.10,
+      useFraction = TRUE,
+      labelSize = 0.7
+    ),
+    silent = TRUE
+  )
+  dev.off()
+
+  png(
+    filename = file.path(plot_dir, "Tier1_common_oncodrive_positional_clustering_FDR0.10.png"),
+    width = 10,
+    height = 8,
+    units = "in",
+    res = 300
+  )
+  try(
+    plotOncodrive(
+      res = oncodrive_res_dt,
+      fdrCutOff = 0.10,
+      useFraction = TRUE,
+      labelSize = 0.7
     ),
     silent = TRUE
   )
   dev.off()
 
   # Show in Rmd output
-  try(
-    somaticInteractions(
-      maf = maf_nonsilent,
-      top = 25,
-      pvalue = c(0.05, 0.01)
-    ),
-    silent = TRUE
+  plotOncodrive(
+    res = oncodrive_res_dt,
+    fdrCutOff = 0.10,
+    useFraction = TRUE,
+    labelSize = 0.7
+  )
+
+} else {
+  message(
+    "No oncodrive results returned. Possible reasons: too few recurrently mutated genes, ",
+    "missing/poorly formatted protein-change values in ", aa_col, ", or minMut is too strict. ",
+    "Try min_mut_oncodrive <- 2 for exploratory analysis."
   )
 }
+```
+```{r}
+
 ```
 
