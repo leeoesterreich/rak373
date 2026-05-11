@@ -1,0 +1,100 @@
+---
+title: "clinical_sample_sanity_check"
+output: html_document
+date: "2026-05-11"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(data.table)
+
+OUT_DIR <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/MOFA2"
+CLIN_DIR <- file.path(OUT_DIR, "MOFA2_Clinical_Association")
+TABLE_DIR <- file.path(OUT_DIR, "MOFA2_Tables")
+
+clinical_raw <- fread(file.path(CLIN_DIR, "ClinicalCorrelation.csv"), check.names = FALSE)
+factor_dt <- fread(file.path(TABLE_DIR, "MOFA2_factor_scores_wide.csv"))
+
+if ("sample" %in% colnames(factor_dt)) {
+  setnames(factor_dt, "sample", "Sample")
+}
+
+clean_sample <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+  x <- gsub("\\s+", "", x)
+  x <- gsub("\\(.*\\)$", "", x)
+  x <- gsub("(?i)_T$|(?i)_N$|(?i)-T$|(?i)-N$", "", x, perl = TRUE)
+  x <- gsub("(?i)NL$", "", x, perl = TRUE)
+  x <- gsub("(?i)(?<=\\d)T$|(?i)(?<=\\d)N$", "", x, perl = TRUE)
+  x
+}
+
+to_numeric_clean <- function(x) {
+  y <- trimws(as.character(x))
+  y[y %in% c("", "NA", "N/A")] <- NA
+  y <- gsub("^<\\s*5$", "2.5", y)
+  y <- gsub("%|,", "", y)
+  suppressWarnings(as.numeric(y))
+}
+
+normalize_marker <- function(x) {
+  y <- toupper(trimws(as.character(x)))
+  y[y %in% c("", "NA", "N/A")] <- NA
+
+  out <- rep(NA_character_, length(y))
+  out[grepl("POS|POSITIVE|\\+|YES", y)] <- "Positive"
+  out[grepl("NEG|NEGATIVE|\\-|NO", y)] <- "Negative"
+  out[grepl("EQUIVOCAL|BORDERLINE|INDETERMINATE", y)] <- "Equivocal"
+  out
+}
+
+clinical_clean <- data.table(
+  Sample = clean_sample(clinical_raw[["Sample name"]]),
+  Age_at_Diagnosis = to_numeric_clean(clinical_raw[["Age at Diagnosis"]]),
+  Tumor_cellularity = to_numeric_clean(clinical_raw[["MirrorFFPE_overall_tumor_cellularity (%)"]]),
+  Pleomorphic_invasive_component_cellularity = to_numeric_clean(clinical_raw[["MirrorFFPE_pleomorphic_invasive_compoent_cellularity (%)"]]),
+  TILs = to_numeric_clean(clinical_raw[["MirrorFFPE_TILs (%)"]]),
+  Grade = trimws(as.character(clinical_raw[["Grade/Differentiation-Desc"]])),
+  HER2_status = normalize_marker(clinical_raw[["BREAST: Her-2/Neu-Desc"]]),
+  ER_status = normalize_marker(clinical_raw[["Tumor Marker #ER"]]),
+  PR_status = normalize_marker(clinical_raw[["Tumor Marker #PR"]])
+)
+
+clinical_clean[, HR_status := fifelse(
+  ER_status == "Positive" | PR_status == "Positive",
+  "HR+",
+  fifelse(ER_status == "Negative" & PR_status == "Negative", "HR-", NA_character_)
+)]
+
+clinical_clean[, HR_HER2_subtype := fifelse(
+  HR_status == "HR+" & HER2_status == "Negative", "HR+/HER2-",
+  fifelse(
+    HR_status == "HR+" & HER2_status == "Positive", "HR+/HER2+",
+    fifelse(
+      HR_status == "HR-" & HER2_status == "Positive", "HR-/HER2+",
+      fifelse(HR_status == "HR-" & HER2_status == "Negative", "Triple-negative", NA_character_)
+    )
+  )
+)]
+
+clinical_clean <- unique(clinical_clean, by = "Sample")
+
+mofa_clinical <- merge(
+  data.table(Sample = clean_sample(factor_dt$Sample)),
+  clinical_clean,
+  by = "Sample",
+  all.x = TRUE
+)
+
+fwrite(
+  mofa_clinical,
+  file.path(CLIN_DIR, "Clinical_annotations_cleaned_for_MOFA2_factor_association.csv")
+)
+
+cat("MOFA2 samples:", nrow(mofa_clinical), "\n")
+cat("Samples with clinical annotation:", sum(!is.na(mofa_clinical$TILs) | !is.na(mofa_clinical$ER_status)), "\n")
+```

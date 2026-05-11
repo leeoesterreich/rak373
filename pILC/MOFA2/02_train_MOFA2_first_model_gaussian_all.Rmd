@@ -1,0 +1,575 @@
+---
+title: "02_train_MOFA2_first_model_gaussian_all"
+output: html_document
+date: "2026-05-11"
+---
+# Aim
+
+This  document trains the first exploratory MOFA2 model for the pILC multi-omics integration project.
+
+The model integrates:
+
+- RNA-seq log2TPM expression
+- WES mutation matrix
+- WES CNV matrix
+- MSK-IMPACT mutation matrix
+
+This first model uses a **Gaussian likelihood for all views**. This is intended as a stable exploratory model. Binary mutation views are treated as continuous 0/1 features in this first-pass analysis. A second sensitivity model should later be trained using Bernoulli likelihoods for binary mutation views.
+
+# Scientific rationale
+
+MOFA2 identifies latent factors that explain coordinated variation across multiple omics layers. In this first exploratory model, all views are modeled with Gaussian likelihood to improve stability and allow direct comparison across RNA, CNV, and mutation-derived matrices.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+USER_LIB <- "/ihome/alee/rak373/R/x86_64-pc-linux-gnu-library/4.4"
+.libPaths(c(USER_LIB, .libPaths()))
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+  library(MOFA2)
+})
+```
+
+```{r}
+# ============================================================
+# Paths
+# ============================================================
+
+OUT_DIR <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/MOFA2"
+
+RDS_DIR   <- file.path(OUT_DIR, "MOFA2_RDS")
+QC_DIR    <- file.path(OUT_DIR, "Sample_QC")
+MODEL_DIR <- file.path(OUT_DIR, "MOFA2_Model")
+PLOT_DIR  <- file.path(OUT_DIR, "MOFA2_Plots")
+TABLE_DIR <- file.path(OUT_DIR, "MOFA2_Tables")
+
+dir.create(MODEL_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(PLOT_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(TABLE_DIR, recursive = TRUE, showWarnings = FALSE)
+
+INPUT_RDS <- file.path(RDS_DIR, "MOFA2_data_list_union_samples_NA.rds")
+
+MODEL_NAME <- "pILC_MOFA2_first_model_gaussian_all"
+MODEL_HDF5 <- file.path(MODEL_DIR, paste0(MODEL_NAME, ".hdf5"))
+MODEL_RDS  <- file.path(MODEL_DIR, paste0(MODEL_NAME, ".trained.rds"))
+
+```
+
+```{r}
+# ============================================================
+# Parameters
+# ============================================================
+
+MIN_VIEWS_PER_SAMPLE <- 2
+MIN_NONMISSING_SAMPLES_PER_FEATURE <- 5
+NUM_FACTORS <- 10
+MAXITER <- 1000
+
+# For first stable model:
+# gaussian_all = treats RNA, CNV, and binary mutation as scaled continuous views.
+# Later we can compare with mixed likelihood, where mutation views use Bernoulli.
+LIKELIHOOD_MODE <- "gaussian_all"
+
+```
+
+```{r}
+# ============================================================
+# Helper functions
+# ============================================================
+
+feature_variance <- function(mat) {
+  apply(mat, 1, function(z) {
+    z <- z[!is.na(z)]
+    if (length(z) < 2) return(0)
+    if (length(unique(z)) < 2) return(0)
+    var(z)
+  })
+}
+
+clean_one_view <- function(mat, view_name) {
+  mat <- as.matrix(mat)
+  storage.mode(mat) <- "numeric"
+
+  feature_nonmissing <- rowSums(!is.na(mat))
+  feature_var <- feature_variance(mat)
+
+  keep <- feature_nonmissing >= MIN_NONMISSING_SAMPLES_PER_FEATURE &
+    is.finite(feature_var) &
+    feature_var > 0
+
+  dropped <- data.table(
+    View = view_name,
+    Feature = rownames(mat),
+    Nonmissing_samples = feature_nonmissing,
+    Variance = feature_var,
+    Keep = keep
+  )
+
+  mat2 <- mat[keep, , drop = FALSE]
+
+  list(
+    mat = mat2,
+    feature_qc = dropped
+  )
+}
+
+view_present_for_sample <- function(mat) {
+  apply(mat, 2, function(z) any(!is.na(z)))
+}
+
+save_pdf_plot <- function(plot_expr, outfile, width = 9, height = 7) {
+  pdf(outfile, width = width, height = height)
+  print(plot_expr)
+  dev.off()
+  message("[SAVED] ", outfile)
+}
+
+```
+
+```{r}
+# ============================================================
+# 1. Load MOFA2 data list
+# ============================================================
+
+message("\n==============================")
+message("1. Loading input data list")
+message("==============================")
+
+if (!file.exists(INPUT_RDS)) {
+  stop("Input RDS not found: ", INPUT_RDS)
+}
+
+data_list <- readRDS(INPUT_RDS)
+
+message("Views found:")
+print(names(data_list))
+
+```
+```{r}
+# ============================================================
+# 2. Feature-level cleaning
+# ============================================================
+
+message("\n==============================")
+message("2. Cleaning features")
+message("==============================")
+
+cleaned <- lapply(names(data_list), function(v) {
+  clean_one_view(data_list[[v]], v)
+})
+names(cleaned) <- names(data_list)
+
+feature_qc <- rbindlist(lapply(cleaned, function(x) x$feature_qc))
+fwrite(feature_qc, file.path(QC_DIR, "MOFA2_feature_filtering_QC.csv"))
+
+data_list_clean <- lapply(cleaned, function(x) x$mat)
+
+# Remove empty views
+view_dims_before <- rbindlist(lapply(names(data_list), function(v) {
+  data.table(
+    View = v,
+    Features_before = nrow(data_list[[v]]),
+    Samples_before = ncol(data_list[[v]])
+  )
+}))
+
+data_list_clean <- data_list_clean[sapply(data_list_clean, function(x) nrow(x) > 0 & ncol(x) > 0)]
+
+view_dims_after <- rbindlist(lapply(names(data_list_clean), function(v) {
+  data.table(
+    View = v,
+    Features_after = nrow(data_list_clean[[v]]),
+    Samples_after = ncol(data_list_clean[[v]])
+  )
+}))
+
+view_filter_summary <- merge(
+  view_dims_before,
+  view_dims_after,
+  by = "View",
+  all.x = TRUE
+)
+
+fwrite(view_filter_summary, file.path(QC_DIR, "MOFA2_view_feature_filtering_summary.csv"))
+
+message("View summary after feature filtering:")
+print(view_filter_summary)
+
+```
+```{r}
+# ============================================================
+# 3. Sample-level cleaning
+# ============================================================
+
+message("\n==============================")
+message("3. Cleaning samples")
+message("==============================")
+
+all_samples <- sort(unique(unlist(lapply(data_list_clean, colnames))))
+
+sample_view_presence <- data.table(Sample = all_samples)
+
+for (v in names(data_list_clean)) {
+  mat <- data_list_clean[[v]]
+
+  present_vec <- rep(FALSE, length(all_samples))
+  names(present_vec) <- all_samples
+
+  shared <- intersect(all_samples, colnames(mat))
+  present_vec[shared] <- view_present_for_sample(mat[, shared, drop = FALSE])
+
+  sample_view_presence[, (v) := present_vec[Sample]]
+}
+
+view_cols <- setdiff(colnames(sample_view_presence), "Sample")
+
+sample_view_presence[, N_views_present := rowSums(.SD), .SDcols = view_cols]
+sample_view_presence[, Keep_for_MOFA := N_views_present >= MIN_VIEWS_PER_SAMPLE]
+
+fwrite(
+  sample_view_presence,
+  file.path(QC_DIR, "MOFA2_sample_view_presence_for_training.csv")
+)
+
+keep_samples <- sample_view_presence[Keep_for_MOFA == TRUE, Sample]
+
+message("Samples before filtering: ", length(all_samples))
+message("Samples kept with at least ", MIN_VIEWS_PER_SAMPLE, " modalities: ", length(keep_samples))
+
+if (length(keep_samples) < 10) {
+  warning("Fewer than 10 samples kept. MOFA2 model may be unstable.")
+}
+
+data_list_clean <- lapply(data_list_clean, function(mat) {
+  mat[, keep_samples, drop = FALSE]
+})
+
+# Make sure all views have identical sample order
+data_list_clean <- lapply(data_list_clean, function(mat) {
+  mat[, sort(keep_samples), drop = FALSE]
+})
+
+saveRDS(
+  data_list_clean,
+  file.path(RDS_DIR, "MOFA2_data_list_training_filtered.rds")
+)
+
+message("[SAVED] ", file.path(RDS_DIR, "MOFA2_data_list_training_filtered.rds"))
+
+training_view_summary <- rbindlist(lapply(names(data_list_clean), function(v) {
+  mat <- data_list_clean[[v]]
+
+  data.table(
+    View = v,
+    Features = nrow(mat),
+    Samples = ncol(mat),
+    Missing_values = sum(is.na(mat)),
+    Percent_missing = round(100 * mean(is.na(mat)), 2)
+  )
+}))
+
+fwrite(
+  training_view_summary,
+  file.path(QC_DIR, "MOFA2_training_view_summary.csv")
+)
+
+message("Training view summary:")
+print(training_view_summary)
+```
+```{r}
+# ============================================================
+# 4. Create MOFA object
+# ============================================================
+
+message("\n==============================")
+message("4. Creating MOFA object")
+message("==============================")
+
+MOFAobject <- create_mofa(data_list_clean)
+
+save_pdf_plot(
+  plot_data_overview(MOFAobject),
+  file.path(PLOT_DIR, "MOFA2_data_overview_before_training.pdf"),
+  width = 10,
+  height = 6
+)
+
+# ============================================================
+# 5. Define MOFA options
+# ============================================================
+
+message("\n==============================")
+message("5. Defining MOFA options")
+message("==============================")
+
+data_opts <- get_default_data_options(MOFAobject)
+data_opts$scale_views <- TRUE
+data_opts$scale_groups <- FALSE
+data_opts$center_groups <- TRUE
+
+model_opts <- get_default_model_options(MOFAobject)
+model_opts$num_factors <- NUM_FACTORS
+
+if (LIKELIHOOD_MODE == "gaussian_all") {
+  model_opts$likelihoods <- setNames(
+    rep("gaussian", length(names(data_list_clean))),
+    names(data_list_clean)
+  )
+} else if (LIKELIHOOD_MODE == "mixed") {
+  likelihoods <- setNames(
+    rep("gaussian", length(names(data_list_clean))),
+    names(data_list_clean)
+  )
+
+  binary_views <- grep("mutation|binary", names(likelihoods), ignore.case = TRUE, value = TRUE)
+  likelihoods[binary_views] <- "bernoulli"
+
+  model_opts$likelihoods <- likelihoods
+} else {
+  stop("Unknown LIKELIHOOD_MODE: ", LIKELIHOOD_MODE)
+}
+
+train_opts <- get_default_training_options(MOFAobject)
+train_opts$maxiter <- MAXITER
+train_opts$convergence_mode <- "fast"
+train_opts$verbose <- TRUE
+train_opts$seed <- 1234
+
+message("Likelihoods:")
+print(model_opts$likelihoods)
+
+# Save options
+capture.output(
+  list(
+    data_options = data_opts,
+    model_options = model_opts,
+    training_options = train_opts
+  ),
+  file = file.path(MODEL_DIR, paste0(MODEL_NAME, "_options.txt"))
+)
+
+```
+```{r}
+# ============================================================
+# 6. Prepare and train MOFA model
+# ============================================================
+
+message("\n==============================")
+message("6. Preparing MOFA object")
+message("==============================")
+
+MOFAobject <- prepare_mofa(
+  object = MOFAobject,
+  data_options = data_opts,
+  model_options = model_opts,
+  training_options = train_opts
+)
+
+message("\n==============================")
+message("7. Training MOFA model")
+message("==============================")
+
+MOFAobject.trained <- tryCatch(
+  {
+    run_mofa(
+      MOFAobject,
+      outfile = MODEL_HDF5,
+      use_basilisk = TRUE
+    )
+  },
+  error = function(e) {
+    message("\n[WARNING] run_mofa with use_basilisk=TRUE failed.")
+    message("Trying run_mofa without use_basilisk...")
+    message("Original error: ", e$message)
+
+    run_mofa(
+      MOFAobject,
+      outfile = MODEL_HDF5
+    )
+  }
+)
+
+saveRDS(MOFAobject.trained, MODEL_RDS)
+
+message("[SAVED] ", MODEL_HDF5)
+message("[SAVED] ", MODEL_RDS)
+
+```
+```{r}
+# ============================================================
+# 8. Export factors and weights
+# ============================================================
+
+message("\n==============================")
+message("8. Exporting factors and weights")
+message("==============================")
+
+factors_df <- tryCatch(
+  {
+    get_factors(
+      MOFAobject.trained,
+      factors = "all",
+      as.data.frame = TRUE
+    )
+  },
+  error = function(e) {
+    message("[WARNING] Could not export factors: ", e$message)
+    NULL
+  }
+)
+
+if (!is.null(factors_df)) {
+  fwrite(
+    as.data.table(factors_df),
+    file.path(TABLE_DIR, "MOFA2_factor_scores_long.csv")
+  )
+
+  factor_wide <- dcast(
+    as.data.table(factors_df),
+    sample ~ factor,
+    value.var = "value"
+  )
+
+  fwrite(
+    factor_wide,
+    file.path(TABLE_DIR, "MOFA2_factor_scores_wide.csv")
+  )
+
+  message("[SAVED] factor scores")
+}
+
+weights_df <- tryCatch(
+  {
+    get_weights(
+      MOFAobject.trained,
+      views = "all",
+      factors = "all",
+      as.data.frame = TRUE
+    )
+  },
+  error = function(e) {
+    message("[WARNING] Could not export weights: ", e$message)
+    NULL
+  }
+)
+
+if (!is.null(weights_df)) {
+  weights_dt <- as.data.table(weights_df)
+
+  fwrite(
+    weights_dt,
+    file.path(TABLE_DIR, "MOFA2_feature_weights_long.csv")
+  )
+
+  top_weights <- weights_dt[
+    ,
+    .SD[order(-abs(value))][1:min(.N, 25)],
+    by = .(view, factor)
+  ]
+
+  fwrite(
+    top_weights,
+    file.path(TABLE_DIR, "MOFA2_top25_feature_weights_by_view_factor.csv")
+  )
+
+  message("[SAVED] feature weights")
+}
+
+```
+```{r}
+# ============================================================
+# 9. Basic plots
+# ============================================================
+
+message("\n==============================")
+message("9. Saving basic MOFA plots")
+message("==============================")
+
+try({
+  save_pdf_plot(
+    plot_data_overview(MOFAobject.trained),
+    file.path(PLOT_DIR, "MOFA2_data_overview_after_training.pdf"),
+    width = 10,
+    height = 6
+  )
+}, silent = TRUE)
+
+try({
+  save_pdf_plot(
+    plot_variance_explained(MOFAobject.trained),
+    file.path(PLOT_DIR, "MOFA2_variance_explained.pdf"),
+    width = 10,
+    height = 7
+  )
+}, silent = TRUE)
+
+try({
+  save_pdf_plot(
+    plot_factor_cor(MOFAobject.trained),
+    file.path(PLOT_DIR, "MOFA2_factor_correlation.pdf"),
+    width = 8,
+    height = 7
+  )
+}, silent = TRUE)
+
+# Save factor plots for first few factors
+for (ff in 1:min(5, NUM_FACTORS)) {
+  try({
+    save_pdf_plot(
+      plot_factor(MOFAobject.trained, factors = ff),
+      file.path(PLOT_DIR, paste0("MOFA2_factor_", ff, "_sample_scores.pdf")),
+      width = 8,
+      height = 5
+    )
+  }, silent = TRUE)
+}
+
+# Save top weight plots for first few factors and each view
+for (v in names(data_list_clean)) {
+  for (ff in 1:min(5, NUM_FACTORS)) {
+    try({
+      save_pdf_plot(
+        plot_weights(
+          MOFAobject.trained,
+          view = v,
+          factors = ff,
+          nfeatures = 15,
+          scale = TRUE
+        ),
+        file.path(
+          PLOT_DIR,
+          paste0("MOFA2_weights_", gsub("[^A-Za-z0-9]+", "_", v), "_Factor", ff, ".pdf")
+        ),
+        width = 10,
+        height = 7
+      )
+    }, silent = TRUE)
+  }
+}
+```
+
+
+```{r}
+# ============================================================
+# 10. Save session info
+# ============================================================
+
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(MODEL_DIR, paste0(MODEL_NAME, "_sessionInfo.txt"))
+)
+
+message("\nDONE.")
+message("Model files:")
+message("  ", MODEL_HDF5)
+message("  ", MODEL_RDS)
+message("Tables:")
+message("  ", TABLE_DIR)
+message("Plots:")
+message("  ", PLOT_DIR)
+
+```
+

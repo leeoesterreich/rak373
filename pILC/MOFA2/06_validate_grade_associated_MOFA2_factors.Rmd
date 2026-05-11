@@ -1,0 +1,512 @@
+---
+title: "06_validate_grade_associated_MOFA2_factors"
+output: html_document
+date: "2026-05-11"
+---
+Purpose:
+1. Validate Factor5 and Factor6 using Grade II vs Grade III only
+2. Exclude “Cell type not determined”
+3. Export statistical results
+4. Save publication/PPT-ready plots
+5. Export samples ranked by Factor5/Factor6
+6. Extract top positive and negative weights for Factor5/6
+
+# Aim
+
+This analysis validates the grade-associated MOFA2 factors identified from the clinical association analysis.
+
+The prior analysis identified Factor5 and Factor6 as the strongest clinically associated factors, both linked to histologic grade. Here, we perform a focused validation by excluding samples labeled as "Cell type not determined" and testing only:
+
+- Grade II
+- Grade III
+
+This provides a cleaner biological comparison.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+})
+```
+
+# Paths
+
+```{r paths}
+OUT_DIR <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/MOFA2"
+
+TABLE_DIR <- file.path(OUT_DIR, "MOFA2_Tables")
+CLIN_DIR  <- file.path(OUT_DIR, "MOFA2_Clinical_Association")
+ASSOC_DIR <- file.path(CLIN_DIR, "Factor_Association")
+
+VALID_DIR <- file.path(CLIN_DIR, "Grade_Associated_Factor_Validation")
+PLOT_DIR  <- file.path(VALID_DIR, "Plots")
+TABLE_OUT <- file.path(VALID_DIR, "Tables")
+
+dir.create(VALID_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(PLOT_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(TABLE_OUT, recursive = TRUE, showWarnings = FALSE)
+
+FACTOR_CLINICAL_FILE <- file.path(
+  ASSOC_DIR,
+  "MOFA2_factor_scores_with_clinical_annotations.csv"
+)
+
+PRIORITY_FILE <- file.path(
+  ASSOC_DIR,
+  "MOFA2_prioritized_clinical_association_hits.csv"
+)
+
+TOP_WEIGHT_FILE <- file.path(
+  TABLE_DIR,
+  "MOFA2_top25_feature_weights_by_view_factor.csv"
+)
+
+ALL_WEIGHT_FILE <- file.path(
+  TABLE_DIR,
+  "MOFA2_feature_weights_long.csv"
+)
+```
+
+# Helper functions
+
+```{r helper-functions}
+clean_grade <- function(x) {
+  y <- trimws(as.character(x))
+
+  out <- rep(NA_character_, length(y))
+  out[grepl("Grade II", y, ignore.case = TRUE)] <- "Grade II"
+  out[grepl("Grade III", y, ignore.case = TRUE)] <- "Grade III"
+  out[grepl("not determined", y, ignore.case = TRUE)] <- NA_character_
+
+  out
+}
+
+wilcox_effect_summary <- function(dt, factor_col, group_col = "Grade_clean") {
+  tmp <- dt[
+    !is.na(get(group_col)) &
+      get(group_col) %in% c("Grade II", "Grade III") &
+      is.finite(get(factor_col))
+  ]
+
+  tmp[, (group_col) := factor(get(group_col), levels = c("Grade II", "Grade III"))]
+
+  if (nrow(tmp) < 5 || length(unique(tmp[[group_col]])) < 2) {
+    return(data.table(
+      Factor = factor_col,
+      Comparison = "Grade II vs Grade III",
+      N_total = nrow(tmp),
+      N_Grade_II = sum(tmp[[group_col]] == "Grade II"),
+      N_Grade_III = sum(tmp[[group_col]] == "Grade III"),
+      Median_Grade_II = NA_real_,
+      Median_Grade_III = NA_real_,
+      Difference_GradeIII_minus_GradeII = NA_real_,
+      Wilcoxon_P = NA_real_,
+      Note = "Too few samples or only one group"
+    ))
+  }
+
+  x <- tmp[[factor_col]]
+  g <- tmp[[group_col]]
+
+  test <- suppressWarnings(wilcox.test(x ~ g))
+
+  med_ii <- median(x[g == "Grade II"], na.rm = TRUE)
+  med_iii <- median(x[g == "Grade III"], na.rm = TRUE)
+
+  data.table(
+    Factor = factor_col,
+    Comparison = "Grade II vs Grade III",
+    N_total = nrow(tmp),
+    N_Grade_II = sum(g == "Grade II"),
+    N_Grade_III = sum(g == "Grade III"),
+    Median_Grade_II = med_ii,
+    Median_Grade_III = med_iii,
+    Difference_GradeIII_minus_GradeII = med_iii - med_ii,
+    Wilcoxon_P = test$p.value,
+    Note = NA_character_
+  )
+}
+
+make_grade_plot <- function(dt, factor_col, out_file) {
+  tmp <- dt[
+    !is.na(Grade_clean) &
+      Grade_clean %in% c("Grade II", "Grade III") &
+      is.finite(get(factor_col))
+  ]
+
+  tmp[, Grade_clean := factor(Grade_clean, levels = c("Grade II", "Grade III"))]
+
+  p <- ggplot(
+    tmp,
+    aes(
+      x = Grade_clean,
+      y = .data[[factor_col]]
+    )
+  ) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_jitter(width = 0.12, height = 0, size = 2, alpha = 0.8) +
+    theme_bw(base_size = 13) +
+    labs(
+      title = paste0(factor_col, " score by histologic grade"),
+      subtitle = "Grade II vs Grade III only; cell type not determined excluded",
+      x = "Histologic grade",
+      y = paste0(factor_col, " score")
+    )
+
+  print(p)
+
+  ggsave(
+    filename = out_file,
+    plot = p,
+    width = 6.5,
+    height = 5
+  )
+
+  p
+}
+```
+
+# Load data
+
+```{r load-data}
+factor_clinical <- fread(FACTOR_CLINICAL_FILE, data.table = TRUE)
+
+cat("Factor-clinical table dimensions:\n")
+print(dim(factor_clinical))
+
+cat("Columns:\n")
+print(colnames(factor_clinical))
+
+factor_cols <- grep("^Factor", colnames(factor_clinical), value = TRUE)
+
+cat("Factors found:\n")
+print(factor_cols)
+
+if (!"Grade" %in% colnames(factor_clinical)) {
+  stop("Column 'Grade' not found in factor-clinical file.")
+}
+
+factor_clinical[, Grade_clean := clean_grade(Grade)]
+
+cat("Grade distribution before filtering:\n")
+print(factor_clinical[, .N, by = Grade][order(Grade)])
+
+cat("Grade distribution after cleaning:\n")
+print(factor_clinical[, .N, by = Grade_clean][order(Grade_clean)])
+```
+
+# Identify prioritized grade-associated factors
+
+```{r identify-prioritized-grade-factors}
+if (file.exists(PRIORITY_FILE)) {
+  priority_hits <- fread(PRIORITY_FILE, data.table = TRUE)
+
+  print(priority_hits)
+
+  grade_factors <- unique(
+    priority_hits[
+      Annotation == "Grade" &
+        Priority %in% c("FDR_global_lt_0.1", "Nominal_p_lt_0.05", "Trend_p_lt_0.1"),
+      Factor
+    ]
+  )
+
+} else {
+  warning("Priority file not found. Falling back to Factor5 and Factor6.")
+  grade_factors <- c("Factor5", "Factor6")
+}
+
+# Safety fallback based on previous result
+if (length(grade_factors) == 0) {
+  grade_factors <- c("Factor5", "Factor6")
+}
+
+grade_factors <- intersect(grade_factors, factor_cols)
+
+cat("Grade-associated factors selected for validation:\n")
+print(grade_factors)
+
+if (length(grade_factors) == 0) {
+  stop("No grade-associated factors found in factor score table.")
+}
+```
+
+# Grade II vs Grade III validation
+
+```{r grade-validation-tests}
+grade_test_results <- rbindlist(lapply(grade_factors, function(fac) {
+  wilcox_effect_summary(factor_clinical, fac, "Grade_clean")
+}))
+
+grade_test_results[, FDR := p.adjust(Wilcoxon_P, method = "BH")]
+
+fwrite(
+  grade_test_results,
+  file.path(TABLE_OUT, "MOFA2_grade_associated_factor_validation_tests.csv")
+)
+
+print(grade_test_results)
+```
+
+# Save Grade II/III-only analysis table
+
+```{r grade-filtered-table}
+grade_filtered <- factor_clinical[
+  !is.na(Grade_clean) &
+    Grade_clean %in% c("Grade II", "Grade III")
+]
+
+grade_filtered[, Grade_clean := factor(Grade_clean, levels = c("Grade II", "Grade III"))]
+
+fwrite(
+  grade_filtered,
+  file.path(TABLE_OUT, "MOFA2_factor_scores_clinical_GradeII_GradeIII_only.csv")
+)
+
+cat("Grade II/III-only table dimensions:\n")
+print(dim(grade_filtered))
+
+cat("Grade II/III sample counts:\n")
+print(grade_filtered[, .N, by = Grade_clean])
+```
+
+# Plot validated grade-associated factors
+
+```{r plot-grade-factors, fig.width=6.5, fig.height=5}
+for (fac in grade_factors) {
+  make_grade_plot(
+    grade_filtered,
+    fac,
+    file.path(PLOT_DIR, paste0(fac, "_GradeII_vs_GradeIII_boxplot.pdf"))
+  )
+}
+```
+
+# Export ranked samples by grade-associated factor scores
+
+```{r ranked-samples}
+for (fac in grade_factors) {
+  ranked_dt <- grade_filtered[
+    ,
+    c(
+      "Sample",
+      "Grade",
+      "Grade_clean",
+      "ER_status",
+      "PR_status",
+      "HER2_status",
+      "HR_status",
+      "HR_HER2_subtype",
+      "TILs",
+      "Tumor_cellularity",
+      fac
+    ),
+    with = FALSE
+  ][order(-get(fac))]
+
+  fwrite(
+    ranked_dt,
+    file.path(TABLE_OUT, paste0("Samples_ranked_by_", fac, ".csv"))
+  )
+
+  cat("\nTop samples by ", fac, ":\n", sep = "")
+  print(head(ranked_dt, 10))
+
+  cat("\nBottom samples by ", fac, ":\n", sep = "")
+  print(tail(ranked_dt, 10))
+}
+```
+
+# Correlation between Factor5 and Factor6
+
+```{r factor5-factor6-correlation, fig.width=6, fig.height=5}
+if (all(c("Factor5", "Factor6") %in% colnames(grade_filtered))) {
+  cor_test <- cor.test(
+    grade_filtered$Factor5,
+    grade_filtered$Factor6,
+    method = "spearman"
+  )
+
+  factor56_cor <- data.table(
+    Factor_X = "Factor5",
+    Factor_Y = "Factor6",
+    Spearman_rho = unname(cor_test$estimate),
+    P_value = cor_test$p.value,
+    N = sum(is.finite(grade_filtered$Factor5) & is.finite(grade_filtered$Factor6))
+  )
+
+  fwrite(
+    factor56_cor,
+    file.path(TABLE_OUT, "Factor5_Factor6_spearman_correlation.csv")
+  )
+
+  print(factor56_cor)
+
+  p <- ggplot(
+    grade_filtered,
+    aes(
+      x = Factor5,
+      y = Factor6,
+      shape = Grade_clean
+    )
+  ) +
+    geom_point(size = 2.5, alpha = 0.85) +
+    theme_bw(base_size = 13) +
+    labs(
+      title = "Relationship between Factor5 and Factor6",
+      subtitle = paste0(
+        "Spearman rho = ",
+        round(factor56_cor$Spearman_rho, 3),
+        ", P = ",
+        signif(factor56_cor$P_value, 3)
+      ),
+      x = "Factor5 score",
+      y = "Factor6 score",
+      shape = "Grade"
+    )
+
+  print(p)
+
+  ggsave(
+    file.path(PLOT_DIR, "Factor5_vs_Factor6_by_grade.pdf"),
+    p,
+    width = 6,
+    height = 5
+  )
+}
+```
+
+# Extract top weights for grade-associated factors
+
+```{r top-weights-grade-factors}
+if (file.exists(TOP_WEIGHT_FILE)) {
+  top_weights <- fread(TOP_WEIGHT_FILE, data.table = TRUE)
+
+  top_weights_grade <- top_weights[factor %in% grade_factors]
+
+  fwrite(
+    top_weights_grade,
+    file.path(TABLE_OUT, "Top25_feature_weights_for_grade_associated_factors.csv")
+  )
+
+  print(top_weights_grade)
+} else {
+  warning("Top weight file not found: ", TOP_WEIGHT_FILE)
+}
+```
+
+# Extract top positive and negative weights from all features
+
+```{r top-positive-negative-all-weights}
+if (file.exists(ALL_WEIGHT_FILE)) {
+  all_weights <- fread(ALL_WEIGHT_FILE, data.table = TRUE)
+
+  grade_weight_details <- rbindlist(lapply(grade_factors, function(fac) {
+    tmp <- all_weights[factor == fac]
+
+    rbindlist(lapply(unique(tmp$view), function(vv) {
+      vv_dt <- tmp[view == vv]
+
+      top_pos <- vv_dt[order(-value)][1:min(.N, 25)]
+      top_pos[, Direction := "Positive_weight"]
+
+      top_neg <- vv_dt[order(value)][1:min(.N, 25)]
+      top_neg[, Direction := "Negative_weight"]
+
+      rbind(top_pos, top_neg, fill = TRUE)
+    }), fill = TRUE)
+  }), fill = TRUE)
+
+  fwrite(
+    grade_weight_details,
+    file.path(TABLE_OUT, "Top_positive_negative_feature_weights_for_grade_associated_factors.csv")
+  )
+
+  print(grade_weight_details)
+} else {
+  warning("All feature weight file not found: ", ALL_WEIGHT_FILE)
+}
+```
+
+# Check top-weight features by direction and view
+
+```{r summarize-weight-direction}
+if (exists("grade_weight_details")) {
+  weight_summary <- grade_weight_details[
+    ,
+    .N,
+    by = .(factor, view, Direction)
+  ][order(factor, view, Direction)]
+
+  fwrite(
+    weight_summary,
+    file.path(TABLE_OUT, "Top_weight_feature_count_by_factor_view_direction.csv")
+  )
+
+  print(weight_summary)
+}
+```
+
+# Create concise interpretation table
+
+```{r concise-interpretation-table}
+interpretation_table <- copy(grade_test_results)
+
+interpretation_table[, Association_direction := fifelse(
+  Difference_GradeIII_minus_GradeII > 0,
+  "Higher in Grade III",
+  fifelse(
+    Difference_GradeIII_minus_GradeII < 0,
+    "Higher in Grade II",
+    NA_character_
+  )
+)]
+
+interpretation_table[, Interpretation := paste0(
+  Factor,
+  " is ",
+  Association_direction,
+  " compared with the other grade group. ",
+  "Median Grade II = ",
+  round(Median_Grade_II, 3),
+  "; median Grade III = ",
+  round(Median_Grade_III, 3),
+  "; Wilcoxon P = ",
+  signif(Wilcoxon_P, 3),
+  "; FDR = ",
+  signif(FDR, 3),
+  "."
+)]
+
+fwrite(
+  interpretation_table,
+  file.path(TABLE_OUT, "MOFA2_grade_factor_validation_interpretation_table.csv")
+)
+
+print(interpretation_table[, .(
+  Factor,
+  Association_direction,
+  Median_Grade_II,
+  Median_Grade_III,
+  Difference_GradeIII_minus_GradeII,
+  Wilcoxon_P,
+  FDR,
+  Interpretation
+)])
+```
+
+# Session info
+
+```{r session-info}
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(VALID_DIR, "06_validate_grade_associated_MOFA2_factors_sessionInfo.txt")
+)
+
+sessionInfo()
+```
+```

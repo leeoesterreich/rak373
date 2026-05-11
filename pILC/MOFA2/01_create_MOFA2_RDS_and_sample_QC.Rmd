@@ -1,0 +1,600 @@
+---
+title: "01_create_MOFA2_RDS_and_sample_QC"
+output: html_document
+date: "2026-05-11"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+suppressPackageStartupMessages({
+  library(data.table)
+})
+```
+
+```{r}
+# ============================================================
+# Paths
+# ============================================================
+
+OUT_DIR <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/MOFA2"
+
+RNAseq <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/4_Count_file_pILC/Max_TPM/tpm_matrix_pILC_log2TPM.txt"
+
+WES_MAF_FILE <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Compare_TumorOnly_vs_WithPON/maftools/Tier_1_common/Combined_MAF/Tier_1_common_all_samples.combined.maf"
+
+WES_CNV_FILE <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/CNV_PCGR/Plot/Figures/WES_PCGR_CNV_onecall_per_gene_sample.tsv"
+
+IMPACT_FILE <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/MSK_IMPACT/pILC_IMPACT_filtered.tsv"
+
+RDS_DIR <- file.path(OUT_DIR, "MOFA2_RDS")
+QC_DIR  <- file.path(OUT_DIR, "Sample_QC")
+
+dir.create(RDS_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(QC_DIR, recursive = TRUE, showWarnings = FALSE)
+
+TOP_N_RNA_GENES <- 5000
+MIN_MUTATED_SAMPLES <- 2
+```
+
+
+```{r}
+# ============================================================
+# Helper functions
+# ============================================================
+
+clean_sample <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+  x <- gsub("\\s+", "", x)
+
+  # Remove trailing parenthetical information if present: TP20-M388(10) -> TP20-M388
+  x <- gsub("\\(.*\\)$", "", x)
+
+  # Common tumor/normal suffixes
+  x <- gsub("(?i)_T$", "", x, perl = TRUE)
+  x <- gsub("(?i)_N$", "", x, perl = TRUE)
+  x <- gsub("(?i)-T$", "", x, perl = TRUE)
+  x <- gsub("(?i)-N$", "", x, perl = TRUE)
+
+  # IMPACT-style suffixes:
+  # TP03-117T  -> TP03-117
+  # TP03-117NL -> TP03-117
+  x <- gsub("(?i)NL$", "", x, perl = TRUE)
+  x <- gsub("(?i)(?<=\\d)T$", "", x, perl = TRUE)
+  x <- gsub("(?i)(?<=\\d)N$", "", x, perl = TRUE)
+
+  x
+}
+
+save_matrix <- function(mat, filename) {
+  out_file <- file.path(RDS_DIR, filename)
+  saveRDS(mat, out_file)
+  message("[SAVED] ", out_file, " | dim = ", paste(dim(mat), collapse = " x "))
+}
+
+pick_col <- function(dt, candidates) {
+  hits <- intersect(candidates, colnames(dt))
+  if (length(hits) == 0) return(NA_character_)
+  hits[1]
+}
+
+collapse_duplicate_features <- function(mat) {
+  mat <- as.data.frame(mat, check.names = FALSE)
+  mat$Feature_ID <- rownames(mat)
+
+  dt <- as.data.table(mat)
+  value_cols <- setdiff(colnames(dt), "Feature_ID")
+
+  dt[, (value_cols) := lapply(.SD, as.numeric), .SDcols = value_cols]
+
+  dt2 <- dt[
+    ,
+    lapply(.SD, function(z) mean(z, na.rm = TRUE)),
+    by = Feature_ID,
+    .SDcols = value_cols
+  ]
+
+  features <- dt2$Feature_ID
+  dt2[, Feature_ID := NULL]
+
+  out <- as.matrix(dt2)
+  rownames(out) <- features
+  storage.mode(out) <- "numeric"
+  out
+}
+
+encode_cnv <- function(x) {
+  y <- toupper(trimws(as.character(x)))
+
+  out <- rep(NA_real_, length(y))
+
+  out[y %in% c("HOMDEL", "HOMD", "HOM_DEL", "HOMOZYGOUSDELETION",
+               "HOMOZYGOUS_DELETION", "DEEPDELETION", "DEEP_DELETION", "-2")] <- -2
+
+  out[y %in% c("HETDEL", "HETD", "HET_DEL", "HETEROZYGOUSDELETION",
+               "HETEROZYGOUS_DELETION", "LOSS", "DEL", "DELETION", "-1")] <- -1
+
+  out[y %in% c("NEUTRAL", "DIPLOID", "NORMAL", "0", "NONE", "NA", "")] <- 0
+
+  out[y %in% c("GAIN", "LOWGAIN", "LOW_GAIN", "LOW-LEVEL_GAIN", "1")] <- 1
+
+  out[y %in% c("AMP", "AMPLIFICATION", "HLAMP", "HIGHLEVELAMPLIFICATION",
+               "HIGH_LEVEL_AMPLIFICATION", "HIGH-LEVEL_AMPLIFICATION", "2")] <- 2
+
+  suppressWarnings({
+    numeric_y <- as.numeric(y)
+    idx <- is.na(out) & !is.na(numeric_y)
+    out[idx] <- numeric_y[idx]
+  })
+
+  out
+}
+
+collapse_extreme_cnv <- function(z) {
+  z <- z[!is.na(z)]
+  if (length(z) == 0) return(NA_real_)
+  z[which.max(abs(z))]
+}
+
+nonsilent_filter <- function(dt, class_col) {
+  if (is.na(class_col)) return(dt)
+
+  silent_classes <- c(
+    "Silent",
+    "Intron",
+    "IGR",
+    "RNA",
+    "lincRNA",
+    "3'UTR",
+    "5'UTR",
+    "3'Flank",
+    "5'Flank",
+    "Splice_Region"
+  )
+
+  dt[!dt[[class_col]] %in% silent_classes, , drop = FALSE]
+}
+
+make_presence_matrix <- function(sample_sets) {
+  all_samples <- sort(unique(unlist(sample_sets)))
+
+  presence <- data.table(Sample = all_samples)
+
+  for (nm in names(sample_sets)) {
+    presence[, (nm) := Sample %in% sample_sets[[nm]]]
+  }
+
+  presence
+}
+
+make_pairwise_overlap <- function(sample_sets) {
+  mods <- names(sample_sets)
+  res <- list()
+
+  k <- 1
+  for (i in seq_along(mods)) {
+    for (j in seq_along(mods)) {
+      a <- mods[i]
+      b <- mods[j]
+
+      res[[k]] <- data.table(
+        Modality_1 = a,
+        Modality_2 = b,
+        N_modality_1 = length(sample_sets[[a]]),
+        N_modality_2 = length(sample_sets[[b]]),
+        N_overlap = length(intersect(sample_sets[[a]], sample_sets[[b]]))
+      )
+      k <- k + 1
+    }
+  }
+
+  rbindlist(res)
+}
+
+add_missing_sample_columns <- function(mat, all_samples) {
+  missing_samples <- setdiff(all_samples, colnames(mat))
+
+  if (length(missing_samples) > 0) {
+    na_mat <- matrix(
+      NA_real_,
+      nrow = nrow(mat),
+      ncol = length(missing_samples),
+      dimnames = list(rownames(mat), missing_samples)
+    )
+
+    mat <- cbind(mat, na_mat)
+  }
+
+  mat[, all_samples, drop = FALSE]
+}
+```
+
+
+```{r}
+# ============================================================
+# 1. RNA-seq log2TPM matrix
+# ============================================================
+
+message("\n==============================")
+message("1. Processing RNA-seq")
+message("==============================")
+
+rna_dt <- fread(RNAseq, data.table = FALSE, check.names = FALSE)
+
+gene_col <- colnames(rna_dt)[1]
+rna_genes <- rna_dt[[gene_col]]
+rna_dt[[gene_col]] <- NULL
+
+rna_mat <- as.matrix(rna_dt)
+rownames(rna_mat) <- rna_genes
+colnames(rna_mat) <- clean_sample(colnames(rna_mat))
+storage.mode(rna_mat) <- "numeric"
+
+rna_mat <- collapse_duplicate_features(rna_mat)
+
+rna_var <- apply(rna_mat, 1, var, na.rm = TRUE)
+keep <- is.finite(rna_var) & rna_var > 0
+
+rna_mat <- rna_mat[keep, , drop = FALSE]
+rna_var <- rna_var[keep]
+
+top_n <- min(TOP_N_RNA_GENES, nrow(rna_mat))
+top_genes <- names(sort(rna_var, decreasing = TRUE))[seq_len(top_n)]
+rna_top <- rna_mat[top_genes, , drop = FALSE]
+
+save_matrix(rna_mat, "RNA_log2TPM_allgenes.rds")
+save_matrix(rna_top, paste0("RNA_log2TPM_top", TOP_N_RNA_GENES, "var.rds"))
+
+fwrite(
+  data.table(
+    Raw_sample = colnames(rna_dt),
+    Clean_sample = clean_sample(colnames(rna_dt))
+  ),
+  file.path(QC_DIR, "RNA_sample_name_map.csv")
+)
+
+fwrite(
+  data.table(Gene = names(rna_var), Variance = rna_var)[order(-Variance)],
+  file.path(QC_DIR, "RNA_gene_variance_ranked.csv")
+)
+
+rna_samples <- sort(unique(colnames(rna_mat)))
+```
+
+
+```{r}
+# ============================================================
+# 2. WES mutation matrix from MAF
+# ============================================================
+
+message("\n==============================")
+message("2. Processing WES MAF")
+message("==============================")
+
+maf <- fread(WES_MAF_FILE, data.table = FALSE, check.names = FALSE)
+
+wes_gene_col <- pick_col(maf, c("Hugo_Symbol", "SYMBOL", "Gene", "gene"))
+wes_sample_col <- pick_col(maf, c("Tumor_Sample_Barcode", "Sample", "sample", "Sample_ID", "TUMOR_SAMPLE"))
+wes_class_col <- pick_col(maf, c("Variant_Classification", "Consequence", "Effect"))
+
+if (is.na(wes_gene_col) || is.na(wes_sample_col)) {
+  stop("Could not detect gene/sample columns in WES MAF.")
+}
+
+wes_sample_map <- data.table(
+  Raw_sample = unique(maf[[wes_sample_col]]),
+  Clean_sample = clean_sample(unique(maf[[wes_sample_col]]))
+)
+
+fwrite(wes_sample_map, file.path(QC_DIR, "WES_MAF_sample_name_map.csv"))
+
+maf <- nonsilent_filter(maf, wes_class_col)
+
+mut_dt <- data.table(
+  Gene = maf[[wes_gene_col]],
+  Sample = clean_sample(maf[[wes_sample_col]]),
+  Mutated = 1L
+)
+
+mut_dt <- mut_dt[!is.na(Gene) & Gene != "" & !is.na(Sample) & Sample != ""]
+
+mut_wide <- dcast(
+  unique(mut_dt),
+  Gene ~ Sample,
+  value.var = "Mutated",
+  fill = 0,
+  fun.aggregate = max
+)
+
+mut_genes <- mut_wide$Gene
+mut_wide[, Gene := NULL]
+
+wes_mut_mat <- as.matrix(mut_wide)
+rownames(wes_mut_mat) <- mut_genes
+storage.mode(wes_mut_mat) <- "numeric"
+
+wes_mut_count <- rowSums(wes_mut_mat, na.rm = TRUE)
+wes_mut_recurrent <- wes_mut_mat[wes_mut_count >= MIN_MUTATED_SAMPLES, , drop = FALSE]
+
+save_matrix(wes_mut_mat, "WES_mutation_binary_allgenes.rds")
+save_matrix(wes_mut_recurrent, paste0("WES_mutation_binary_recurrent_min", MIN_MUTATED_SAMPLES, ".rds"))
+
+fwrite(
+  data.table(Gene = names(wes_mut_count), Mutated_samples = wes_mut_count)[order(-Mutated_samples)],
+  file.path(QC_DIR, "WES_mutation_gene_frequency.csv")
+)
+
+wes_mut_samples <- sort(unique(colnames(wes_mut_mat)))
+```
+
+
+```{r}
+# ============================================================
+# 3. WES CNV matrix
+# ============================================================
+
+message("\n==============================")
+message("3. Processing WES CNV")
+message("==============================")
+
+cnv <- fread(WES_CNV_FILE, data.table = FALSE, check.names = FALSE)
+
+cnv_sample_col <- pick_col(cnv, c("Sample", "Tumor_Sample_Barcode", "Sample_ID", "TUMOR_SAMPLE"))
+cnv_gene_col <- pick_col(cnv, c("SYMBOL", "Hugo_Symbol", "Gene", "gene"))
+cnv_class_col <- pick_col(cnv, c("VARIANT_CLASS", "Variant_Class", "CNV", "CNV_Call", "Alteration", "Call"))
+
+if (is.na(cnv_sample_col) || is.na(cnv_gene_col) || is.na(cnv_class_col)) {
+  stop("Could not detect Sample/SYMBOL/VARIANT_CLASS columns in WES CNV file.")
+}
+
+fwrite(
+  data.table(
+    Raw_sample = unique(cnv[[cnv_sample_col]]),
+    Clean_sample = clean_sample(unique(cnv[[cnv_sample_col]]))
+  ),
+  file.path(QC_DIR, "WES_CNV_sample_name_map.csv")
+)
+
+cnv_dt <- data.table(
+  Gene = cnv[[cnv_gene_col]],
+  Sample = clean_sample(cnv[[cnv_sample_col]]),
+  CNV_call = cnv[[cnv_class_col]]
+)
+
+cnv_dt <- cnv_dt[!is.na(Gene) & Gene != "" & !is.na(Sample) & Sample != ""]
+cnv_dt[, CNV_numeric := encode_cnv(CNV_call)]
+
+fwrite(
+  unique(cnv_dt[, .(Original_CNV_call = CNV_call, Encoded_CNV_numeric = CNV_numeric)]),
+  file.path(QC_DIR, "WES_CNV_encoding_check.csv")
+)
+
+cnv_wide <- dcast(
+  cnv_dt,
+  Gene ~ Sample,
+  value.var = "CNV_numeric",
+  fun.aggregate = collapse_extreme_cnv,
+  fill = 0
+)
+
+cnv_genes <- cnv_wide$Gene
+cnv_wide[, Gene := NULL]
+
+wes_cnv_mat <- as.matrix(cnv_wide)
+rownames(wes_cnv_mat) <- cnv_genes
+storage.mode(wes_cnv_mat) <- "numeric"
+
+wes_cnv_binary <- wes_cnv_mat
+wes_cnv_binary[!is.na(wes_cnv_binary) & wes_cnv_binary != 0] <- 1
+wes_cnv_binary[!is.na(wes_cnv_binary) & wes_cnv_binary == 0] <- 0
+
+save_matrix(wes_cnv_mat, "WES_CNV_numeric.rds")
+save_matrix(wes_cnv_binary, "WES_CNV_binary.rds")
+
+wes_cnv_freq <- rowSums(wes_cnv_binary == 1, na.rm = TRUE)
+
+fwrite(
+  data.table(Gene = names(wes_cnv_freq), CNV_altered_samples = wes_cnv_freq)[order(-CNV_altered_samples)],
+  file.path(QC_DIR, "WES_CNV_gene_frequency.csv")
+)
+
+wes_cnv_samples <- sort(unique(colnames(wes_cnv_mat)))
+```
+
+
+```{r}
+# ============================================================
+# 4. IMPACT mutation matrix
+# ============================================================
+
+message("\n==============================")
+message("4. Processing IMPACT mutation file")
+message("==============================")
+
+impact <- fread(IMPACT_FILE, data.table = FALSE, check.names = FALSE)
+
+impact_gene_col <- pick_col(impact, c("SYMBOL", "Hugo_Symbol", "Gene", "gene"))
+impact_sample_col <- pick_col(impact, c("TUMOR_SAMPLE", "Tumor_Sample_Barcode", "Sample", "Sample_ID"))
+impact_class_col <- pick_col(impact, c("Variant_Classification", "Consequence", "Effect"))
+
+if (is.na(impact_gene_col) || is.na(impact_sample_col)) {
+  stop("Could not detect gene/sample columns in IMPACT file.")
+}
+
+fwrite(
+  data.table(
+    Raw_sample = unique(impact[[impact_sample_col]]),
+    Clean_sample = clean_sample(unique(impact[[impact_sample_col]]))
+  ),
+  file.path(QC_DIR, "IMPACT_sample_name_map.csv")
+)
+
+impact <- nonsilent_filter(impact, impact_class_col)
+
+impact_dt <- data.table(
+  Gene = impact[[impact_gene_col]],
+  Sample = clean_sample(impact[[impact_sample_col]]),
+  Mutated = 1L
+)
+
+impact_dt <- impact_dt[!is.na(Gene) & Gene != "" & !is.na(Sample) & Sample != ""]
+
+impact_wide <- dcast(
+  unique(impact_dt),
+  Gene ~ Sample,
+  value.var = "Mutated",
+  fill = 0,
+  fun.aggregate = max
+)
+
+impact_genes <- impact_wide$Gene
+impact_wide[, Gene := NULL]
+
+impact_mut_mat <- as.matrix(impact_wide)
+rownames(impact_mut_mat) <- impact_genes
+storage.mode(impact_mut_mat) <- "numeric"
+
+impact_mut_count <- rowSums(impact_mut_mat, na.rm = TRUE)
+impact_mut_recurrent <- impact_mut_mat[impact_mut_count >= MIN_MUTATED_SAMPLES, , drop = FALSE]
+
+save_matrix(impact_mut_mat, "IMPACT_mutation_binary_allgenes.rds")
+save_matrix(impact_mut_recurrent, paste0("IMPACT_mutation_binary_recurrent_min", MIN_MUTATED_SAMPLES, ".rds"))
+
+fwrite(
+  data.table(Gene = names(impact_mut_count), Mutated_samples = impact_mut_count)[order(-Mutated_samples)],
+  file.path(QC_DIR, "IMPACT_mutation_gene_frequency.csv")
+)
+
+impact_samples <- sort(unique(colnames(impact_mut_mat)))
+```
+
+
+```{r}
+# ============================================================
+# 5. Sample sanity checks
+# ============================================================
+
+message("\n==============================")
+message("5. Sample-level sanity checks")
+message("==============================")
+
+sample_sets <- list(
+  RNAseq = rna_samples,
+  WES_MAF = wes_mut_samples,
+  WES_CNV = wes_cnv_samples,
+  IMPACT = impact_samples
+)
+
+sample_count_summary <- rbindlist(lapply(names(sample_sets), function(nm) {
+  data.table(
+    Modality = nm,
+    N_samples = length(sample_sets[[nm]])
+  )
+}))
+
+fwrite(sample_count_summary, file.path(QC_DIR, "MOFA2_modality_sample_counts.csv"))
+
+presence <- make_presence_matrix(sample_sets)
+fwrite(presence, file.path(QC_DIR, "MOFA2_sample_presence_matrix.csv"))
+
+pairwise <- make_pairwise_overlap(sample_sets)
+fwrite(pairwise, file.path(QC_DIR, "MOFA2_pairwise_sample_overlap.csv"))
+
+common_all <- Reduce(intersect, sample_sets)
+
+fwrite(
+  data.table(Sample = sort(common_all)),
+  file.path(QC_DIR, "MOFA2_common_samples_all_modalities.csv")
+)
+
+for (nm in names(sample_sets)) {
+  fwrite(
+    data.table(Sample = sort(sample_sets[[nm]])),
+    file.path(QC_DIR, paste0("Samples_", nm, ".csv"))
+  )
+}
+
+message("\nSample count by modality:")
+print(sample_count_summary)
+
+message("\nPairwise overlap:")
+print(pairwise)
+
+message("\nSamples common to all modalities: ", length(common_all))
+```
+
+
+```{r}
+# ============================================================
+# 6. Create MOFA2 data lists
+# ============================================================
+
+message("\n==============================")
+message("6. Creating MOFA2 data lists")
+message("==============================")
+
+data_list_core <- list(
+  RNA_log2TPM_top5000var = rna_top,
+  WES_mutation_recurrent = wes_mut_recurrent,
+  WES_CNV_numeric = wes_cnv_mat,
+  IMPACT_mutation_recurrent = impact_mut_recurrent
+)
+
+# Remove empty views, if any
+data_list_core <- data_list_core[sapply(data_list_core, function(x) nrow(x) > 0 & ncol(x) > 0)]
+
+# A. Common sample list: strict complete-case MOFA input
+if (length(common_all) > 0) {
+  data_list_common <- lapply(data_list_core, function(mat) {
+    mat[, sort(common_all), drop = FALSE]
+  })
+
+  saveRDS(
+    data_list_common,
+    file.path(RDS_DIR, "MOFA2_data_list_common_all_modalities.rds")
+  )
+
+  message("[SAVED] ", file.path(RDS_DIR, "MOFA2_data_list_common_all_modalities.rds"))
+} else {
+  message("[WARNING] No sample is common to all modalities. Common-only MOFA list not generated.")
+}
+
+# B. Union sample list with NA for missing modality measurements
+# This is useful because not all samples are available in all modalities.
+all_samples_union <- sort(unique(unlist(lapply(data_list_core, colnames))))
+
+data_list_union <- lapply(data_list_core, function(mat) {
+  add_missing_sample_columns(mat, all_samples_union)
+})
+
+saveRDS(
+  data_list_union,
+  file.path(RDS_DIR, "MOFA2_data_list_union_samples_NA.rds")
+)
+
+message("[SAVED] ", file.path(RDS_DIR, "MOFA2_data_list_union_samples_NA.rds"))
+
+view_summary <- rbindlist(lapply(names(data_list_union), function(v) {
+  mat <- data_list_union[[v]]
+
+  data.table(
+    View = v,
+    Features = nrow(mat),
+    Samples = ncol(mat),
+    Missing_values = sum(is.na(mat)),
+    Percent_missing = round(100 * mean(is.na(mat)), 2)
+  )
+}))
+
+fwrite(view_summary, file.path(QC_DIR, "MOFA2_view_summary_union_samples.csv"))
+
+message("\nMOFA2 view summary:")
+print(view_summary)
+
+message("\nDONE.")
+message("Check outputs in:")
+message("  RDS: ", RDS_DIR)
+message("  QC : ", QC_DIR)
+
+```
+
