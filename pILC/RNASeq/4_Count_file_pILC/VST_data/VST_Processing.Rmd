@@ -1,0 +1,414 @@
+---
+title: "VST_Processing"
+output: html_document
+date: "2026-05-12"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+############################################################
+## Create VST RNA-seq matrix from HTSeq count files
+## Input  : HTSeq *.txt files
+## raw HTSeq counts → gene symbols → low-expression filter → VST → top variable genes after VST
+## Output : VST matrices for MOFA2 / WGCNA / clustering
+############################################################
+
+set.seed(42)
+
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(biomaRt)
+  library(dplyr)
+})
+
+############################################################
+## Define input and output directories
+############################################################
+
+count_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/4_Count_file_pILC"
+
+out_dir <- file.path(count_dir, "VST_data")
+
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+cat("Input HTSeq count directory:\n", count_dir, "\n\n")
+cat("Output directory:\n", out_dir, "\n\n")
+
+############################################################
+## Read all HTSeq count files
+############################################################
+
+count_files <- list.files(
+  count_dir,
+  pattern = "\\.txt$",
+  full.names = TRUE
+)
+
+if (length(count_files) == 0) {
+  stop("No .txt HTSeq count files found in: ", count_dir)
+}
+
+cat("Found", length(count_files), "HTSeq count files.\n\n")
+
+read_htseq_file <- function(file) {
+  
+  sample_name <- tools::file_path_sans_ext(basename(file))
+  
+  df <- read.table(
+    file,
+    header = FALSE,
+    sep = "\t",
+    stringsAsFactors = FALSE,
+    col.names = c("ensembl_id", sample_name)
+  )
+  
+  return(df)
+}
+
+count_list <- lapply(count_files, read_htseq_file)
+
+counts_df <- Reduce(
+  function(x, y) merge(x, y, by = "ensembl_id", all = TRUE),
+  count_list
+)
+
+counts_df[is.na(counts_df)] <- 0
+
+cat("Merged HTSeq count matrix dimensions:\n")
+cat("Rows:", nrow(counts_df), "\n")
+cat("Columns:", ncol(counts_df), "\n\n")
+
+############################################################
+## Remove HTSeq summary rows
+## Example rows: __no_feature, __ambiguous, __too_low_aQual
+############################################################
+
+counts_df <- counts_df[!grepl("^__", counts_df$ensembl_id), ]
+
+cat("After removing HTSeq summary rows:\n")
+cat("Rows:", nrow(counts_df), "\n")
+cat("Columns:", ncol(counts_df), "\n\n")
+
+############################################################
+## Remove Ensembl version numbers
+## Example: ENSG00000141510.18 -> ENSG00000141510
+############################################################
+
+counts_df$ensembl_id_clean <- gsub("\\..*", "", counts_df$ensembl_id)
+
+############################################################
+## Map Ensembl IDs to HGNC gene symbols
+############################################################
+
+cat("Mapping Ensembl IDs to HGNC gene symbols using biomaRt...\n")
+
+mart <- useMart(
+  biomart = "ensembl",
+  dataset = "hsapiens_gene_ensembl"
+)
+
+gene_map <- getBM(
+  attributes = c("ensembl_gene_id", "hgnc_symbol"),
+  filters = "ensembl_gene_id",
+  values = unique(counts_df$ensembl_id_clean),
+  mart = mart
+)
+
+gene_map <- gene_map %>%
+  distinct(ensembl_gene_id, .keep_all = TRUE)
+
+cat("Mapped", nrow(gene_map), "Ensembl IDs to HGNC symbols.\n\n")
+
+############################################################
+## Merge gene symbols with count matrix
+############################################################
+
+out_df <- merge(
+  counts_df,
+  gene_map,
+  by.x = "ensembl_id_clean",
+  by.y = "ensembl_gene_id",
+  all.x = TRUE
+)
+
+out_df$gene_name <- ifelse(
+  out_df$hgnc_symbol == "" | is.na(out_df$hgnc_symbol),
+  out_df$ensembl_id_clean,
+  out_df$hgnc_symbol
+)
+```
+
+
+```{r}
+############################################################
+## Prepare count matrix and collapse duplicate gene symbols
+############################################################
+
+sample_cols <- setdiff(
+  colnames(out_df),
+  c("ensembl_id_clean", "ensembl_id", "hgnc_symbol", "gene_name")
+)
+
+count_mat_symbol <- out_df[, c("gene_name", sample_cols)]
+
+count_mat_symbol[, sample_cols] <- lapply(
+  count_mat_symbol[, sample_cols],
+  as.numeric
+)
+
+count_mat_symbol <- count_mat_symbol %>%
+  group_by(gene_name) %>%
+  summarise(
+    across(all_of(sample_cols), ~ sum(.x, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+count_mat_symbol <- as.data.frame(count_mat_symbol)
+
+rownames(count_mat_symbol) <- count_mat_symbol$gene_name
+count_mat_symbol$gene_name <- NULL
+
+cat("After collapsing duplicate gene symbols:\n")
+cat("Genes:", nrow(count_mat_symbol), "\n")
+cat("Samples:", ncol(count_mat_symbol), "\n\n")
+
+############################################################
+## Save raw count matrix with gene names
+############################################################
+
+raw_out <- cbind(
+  Gene = rownames(count_mat_symbol),
+  count_mat_symbol
+)
+
+write.csv(
+  raw_out,
+  file.path(out_dir, "htseq_raw_counts_with_gene_names.csv"),
+  row.names = FALSE
+)
+
+```
+
+
+```{r}
+############################################################
+## Low-expression filtering before VST
+############################################################
+
+cat("Filtering low-expressed genes before VST...\n")
+
+min_samples <- ceiling(ncol(count_mat_symbol) * 0.10)
+min_count <- 5
+
+cat("Minimum count cutoff:", min_count, "\n")
+cat("Gene must have count >=", min_count, "in at least", min_samples, "samples.\n")
+
+keep_genes <- rowSums(count_mat_symbol >= min_count) >= min_samples
+
+counts_filtered <- count_mat_symbol[keep_genes, ]
+
+cat("After low-expression filtering:\n")
+cat("Genes:", nrow(counts_filtered), "\n")
+cat("Samples:", ncol(counts_filtered), "\n\n")
+
+filtered_out <- cbind(
+  Gene = rownames(counts_filtered),
+  counts_filtered
+)
+
+write.csv(
+  filtered_out,
+  file.path(out_dir, "htseq_expression_filtered_counts_gene_names.csv"),
+  row.names = FALSE
+)
+
+```
+
+
+```{r}
+############################################################
+## DESeq2 VST transformation
+############################################################
+
+cat("Running DESeq2 VST transformation...\n")
+
+counts_filtered <- round(as.matrix(counts_filtered))
+
+storage.mode(counts_filtered) <- "integer"
+
+coldata <- data.frame(
+  sample = colnames(counts_filtered)
+)
+
+rownames(coldata) <- coldata$sample
+
+dds <- DESeqDataSetFromMatrix(
+  countData = counts_filtered,
+  colData = coldata,
+  design = ~ 1
+)
+
+vst_obj <- tryCatch(
+  {
+    vst(dds, blind = TRUE)
+  },
+  error = function(e) {
+    cat("vst() gave an error. Trying varianceStabilizingTransformation() instead.\n")
+    cat("Original error message:\n")
+    cat(e$message, "\n")
+    
+    varianceStabilizingTransformation(dds, blind = TRUE)
+  }
+)
+
+vst_mat <- assay(vst_obj)
+
+cat("VST matrix dimensions:\n")
+cat("Genes:", nrow(vst_mat), "\n")
+cat("Samples:", ncol(vst_mat), "\n\n")
+```
+
+
+```{r}
+############################################################
+## Save full VST matrix
+############################################################
+
+vst_out <- cbind(
+  Gene = rownames(vst_mat),
+  as.data.frame(vst_mat)
+)
+
+write.csv(
+  vst_out,
+  file.path(out_dir, "htseq_VST_gene_names_all_expression_filtered_genes.csv"),
+  row.names = FALSE
+)
+
+saveRDS(
+  vst_obj,
+  file.path(out_dir, "DESeq2_VST_object.rds")
+)
+
+saveRDS(
+  vst_mat,
+  file.path(out_dir, "htseq_VST_matrix_all_expression_filtered_genes.rds")
+)
+
+############################################################
+## Select top variable genes after VST
+############################################################
+
+cat("Selecting top variable genes after VST...\n")
+
+top_n_genes <- 5000
+
+vst_gene_vars <- apply(vst_mat, 1, var, na.rm = TRUE)
+
+top_variable_genes <- names(
+  sort(vst_gene_vars, decreasing = TRUE)
+)[1:min(top_n_genes, length(vst_gene_vars))]
+
+vst_mat_topvar <- vst_mat[top_variable_genes, ]
+
+cat("Top-variable VST matrix dimensions:\n")
+cat("Genes:", nrow(vst_mat_topvar), "\n")
+cat("Samples:", ncol(vst_mat_topvar), "\n\n")
+```
+
+
+```{r}
+############################################################
+## Save top-variable VST matrix
+############################################################
+
+vst_topvar_out <- cbind(
+  Gene = rownames(vst_mat_topvar),
+  as.data.frame(vst_mat_topvar)
+)
+
+write.csv(
+  vst_topvar_out,
+  file.path(out_dir, "htseq_VST_gene_names_top5000_variable_genes.csv"),
+  row.names = FALSE
+)
+
+saveRDS(
+  vst_mat_topvar,
+  file.path(out_dir, "htseq_VST_matrix_top5000_variable_genes.rds")
+)
+
+############################################################
+## Save gene variance table
+############################################################
+
+gene_variance_df <- data.frame(
+  Gene = names(vst_gene_vars),
+  VST_variance = as.numeric(vst_gene_vars)
+)
+
+gene_variance_df <- gene_variance_df[order(gene_variance_df$VST_variance, decreasing = TRUE), ]
+
+write.csv(
+  gene_variance_df,
+  file.path(out_dir, "htseq_VST_gene_variance_table.csv"),
+  row.names = FALSE
+)
+
+############################################################
+## Save sample names
+############################################################
+
+sample_info <- data.frame(
+  Sample = colnames(vst_mat)
+)
+
+write.csv(
+  sample_info,
+  file.path(out_dir, "VST_sample_names.csv"),
+  row.names = FALSE
+)
+
+```
+
+
+```{r}
+############################################################
+## Final summary
+############################################################
+
+cat("\n============================================================\n")
+cat("DONE: VST RNA-seq matrix generated successfully\n")
+cat("============================================================\n\n")
+
+cat("Output folder:\n")
+cat(out_dir, "\n\n")
+
+cat("Raw count matrix:\n")
+cat(file.path(out_dir, "htseq_raw_counts_with_gene_names.rds"), "\n\n")
+
+cat("Expression-filtered count matrix:\n")
+cat(file.path(out_dir, "htseq_expression_filtered_counts_gene_names.rds"), "\n\n")
+
+cat("Full VST matrix:\n")
+cat(file.path(out_dir, "htseq_VST_matrix_all_expression_filtered_genes.rds"), "\n\n")
+
+cat("Recommended RNA matrix for MOFA2:\n")
+cat(file.path(out_dir, "htseq_VST_matrix_top5000_variable_genes.rds"), "\n\n")
+
+cat("CSV version for checking:\n")
+cat(file.path(out_dir, "htseq_VST_gene_names_top5000_variable_genes.csv"), "\n")
+
+
+cat("Summary:\n")
+cat("Original rows after removing HTSeq summary rows:", nrow(counts_df), "\n")
+cat("Unique genes after symbol collapsing:", nrow(count_mat_symbol), "\n")
+cat("Genes after low-expression filtering:", nrow(counts_filtered), "\n")
+cat("Genes in full VST matrix:", nrow(vst_mat), "\n")
+cat("Genes in top-variable VST matrix:", nrow(vst_mat_topvar), "\n")
+cat("Number of samples:", ncol(vst_mat), "\n")
+```
+
