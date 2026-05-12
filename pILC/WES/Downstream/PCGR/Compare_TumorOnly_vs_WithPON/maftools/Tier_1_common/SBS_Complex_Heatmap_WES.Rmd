@@ -13,18 +13,74 @@ suppressPackageStartupMessages({
   library(ComplexHeatmap)
   library(circlize)
   library(grid)
+  library(maftools)
 })
 ```
 ```{r}
-# ============================================================
-# SBS mutational signature annotation from PCGR msigs files
-# ============================================================
+combined_maf_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Compare_TumorOnly_vs_WithPON/maftools/Tier_1_common/Combined_MAF/Tier_1_common_all_samples.combined.maf"
 
-msig_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Mutational_Signature_PCGR"
+msig_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Mutational_Signature_PCGR_With_PON"
 
+out_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Compare_TumorOnly_vs_WithPON/maftools/Tier_1_common"
+
+plot_dir <- file.path(out_dir, "plots")
+table_dir <- file.path(out_dir, "tables")
 sbs_out_dir <- file.path(out_dir, "SBS_signature_annotation")
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(table_dir, recursive = TRUE, showWarnings = FALSE)
 dir.create(sbs_out_dir, recursive = TRUE, showWarnings = FALSE)
 
+if (!file.exists(combined_maf_file)) {
+  stop("Combined MAF file not found: ", combined_maf_file)
+}
+
+if (!dir.exists(msig_dir)) {
+  stop("MSIG directory not found: ", msig_dir)
+}
+
+combined_maf_file
+msig_dir
+plot_dir
+```
+```{r}
+# Read Tier 1 common MAF
+maf_nonsilent <- read.maf(
+  maf = combined_maf_file,
+  useAll = TRUE,
+  verbose = TRUE
+)
+
+maf_all <- maf_nonsilent
+
+gene_summary <- getGeneSummary(maf_nonsilent)
+sample_summary <- getSampleSummary(maf_nonsilent)
+
+mut_dt <- as.data.table(maf_nonsilent@data)
+
+fwrite(
+  gene_summary,
+  file = file.path(table_dir, "Tier1_common_gene_summary.tsv"),
+  sep = "\t"
+)
+
+fwrite(
+  sample_summary,
+  file = file.path(table_dir, "Tier1_common_sample_summary.tsv"),
+  sep = "\t"
+)
+
+fwrite(
+  mut_dt,
+  file = file.path(table_dir, "Tier1_common_maftools_mutation_data.tsv"),
+  sep = "\t"
+)
+
+head(gene_summary, 20)
+```
+```{r}
+# Read PCGR SBS signature files
 msig_files <- list.files(
   path = msig_dir,
   pattern = "\\.pcgr\\.grch38\\.msigs\\.tsv$",
@@ -82,73 +138,54 @@ fwrite(
 head(msig_dt)
 ```
 ```{r}
-# ============================================================
-# Sum SBS signatures into biological categories
-# ============================================================
-
-cat_levels <- c(
-  "Clock-like/Aging",
-  "APOBEC/AID",
-  "HR deficiency",
-  "MMR deficiency",
-  "POLE proofreading defect",
-  "Exposure-related",
-  "Unknown/Uncharacterized"
-)
-
-bucket_sum <- msig_dt[
-  ,
-  .(bucket_prop = sum(prop_signature, na.rm = TRUE)),
-  by = .(sample_id, Biological_Categories)
-]
-
-bucket_sum[, total := sum(bucket_prop), by = sample_id]
-bucket_sum[, Relative_contribution := bucket_prop / total]
-
-complete_dt <- CJ(
-  sample_id = unique(bucket_sum$sample_id),
-  Biological_Categories = cat_levels,
-  unique = TRUE
-)
-
-sbs_long <- merge(
-  complete_dt,
-  bucket_sum[, .(sample_id, Biological_Categories, Relative_contribution)],
-  by = c("sample_id", "Biological_Categories"),
-  all.x = TRUE
-)
-
-sbs_long[is.na(Relative_contribution), Relative_contribution := 0]
-
-sbs_long[, Biological_Categories := factor(Biological_Categories, levels = cat_levels)]
-
-fwrite(
-  sbs_long,
-  file = file.path(sbs_out_dir, "SBS_Merged_Categories_for_Tier1_samples.tsv"),
-  sep = "\t"
-)
-
-head(sbs_long)
-```
-```{r}
-# ============================================================
 # Match SBS samples to MAF samples
-# ============================================================
-
 maf_samples <- sort(unique(maf_nonsilent@data$Tumor_Sample_Barcode))
 sbs_samples <- sort(unique(sbs_long$sample_id))
 
 missing_sbs <- setdiff(maf_samples, sbs_samples)
 extra_sbs <- setdiff(sbs_samples, maf_samples)
 
+matched_samples <- intersect(maf_samples, sbs_samples)
+
+if (length(matched_samples) == 0) {
+  stop("No matching samples between MAF and SBS signature files.")
+}
+
+sample_order <- maf_samples[maf_samples %in% matched_samples]
+
+sbs_long_matched <- sbs_long[sample_id %in% matched_samples]
+sbs_long_matched[, sample_id := factor(sample_id, levels = sample_order)]
+sbs_long_matched[, Biological_Categories := factor(Biological_Categories, levels = cat_levels)]
+
+sample_match_summary <- data.table(
+  Metric = c(
+    "MAF samples",
+    "SBS samples",
+    "Matched samples",
+    "MAF samples missing SBS",
+    "Extra SBS samples not in MAF"
+  ),
+  Count = c(
+    length(maf_samples),
+    length(sbs_samples),
+    length(matched_samples),
+    length(missing_sbs),
+    length(extra_sbs)
+  )
+)
+
+fwrite(
+  sample_match_summary,
+  file = file.path(sbs_out_dir, "SBS_MAF_sample_match_summary.tsv"),
+  sep = "\t"
+)
+
+sample_match_summary
 missing_sbs
 extra_sbs
 ```
 ```{r}
-# ============================================================
 # Standalone SBS stacked barplot
-# ============================================================
-
 sbs_colors <- c(
   "Clock-like/Aging" = "#4E79A7",
   "APOBEC/AID" = "#E15759",
@@ -169,7 +206,10 @@ p_sbs <- ggplot(
 ) +
   geom_col(width = 0.9) +
   scale_fill_manual(values = sbs_colors, drop = FALSE) +
-  scale_y_continuous(labels = percent_format(accuracy = 1), expand = c(0, 0)) +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    expand = c(0, 0)
+  ) +
   labs(
     title = "SBS biological categories",
     x = "Sample",
@@ -200,12 +240,11 @@ ggsave(
   height = 6,
   dpi = 300
 )
-```
-```{r}
-# ============================================================
-# Integrated mutation heatmap with SBS bottom annotation
-# ============================================================
 
+```
+
+```{r}
+# Select breast cancer genes (Pedram razavi et.al cancer cell, 2018 )
 breast_genes <- c(
   "ERBB2", "FGFR1", "NF1", "GNAS", "PAK1", "PIK3CA", "PTEN",
   "AKT1", "GATA3", "ESR1", "FOXA1", "ARID1A", "TBX3", "MYC",
@@ -217,12 +256,28 @@ present_breast_genes <- breast_genes[
   breast_genes %in% maf_nonsilent@gene.summary$Hugo_Symbol
 ]
 
+if (length(present_breast_genes) == 0) {
+  stop("None of the selected breast cancer genes are present in the MAF.")
+}
+
+fwrite(
+  data.table(Gene = present_breast_genes),
+  file = file.path(table_dir, "Tier1_common_present_breast_genes_for_SBS_heatmap.tsv"),
+  sep = "\t"
+)
+
 present_breast_genes
 ```
-```{r}
-# Create mutation matrix for oncoPrint-style heatmap
 
-# Make sure Variant_Classification is character
+```{r}
+# Create mutation matrix
+mut_dt <- as.data.table(maf_nonsilent@data)
+
+mut_dt <- mut_dt[
+  Hugo_Symbol %in% present_breast_genes &
+    Tumor_Sample_Barcode %in% sample_order
+]
+
 mut_dt[, Variant_Classification := as.character(Variant_Classification)]
 
 collapse_mut <- function(x) {
@@ -262,14 +317,18 @@ for (i in seq_len(nrow(mut_collapsed))) {
   mut_mat[gene, sample] <- alt
 }
 
-# Remove genes with no mutation after filtering
 mut_mat <- mut_mat[rowSums(mut_mat != "") > 0, , drop = FALSE]
 
+if (nrow(mut_mat) == 0) {
+  stop("Mutation matrix is empty after filtering to selected breast cancer genes.")
+}
+
+dim(mut_mat)
+mut_mat[1:min(5, nrow(mut_mat)), 1:min(5, ncol(mut_mat)), drop = FALSE]
 ```
 
 ```{r}
 # Prepare SBS matrix for bottom annotation
-
 sbs_wide <- dcast(
   sbs_long_matched,
   sample_id ~ Biological_Categories,
@@ -279,11 +338,20 @@ sbs_wide <- dcast(
 
 sbs_wide <- sbs_wide[match(sample_order, sample_id)]
 
+for (cat in cat_levels) {
+  if (!cat %in% names(sbs_wide)) {
+    sbs_wide[, (cat) := 0]
+  }
+}
+
 sbs_bar_mat <- as.matrix(sbs_wide[, cat_levels, with = FALSE])
-rownames(sbs_bar_mat) <- sbs_wide$sample_id
+rownames(sbs_bar_mat) <- as.character(sbs_wide$sample_id)
 
-# Mutation colors
-
+dim(sbs_bar_mat)
+head(sbs_bar_mat)
+```
+```{r}
+# Define mutation colors and drawing functions
 mut_cols <- c(
   "Missense_Mutation" = "#4E79A7",
   "Nonsense_Mutation" = "#E15759",
@@ -296,17 +364,22 @@ mut_cols <- c(
   "Nonstop_Mutation" = "#9C755F",
   "Multi_Hit" = "#000000"
 )
-```
 
-```{r}
-# Keep only alteration classes present in the matrix
-present_alterations <- unique(unlist(strsplit(mut_mat[mut_mat != ""], ";")))
+present_alterations <- unique(as.vector(mut_mat[mut_mat != ""]))
 present_alterations <- present_alterations[present_alterations %in% names(mut_cols)]
+
 mut_cols_present <- mut_cols[present_alterations]
+
+if (length(mut_cols_present) == 0) {
+  stop("No mutation classes in mut_mat match mut_cols.")
+}
 
 alter_fun <- list(
   background = function(x, y, w, h) {
-    grid.rect(x, y, w, h, gp = gpar(fill = "#F2F2F2", col = "white"))
+    grid.rect(
+      x, y, w, h,
+      gp = gpar(fill = "#F2F2F2", col = "white")
+    )
   }
 )
 
@@ -323,12 +396,36 @@ for (alteration in names(mut_cols_present)) {
     }
   })
 }
+
+mut_cols_present
 ```
 
 ```{r}
-# ============================================================
-# SBS bottom annotation with manual SBS legend
-# ============================================================
+# Build integrated ComplexHeatmap oncoPrint with SBS bottom annotation
+
+top_ha <- HeatmapAnnotation(
+  Mutation_Burden = anno_oncoprint_barplot(
+    height = unit(2.0, "cm"),
+    bar_width = 1,
+    axis_param = list(
+      side = "left",
+      labels_rot = 0
+    )
+  ),
+  annotation_name_side = "left"
+)
+
+right_ha <- rowAnnotation(
+  Gene_Frequency = anno_oncoprint_barplot(
+    width = unit(2.0, "cm"),
+    bar_width = 1,
+    axis_param = list(
+      side = "bottom",
+      labels_rot = 0
+    )
+  ),
+  annotation_name_side = "top"
+)
 
 bottom_ha <- HeatmapAnnotation(
   SBS = anno_barplot(
@@ -345,44 +442,38 @@ bottom_ha <- HeatmapAnnotation(
   which = "column"
 )
 
-# Manual SBS legend
 sbs_lgd <- Legend(
   title = "SBS category",
   at = names(sbs_colors),
   legend_gp = gpar(fill = sbs_colors),
   labels = names(sbs_colors)
 )
-```
-
-```{r}
-# ============================================================
-# Oncoplot
-# ============================================================
 
 ht <- oncoPrint(
   mut_mat,
   alter_fun = alter_fun,
   col = mut_cols_present,
   get_type = function(x) strsplit(x, ";")[[1]],
+  top_annotation = top_ha,
+  right_annotation = right_ha,
   bottom_annotation = bottom_ha,
   show_column_names = TRUE,
-  column_labels = sample_order,   # original sample IDs
+  column_labels = sample_order,
   column_names_rot = 60,
-  column_names_gp = gpar(fontsize = 6),
-  row_names_gp = gpar(fontsize = 9),
+  column_names_gp = gpar(fontsize = 10),
+  row_names_gp = gpar(fontsize = 10),
   heatmap_legend_param = list(title = "Mutation type"),
   column_title = "Tier 1 common variants with SBS bottom annotation",
   pct_side = "right",
   row_names_side = "left"
 )
+
+ht
 ```
 
 
 ```{r}
-# ============================================================
-# Save Plot 
-# ============================================================
-# Save PDF
+# Save integrated heatmap
 pdf(
   file.path(plot_dir, "Tier1_common_breast_genes_with_SBS_bottom_annotation.pdf"),
   width = 20,
@@ -397,9 +488,6 @@ draw(
 )
 
 dev.off()
-
-# Save PNG
-
 
 png(
   filename = file.path(plot_dir, "Tier1_common_breast_genes_with_SBS_bottom_annotation.png"),
@@ -424,5 +512,8 @@ draw(
   annotation_legend_side = "right",
   annotation_legend_list = list(sbs_lgd)
 )
+```
+```{r}
+sessionInfo()
 ```
 
