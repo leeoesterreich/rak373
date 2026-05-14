@@ -228,16 +228,16 @@ bedtools intersect -a "$BINS" -b "$GENES" -wa -wb > "$OUT"
 echo "Wrote: $OUT"
 ```
 
-# Intersect BH-significant bins with genes (NO CNV masking)
+# Intersect BH-significant bins with genes
 
 ```bash
 module load bedtools/2.31.1
 
-BINS="/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/Broad/NST/Fragmentation_analysis/Regional_Fragment_analysis/LOLA_inputs_top3sites/Effect_size_no_cnv_masking/KW_BH/no_cnv_masking.BHsig.bins.bed"
+BINS="/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/Broad/NST/Fragmentation_analysis/Regional_Fragment_analysis/LOLA_inputs_top3sites/Effect_size_cnv_masking/KW_BH/cnv_masking.BHsig.bins.bed"
 
 GENES="/ix1/alee/LO_LAB/Personal/Rahul/Reference_genome/Human/gencode.v19.genes.bed"
 
-OUT="/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/Broad/NST/Fragmentation_analysis/Regional_Fragment_analysis/LOLA_inputs_top3sites/Effect_size_no_cnv_masking/KW_BH/no_cnv_masking.BHsig.bins.geneHits.tsv"
+OUT="/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/Broad/NST/Fragmentation_analysis/Regional_Fragment_analysis/LOLA_inputs_top3sites/Effect_size_cnv_masking/KW_BH/cnv_masking.BHsig.bins.geneHits.tsv"
 
 bedtools intersect -a "$BINS" -b "$GENES" -wa -wb > "$OUT"
 
