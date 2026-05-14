@@ -41,10 +41,8 @@ split -d -l 25 bams.coordsort.list.txt bamchunk_   # creates bamchunk_00, bamchu
 
 # 2B) Run CountReadsPerBin per chunk (produce short + long raw TSV per chunk)
 
-# 2C) Merge chunk TSVs into final short/long matrices
-# Each chunk TSV must have identical first 3 columns: chrom / start / end, followed by sample columns.
 ```
-## Step 3 — Enforce consistent bin order and verify short/long bin matching
+## Step 3 — Enforce consistent bin order and verify short/long bin matching before merging chunk TSVs into final short/long matrices
 
 Sort each chunk TSV in a fixed chromosome order (chr1–chr22 + chrX) and confirm that all chunk files (and short vs long) share identical bin rows.
 
