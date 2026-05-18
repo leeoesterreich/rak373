@@ -1,0 +1,289 @@
+---
+title: "ORA_top100_mutated_cancer_genes"
+output: html_document
+date: "2026-05-18"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# ============================================================
+# ORA analysis for top 100 mutated cancer genes vs all 949 mutated cancer genes
+# Purpose: recurrence-enriched pathways
+# Query/input:
+#   Top 100 frequently mutated cancer genes
+#
+# Background/universe:
+#   All nonsilently Oncovar mutated cancer genes (n=949) in the cohort
+#
+# Outputs:
+#   1. Reactome ORA table + bubble plot
+#   2. MSigDB Hallmark ORA table + bubble plot
+#   3. GO Biological Process ORA table + bubble plot
+# ============================================================
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  library(enrichplot)
+  library(msigdbr)
+  library(ReactomePA)
+})
+```
+```{r}
+# -------------------------------
+# Input files
+# -------------------------------
+
+top100_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Compare_TumorOnly_vs_WithPON/maftools/Tier_1_common/plots/Oncovar_gene/Tier1_common_cancerGeneList_top100_mutated_genes.tsv"
+
+background_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Compare_TumorOnly_vs_WithPON/maftools/Tier_1_common/plots/Oncovar_gene/Tier1_common_cancerGeneList_mutation_frequency_all_genes.tsv"
+
+# -------------------------------
+# Output directory
+# -------------------------------
+
+out_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Compare_TumorOnly_vs_WithPON/maftools/Tier_1_common/plots/Oncovar_gene/ORA_top100_mutated_cancer_genes"
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# -------------------------------
+# Read top 100 query genes
+# -------------------------------
+
+top100_dt <- fread(top100_file)
+
+if (!"Hugo_Symbol" %in% colnames(top100_dt)) {
+  stop("Hugo_Symbol column not found in top100 file.")
+}
+
+top_genes <- unique(toupper(trimws(top100_dt$Hugo_Symbol)))
+top_genes <- top_genes[!is.na(top_genes) & top_genes != ""]
+
+message("Top genes used for ORA query: ", length(top_genes))
+
+# -------------------------------
+# Read background genes
+# -------------------------------
+# Background = all nonsilently mutated cancer genes in the cohort
+
+background_dt <- fread(background_file)
+
+if (!"Hugo_Symbol" %in% colnames(background_dt)) {
+  stop("Hugo_Symbol column not found in background file.")
+}
+
+background_genes <- unique(toupper(trimws(background_dt$Hugo_Symbol)))
+background_genes <- background_genes[!is.na(background_genes) & background_genes != ""]
+
+message("Background genes used for ORA: ", length(background_genes))
+```
+```{r}
+# -------------------------------
+# Convert SYMBOL to ENTREZ ID
+# -------------------------------
+
+top_map <- bitr(
+  top_genes,
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = org.Hs.eg.db
+)
+
+bg_map <- bitr(
+  background_genes,
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = org.Hs.eg.db
+)
+
+top_entrez <- unique(top_map$ENTREZID)
+bg_entrez <- unique(bg_map$ENTREZID)
+
+message("Top genes mapped to Entrez: ", length(top_entrez))
+message("Background genes mapped to Entrez: ", length(bg_entrez))
+
+if (length(top_entrez) < 5) {
+  stop("Too few top genes mapped to Entrez IDs.")
+}
+
+if (length(bg_entrez) < length(top_entrez)) {
+  stop("Background Entrez gene set is smaller than query set.")
+}
+```
+```{r}
+# -------------------------------
+# Helper function:
+# -------------------------------
+
+save_ora_result <- function(
+  enrich_obj,
+  out_prefix,
+  title_text,
+  table_file,
+  show_n = 20
+) {
+  
+  enrich_dt <- as.data.table(enrich_obj)
+  
+  fwrite(
+    enrich_dt,
+    file.path(out_dir, table_file),
+    sep = "\t",
+    quote = FALSE,
+    na = ""
+  )
+  
+  message(out_prefix, " significant terms: ", nrow(enrich_dt))
+  
+  if (nrow(enrich_dt) == 0) {
+    message("No significant terms found for ", out_prefix, ". Plot skipped.")
+    return(invisible(enrich_dt))
+  }
+  
+  pdf_file <- file.path(
+    out_dir,
+    paste0(out_prefix, "_bubbleplot.pdf")
+  )
+  
+  png_file <- file.path(
+    out_dir,
+    paste0(out_prefix, "_bubbleplot.png")
+  )
+  
+  p <- dotplot(
+    enrich_obj,
+    showCategory = show_n,
+    title = title_text
+  ) +
+    theme_bw(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", size = 14),
+      axis.text.y = element_text(size = 9)
+    ) +
+    labs(
+      subtitle = paste0(
+        "Background: all nonsilently mutated cancer genes, n = ",
+        length(background_genes)
+      )
+    )
+  
+  ggsave(
+    filename = pdf_file,
+    plot = p,
+    width = 10,
+    height = 8
+  )
+  
+  ggsave(
+    filename = png_file,
+    plot = p,
+    width = 10,
+    height = 8,
+    dpi = 300
+  )
+  
+  message("Saved bubble plot:")
+  message(pdf_file)
+  message(png_file)
+  
+  invisible(enrich_dt)
+}
+```
+
+```{r}
+# ============================================================
+# Reactome pathway ORA
+# ============================================================
+
+reactome_ora <- enrichPathway(
+  gene = top_entrez,
+  universe = bg_entrez,
+  organism = "human",
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.25,
+  readable = TRUE
+)
+
+reactome_dt <- save_ora_result(
+  enrich_obj = reactome_ora,
+  out_prefix = "Reactome_ORA_top100_vs_all_mutated_cancer_genes",
+  title_text = "Reactome enrichment: top 100 mutated cancer genes",
+  table_file = "Reactome_ORA_top100_vs_all_mutated_cancer_genes.tsv",
+  show_n = 20
+)
+
+```
+```{r}
+# ============================================================
+# MSigDB Hallmark ORA
+# ============================================================
+
+# msigdbr changed argument names across versions.
+# This block supports both older and newer versions.
+
+msigdbr_args <- names(formals(msigdbr::msigdbr))
+
+if ("collection" %in% msigdbr_args) {
+  hallmark <- msigdbr::msigdbr(
+    species = "Homo sapiens",
+    collection = "H"
+  )
+} else {
+  hallmark <- msigdbr::msigdbr(
+    species = "Homo sapiens",
+    category = "H"
+  )
+}
+
+hallmark_term2gene <- as.data.table(
+  hallmark[, c("gs_name", "gene_symbol")]
+)
+
+hallmark_term2gene[, gene_symbol := toupper(trimws(gene_symbol))]
+
+hallmark_ora <- enricher(
+  gene = top_genes,
+  universe = background_genes,
+  TERM2GENE = hallmark_term2gene,
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.25
+)
+
+hallmark_dt <- save_ora_result(
+  enrich_obj = hallmark_ora,
+  out_prefix = "MSigDB_Hallmark_ORA_top100_vs_all_mutated_cancer_genes",
+  title_text = "MSigDB Hallmark enrichment: top 100 mutated cancer genes",
+  table_file = "MSigDB_Hallmark_ORA_top100_vs_all_mutated_cancer_genes.tsv",
+  show_n = 20
+)
+```
+
+```{r}
+# ============================================================
+# GO Biological Process ORA
+# ============================================================
+
+go_bp_ora <- enrichGO(
+  gene = top_entrez,
+  universe = bg_entrez,
+  OrgDb = org.Hs.eg.db,
+  keyType = "ENTREZID",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.25,
+  readable = TRUE
+)
+
+go_bp_dt <- save_ora_result(
+  enrich_obj = go_bp_ora,
+  out_prefix = "GO_BP_ORA_top100_vs_all_mutated_cancer_genes",
+  title_text = "GO Biological Process enrichment: top 100 mutated cancer genes",
+  table_file = "GO_BP_ORA_top100_vs_all_mutated_cancer_genes.tsv",
+  show_n = 20
+)
+```
+

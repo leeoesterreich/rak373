@@ -1,0 +1,159 @@
+---
+title: "Top genes across the cohort"
+output: html_document
+date: "2026-05-18"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+suppressPackageStartupMessages({
+  library(data.table)
+})
+```
+
+```{r}
+# ============================================================
+# Generate nonsilent gene-level mutation frequency table
+# from full cohort MAF
+#
+# Output:
+# Full_MAF_nonsilent_gene_mutation_frequency_all_genes.tsv
+# ============================================================
+
+# -------------------------------
+# Input MAF
+# -------------------------------
+
+maf_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Compare_TumorOnly_vs_WithPON/maftools/Tier_1_common/Combined_MAF/Tier_1_common_all_samples.combined.maf"
+
+# -------------------------------
+# Output directory
+# -------------------------------
+
+out_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Compare_TumorOnly_vs_WithPON/maftools/Tier_1_common/Combined_MAF"
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+summary_file <- file.path(
+  out_dir,
+  "Full_MAF_nonsilent_gene_mutation_frequency_all_genes.tsv"
+)
+
+# -------------------------------
+# Read MAF
+# -------------------------------
+
+maf_dt <- fread(
+  maf_file,
+  sep = "\t",
+  header = TRUE,
+  data.table = TRUE
+)
+
+required_cols <- c(
+  "Hugo_Symbol",
+  "Tumor_Sample_Barcode",
+  "Variant_Classification"
+)
+
+missing_cols <- setdiff(required_cols, colnames(maf_dt))
+
+if (length(missing_cols) > 0) {
+  stop(
+    "Missing required columns in MAF: ",
+    paste(missing_cols, collapse = ", ")
+  )
+}
+
+maf_dt[, Hugo_Symbol_clean := toupper(trimws(Hugo_Symbol))]
+
+```
+
+```{r}
+# -------------------------------
+# Define nonsilent variant classes
+# Based on observed Variant_Classification values in your MAF
+# -------------------------------
+
+nonsilent_classes <- c(
+  "Missense_Mutation",
+  "Nonsense_Mutation",
+  "Nonstop_Mutation",
+  "Frame_Shift_Del",
+  "Frame_Shift_Ins",
+  "In_Frame_Del",
+  "In_Frame_Ins",
+  "Splice_Site",
+  "Splice_Region",
+  "Translation_Start_Site"
+)
+
+# -------------------------------
+# Filter to nonsilent variants
+# -------------------------------
+
+nonsilent_maf <- maf_dt[
+  Variant_Classification %in% nonsilent_classes &
+    !is.na(Hugo_Symbol_clean) &
+    Hugo_Symbol_clean != ""
+]
+
+message("Total MAF rows: ", nrow(maf_dt))
+message("Nonsilent MAF rows: ", nrow(nonsilent_maf))
+message("Unique nonsilently mutated genes: ", uniqueN(nonsilent_maf$Hugo_Symbol_clean))
+message("Unique mutated samples: ", uniqueN(nonsilent_maf$Tumor_Sample_Barcode))
+
+```
+```{r}
+# -------------------------------
+# Rank genes by sample-level mutation frequency
+# -------------------------------
+# Mutated_Samples = number of unique samples with at least one nonsilent mutation
+# Variant_Count = total number of nonsilent variant rows in that gene
+
+total_samples <- uniqueN(nonsilent_maf$Tumor_Sample_Barcode)
+
+gene_summary <- nonsilent_maf[
+  ,
+  .(
+    Mutated_Samples = uniqueN(Tumor_Sample_Barcode),
+    Variant_Count = .N,
+    Variant_Classification = paste(
+      sort(unique(Variant_Classification)),
+      collapse = ";"
+    )
+  ),
+  by = .(Hugo_Symbol = Hugo_Symbol_clean)
+]
+
+gene_summary[
+  ,
+  Frequency_Percent := round((Mutated_Samples / total_samples) * 100, 2)
+]
+
+setorder(
+  gene_summary,
+  -Mutated_Samples,
+  -Variant_Count,
+  Hugo_Symbol
+)
+
+# -------------------------------
+# Save output table
+# -------------------------------
+
+fwrite(
+  gene_summary,
+  summary_file,
+  sep = "\t",
+  quote = FALSE,
+  na = ""
+)
+
+message("Gene frequency table saved:")
+message(summary_file)
+
+# Show top genes
+head(gene_summary, 20)
+```

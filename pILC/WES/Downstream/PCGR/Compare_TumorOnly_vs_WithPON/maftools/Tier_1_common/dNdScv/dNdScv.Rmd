@@ -1,0 +1,385 @@
+---
+title: "dNdScv"
+output: html_document
+date: "2026-05-18"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# ============================================================
+# Run dNdScv from pILC WES cohort MAF
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dndscv)
+  library(ggplot2)
+})
+
+# -----------------------------
+# Paths
+# -----------------------------
+
+base_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Compare_TumorOnly_vs_WithPON/maftools/Tier_1_common"
+
+maf_file <- file.path(
+  base_dir,
+  "Combined_MAF",
+  "Tier_1_common_all_samples.combined.maf"
+)
+
+dndscv_dir <- file.path(base_dir, "dNdScv")
+results_dir <- file.path(dndscv_dir, "results")
+dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
+
+
+stopifnot(file.exists(maf_file))
+
+message("Input MAF: ", maf_file)
+message("Output directory: ", results_dir)
+```
+
+
+```{r}
+# -----------------------------
+# Read MAF
+# -----------------------------
+# skip = "Hugo_Symbol" handles MAF files with comment/header lines
+
+maf <- fread(
+  maf_file,
+  sep = "\t",
+  header = TRUE,
+  skip = "Hugo_Symbol",
+  data.table = TRUE,
+  showProgress = TRUE
+)
+
+message("Total MAF rows: ", nrow(maf))
+
+# -----------------------------
+# Check required columns
+# -----------------------------
+
+required_cols <- c(
+  "Tumor_Sample_Barcode",
+  "Chromosome",
+  "Start_Position",
+  "Reference_Allele",
+  "Tumor_Seq_Allele2",
+  "Variant_Classification"
+)
+
+missing_cols <- setdiff(required_cols, colnames(maf))
+
+if (length(missing_cols) > 0) {
+  stop("Missing required columns: ", paste(missing_cols, collapse = ", "))
+}
+```
+
+
+```{r}
+# -----------------------------
+# Keep coding variants, including Silent
+# -----------------------------
+# Important:
+# dNdScv needs synonymous/Silent mutations to estimate the background mutation rate.
+
+coding_classes <- c(
+  "Silent",
+  "Missense_Mutation",
+  "Nonsense_Mutation",
+  "Nonstop_Mutation",
+  "Splice_Site",
+  "Splice_Region",
+  "Translation_Start_Site",
+  "Frame_Shift_Del",
+  "Frame_Shift_Ins",
+  "In_Frame_Del",
+  "In_Frame_Ins"
+)
+
+maf_coding <- maf[Variant_Classification %in% coding_classes]
+
+message("Rows after coding filter including Silent: ", nrow(maf_coding))
+```
+
+
+```{r}
+# -----------------------------
+# Optional Variant_Type filter
+# -----------------------------
+# dNdScv is safest with SNP, INS, DEL.
+# Complex multinucleotide variants are excluded and saved separately.
+
+if ("Variant_Type" %in% colnames(maf_coding)) {
+  
+  maf_excluded_variant_type <- maf_coding[
+    !Variant_Type %in% c("SNP", "INS", "DEL")
+  ]
+  
+  fwrite(
+    maf_excluded_variant_type,
+    file.path(results_dir, "dNdScv_excluded_non_SNP_INS_DEL_variants.tsv"),
+    sep = "\t"
+  )
+  
+  maf_coding <- maf_coding[Variant_Type %in% c("SNP", "INS", "DEL")]
+  
+  message("Rows after keeping SNP/INS/DEL: ", nrow(maf_coding))
+}
+```
+
+
+```{r}
+# -----------------------------
+# Prepare dNdScv 5-column input
+# -----------------------------
+
+dnds_input <- maf_coding[
+  ,
+  .(
+    sampleID = Tumor_Sample_Barcode,
+    chr      = Chromosome,
+    pos      = Start_Position,
+    ref      = Reference_Allele,
+    mut      = Tumor_Seq_Allele2
+  )
+]
+
+# Clean chromosome format
+dnds_input[, chr := gsub("^chr", "", as.character(chr), ignore.case = TRUE)]
+dnds_input[, chr := as.character(chr)]
+
+# Keep standard chromosomes
+dnds_input <- dnds_input[chr %in% c(as.character(1:22), "X", "Y")]
+
+# Clean alleles
+dnds_input[, ref := toupper(as.character(ref))]
+dnds_input[, mut := toupper(as.character(mut))]
+
+# Remove incomplete rows
+dnds_input <- dnds_input[
+  !is.na(sampleID) &
+    !is.na(chr) &
+    !is.na(pos) &
+    !is.na(ref) &
+    !is.na(mut) &
+    sampleID != "" &
+    chr != "" &
+    ref != "" &
+    mut != "" &
+    ref != "." &
+    mut != "."
+]
+
+# Remove REF == ALT
+dnds_input <- dnds_input[ref != mut]
+
+# Remove duplicate mutation records
+dnds_input <- unique(dnds_input)
+
+message("Final dNdScv input rows: ", nrow(dnds_input))
+message("Number of samples: ", length(unique(dnds_input$sampleID)))
+
+# Save dNdScv input
+fwrite(
+  dnds_input,
+  file.path(results_dir, "dNdScv_input_5col.tsv"),
+  sep = "\t"
+)
+```
+
+
+```{r}
+# -----------------------------
+# Save QC summaries
+# -----------------------------
+
+qc_variant_class <- maf_coding[
+  ,
+  .N,
+  by = Variant_Classification
+][order(-N)]
+
+fwrite(
+  qc_variant_class,
+  file.path(results_dir, "QC_variant_class_counts_used_for_dNdScv.tsv"),
+  sep = "\t"
+)
+
+qc_sample_burden <- dnds_input[
+  ,
+  .N,
+  by = sampleID
+][order(-N)]
+
+fwrite(
+  qc_sample_burden,
+  file.path(results_dir, "QC_mutation_count_per_sample_used_for_dNdScv.tsv"),
+  sep = "\t"
+)
+```
+
+
+```{r}
+# -----------------------------
+# Run dNdScv
+# -----------------------------
+# use refdb = "hg38"
+
+message("Running dNdScv...")
+
+dndsout <- dndscv(
+  mutations = as.data.frame(dnds_input),
+  refdb = "hg38",
+  outmats = TRUE
+)
+
+message("dNdScv finished.")
+
+# Save full R object
+saveRDS(
+  dndsout,
+  file.path(results_dir, "dNdScv_output_object.rds")
+)
+
+# -----------------------------
+# Export main output tables
+# -----------------------------
+
+sel_cv <- as.data.table(dndsout$sel_cv)
+
+fwrite(
+  sel_cv,
+  file.path(results_dir, "dNdScv_gene_selection_results_sel_cv.tsv"),
+  sep = "\t"
+)
+
+global_dnds <- as.data.table(
+  dndsout$globaldnds,
+  keep.rownames = "category"
+)
+
+fwrite(
+  global_dnds,
+  file.path(results_dir, "dNdScv_global_dnds.tsv"),
+  sep = "\t"
+)
+
+annotmuts <- as.data.table(dndsout$annotmuts)
+
+fwrite(
+  annotmuts,
+  file.path(results_dir, "dNdScv_annotated_mutations.tsv"),
+  sep = "\t"
+)
+
+genemuts <- as.data.table(dndsout$genemuts)
+
+fwrite(
+  genemuts,
+  file.path(results_dir, "dNdScv_gene_observed_expected_mutations.tsv"),
+  sep = "\t"
+)
+```
+
+
+```{r}
+# -----------------------------
+# Significant driver candidates
+# -----------------------------
+
+sig_q10 <- sel_cv[
+  (!is.na(qglobal_cv) & qglobal_cv < 0.10) |
+    (!is.na(qallsubs_cv) & qallsubs_cv < 0.10)
+][order(qglobal_cv, qallsubs_cv)]
+
+fwrite(
+  sig_q10,
+  file.path(results_dir, "dNdScv_significant_genes_q_lt_0.10.tsv"),
+  sep = "\t"
+)
+
+sig_q05 <- sel_cv[
+  (!is.na(qglobal_cv) & qglobal_cv < 0.05) |
+    (!is.na(qallsubs_cv) & qallsubs_cv < 0.05)
+][order(qglobal_cv, qallsubs_cv)]
+
+fwrite(
+  sig_q05,
+  file.path(results_dir, "dNdScv_significant_genes_q_lt_0.05.tsv"),
+  sep = "\t"
+)
+```
+
+
+```{r}
+# -----------------------------
+# Confidence intervals
+# -----------------------------
+
+message("Calculating gene-level confidence intervals...")
+
+ci <- geneci(dndsout)
+
+ci_dt <- as.data.table(
+  ci,
+  keep.rownames = "gene_name"
+)
+
+fwrite(
+  ci_dt,
+  file.path(results_dir, "dNdScv_gene_dnds_confidence_intervals.tsv"),
+  sep = "\t"
+)
+
+# -----------------------------
+# Simple top-gene plot
+# -----------------------------
+
+plot_dt <- copy(sel_cv)
+
+plot_dt[
+  ,
+  q_for_plot := fifelse(
+    !is.na(qglobal_cv),
+    qglobal_cv,
+    qallsubs_cv
+  )
+]
+
+plot_dt <- plot_dt[
+  is.finite(q_for_plot) & !is.na(q_for_plot)
+][order(q_for_plot)]
+
+plot_dt <- plot_dt[1:min(25, .N)]
+
+plot_dt[, gene_name := factor(gene_name, levels = rev(gene_name))]
+plot_dt[, neglog10q := -log10(q_for_plot)]
+
+pdf(
+  file.path(results_dir, "dNdScv_top25_candidate_driver_genes.pdf"),
+  width = 8,
+  height = 7
+)
+
+ggplot(plot_dt, aes(x = gene_name, y = neglog10q)) +
+  geom_col() +
+  coord_flip() +
+  theme_bw(base_size = 12) +
+  labs(
+    title = "Top candidate driver genes by dNdScv",
+    x = "Gene",
+    y = "-log10(q-value)"
+  )
+
+dev.off()
+
+message("All dNdScv outputs saved to:")
+message(results_dir)
+```
+

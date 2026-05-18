@@ -1,0 +1,329 @@
+---
+title: "ORA_all_mutated_cancer_genes_vs_all_nonsilent_genes"
+output: html_document
+date: "2026-05-18"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# ============================================================
+# ORA for all nonsilently mutated cancer genes
+# Purpose: cancer-gene-list pathway enrichment among all mutated genes
+# just to check, it is biologically biased by design because the query genes are already selected from a cancer gene list.
+# Query/input:
+#   All nonsilently mutated cancer genes in the cohort
+#   from Tier1_common_cancerGeneList_mutation_frequency_all_genes.tsv
+#
+# Background/universe:
+#   All nonsilently mutated genes in the full cohort MAF
+#
+# Outputs:
+#   1. Reactome ORA table + bubble plot
+#   2. MSigDB Hallmark ORA table + bubble plot
+#   3. GO Biological Process ORA table + bubble plot
+#   4. Combined top pathway table for PPT
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  library(ReactomePA)
+  library(enrichplot)
+  library(msigdbr)
+  library(ggplot2)
+})
+```
+
+```{r}
+# -------------------------------
+# Input files
+# -------------------------------
+
+query_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Compare_TumorOnly_vs_WithPON/maftools/Tier_1_common/plots/Oncovar_gene/Tier1_common_cancerGeneList_mutation_frequency_all_genes.tsv"
+
+maf_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Compare_TumorOnly_vs_WithPON/maftools/Tier_1_common/Combined_MAF/Tier_1_common_all_samples.combined.maf"
+
+# -------------------------------
+# Output directory
+# -------------------------------
+
+out_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Compare_TumorOnly_vs_WithPON/maftools/Tier_1_common/plots/Oncovar_gene/ORA_all_mutated_cancer_genes_vs_all_nonsilent_genes"
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# -------------------------------
+# Read query genes
+# -------------------------------
+# Query = all nonsilently mutated cancer genes in the cohort
+
+query_dt <- fread(query_file)
+
+if (!"Hugo_Symbol" %in% colnames(query_dt)) {
+  stop("Hugo_Symbol column not found in query file.")
+}
+
+query_genes <- unique(toupper(trimws(query_dt$Hugo_Symbol)))
+query_genes <- query_genes[!is.na(query_genes) & query_genes != ""]
+
+message("Query genes: all nonsilently mutated cancer genes")
+message("Number of query genes: ", length(query_genes))
+
+# -------------------------------
+# Read MAF and define background
+# -------------------------------
+# Background = all nonsilently mutated genes in the full MAF
+
+maf_dt <- fread(maf_file, sep = "\t", header = TRUE, data.table = TRUE)
+
+required_cols <- c(
+  "Hugo_Symbol",
+  "Variant_Classification"
+)
+
+missing_cols <- setdiff(required_cols, colnames(maf_dt))
+
+if (length(missing_cols) > 0) {
+  stop(
+    "Missing required columns in MAF: ",
+    paste(missing_cols, collapse = ", ")
+  )
+}
+
+maf_dt[, Hugo_Symbol_clean := toupper(trimws(Hugo_Symbol))]
+
+# Nonsilent variant classes based on your MAF
+nonsilent_classes <- c(
+  "Missense_Mutation",
+  "Nonsense_Mutation",
+  "Nonstop_Mutation",
+  "Frame_Shift_Del",
+  "Frame_Shift_Ins",
+  "In_Frame_Del",
+  "In_Frame_Ins",
+  "Splice_Site",
+  "Splice_Region",
+  "Translation_Start_Site"
+)
+
+background_genes <- unique(
+  maf_dt[
+    Variant_Classification %in% nonsilent_classes,
+    Hugo_Symbol_clean
+  ]
+)
+
+background_genes <- background_genes[
+  !is.na(background_genes) & background_genes != ""
+]
+
+message("Background genes: all nonsilently mutated genes in full MAF")
+message("Number of background genes: ", length(background_genes))
+
+```
+```{r}
+# -------------------------------
+# Convert SYMBOL to ENTREZ ID
+# -------------------------------
+
+query_map <- bitr(
+  query_genes,
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = org.Hs.eg.db
+)
+
+bg_map <- bitr(
+  background_genes,
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = org.Hs.eg.db
+)
+
+query_entrez <- unique(query_map$ENTREZID)
+bg_entrez <- unique(bg_map$ENTREZID)
+
+message("Query genes mapped to Entrez: ", length(query_entrez))
+message("Background genes mapped to Entrez: ", length(bg_entrez))
+
+if (length(query_entrez) < 5) {
+  stop("Too few query genes mapped to Entrez IDs.")
+}
+```
+```{r}
+# -------------------------------
+# Helper function
+# -------------------------------
+
+save_ora_result <- function(
+  enrich_obj,
+  out_prefix,
+  title_text,
+  table_file,
+  show_n = 20
+) {
+  
+  enrich_dt <- as.data.table(enrich_obj)
+  
+  fwrite(
+    enrich_dt,
+    file.path(out_dir, table_file),
+    sep = "\t",
+    quote = FALSE,
+    na = ""
+  )
+  
+  message(out_prefix, " significant terms: ", nrow(enrich_dt))
+  
+  if (nrow(enrich_dt) == 0) {
+    message("No significant terms found for ", out_prefix, ". Plot skipped.")
+    return(invisible(enrich_dt))
+  }
+  
+  pdf_file <- file.path(
+    out_dir,
+    paste0(out_prefix, "_bubbleplot.pdf")
+  )
+  
+  png_file <- file.path(
+    out_dir,
+    paste0(out_prefix, "_bubbleplot.png")
+  )
+  
+  p <- dotplot(
+    enrich_obj,
+    showCategory = show_n,
+    title = title_text
+  ) +
+    theme_bw(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", size = 14),
+      axis.text.y = element_text(size = 9)
+    ) +
+    labs(
+      subtitle = paste0(
+        "Background: all nonsilently mutated genes in full MAF, n = ",
+        length(background_genes)
+      )
+    )
+  
+  ggsave(
+    filename = pdf_file,
+    plot = p,
+    width = 10,
+    height = 8
+  )
+  
+  ggsave(
+    filename = png_file,
+    plot = p,
+    width = 10,
+    height = 8,
+    dpi = 300
+  )
+  
+  message("Saved bubble plot:")
+  message(pdf_file)
+  message(png_file)
+  
+  invisible(enrich_dt)
+}
+```
+```{r}
+# ============================================================
+# Reactome pathway ORA
+# ============================================================
+
+reactome_ora <- enrichPathway(
+  gene = query_entrez,
+  universe = bg_entrez,
+  organism = "human",
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.25,
+  readable = TRUE
+)
+
+reactome_dt <- save_ora_result(
+  enrich_obj = reactome_ora,
+  out_prefix = "Reactome_ORA_all_mutated_cancer_genes_vs_all_nonsilent_genes",
+  title_text = "Reactome enrichment: mutated cancer genes vs all nonsilent genes",
+  table_file = "Reactome_ORA_all_mutated_cancer_genes_vs_all_nonsilent_genes.tsv",
+  show_n = 20
+)
+```
+
+
+```{r}
+# ============================================================
+# MSigDB Hallmark ORA
+# ============================================================
+
+# msigdbr changed argument names across versions.
+# This block supports both older and newer versions.
+
+msigdbr_args <- names(formals(msigdbr::msigdbr))
+
+if ("collection" %in% msigdbr_args) {
+  hallmark <- msigdbr::msigdbr(
+    species = "Homo sapiens",
+    collection = "H"
+  )
+} else {
+  hallmark <- msigdbr::msigdbr(
+    species = "Homo sapiens",
+    category = "H"
+  )
+}
+
+hallmark_term2gene <- as.data.table(
+  hallmark[, c("gs_name", "gene_symbol")]
+)
+
+hallmark_term2gene[, gene_symbol := toupper(trimws(gene_symbol))]
+
+hallmark_ora <- enricher(
+  gene = query_genes,
+  universe = background_genes,
+  TERM2GENE = hallmark_term2gene,
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.25
+)
+
+hallmark_dt <- save_ora_result(
+  enrich_obj = hallmark_ora,
+  out_prefix = "MSigDB_Hallmark_ORA_all_mutated_cancer_genes_vs_all_nonsilent_genes",
+  title_text = "MSigDB Hallmark enrichment: mutated cancer genes vs all nonsilent genes",
+  table_file = "MSigDB_Hallmark_ORA_all_mutated_cancer_genes_vs_all_nonsilent_genes.tsv",
+  show_n = 20
+)
+```
+
+
+```{r}
+# ============================================================
+# GO Biological Process ORA
+# ============================================================
+
+go_bp_ora <- enrichGO(
+  gene = query_entrez,
+  universe = bg_entrez,
+  OrgDb = org.Hs.eg.db,
+  keyType = "ENTREZID",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.25,
+  readable = TRUE
+)
+
+go_bp_dt <- save_ora_result(
+  enrich_obj = go_bp_ora,
+  out_prefix = "GO_BP_ORA_all_mutated_cancer_genes_vs_all_nonsilent_genes",
+  title_text = "GO BP enrichment: mutated cancer genes vs all nonsilent genes",
+  table_file = "GO_BP_ORA_all_mutated_cancer_genes_vs_all_nonsilent_genes.tsv",
+  show_n = 20
+)
+
+```

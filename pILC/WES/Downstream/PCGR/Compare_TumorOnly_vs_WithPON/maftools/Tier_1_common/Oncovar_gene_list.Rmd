@@ -1,0 +1,292 @@
+---
+title: "Oncovar_gene_list"
+output: html_document
+date: "2026-05-15"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r}
+# ============================================================
+# Plot top 100 frequently mutated cancer genes from MAF
+# Based on user-provided cancerGeneList.tsv
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+  library(maftools)
+})
+```
+
+```{r}
+# -------------------------------
+# Input files
+# -------------------------------
+
+cancer_gene_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/MOFA2/Updated/cancerGeneList.tsv"
+
+maf_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Compare_TumorOnly_vs_WithPON/maftools/Tier_1_common/Combined_MAF/Tier_1_common_all_samples.combined.maf"
+
+# -------------------------------
+# Output directory
+# -------------------------------
+
+out_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Compare_TumorOnly_vs_WithPON/maftools/Tier_1_common/plots/Oncovar_gene"
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# -------------------------------
+# Read cancer gene list
+# -------------------------------
+
+cancer_dt <- fread(cancer_gene_file, sep = "\t", header = TRUE, data.table = TRUE)
+
+# Detect Hugo symbol column safely
+possible_hugo_cols <- c("Hugo Symbol", "Hugo_Symbol", "HugoSymbol", "Gene", "SYMBOL")
+
+hugo_col <- possible_hugo_cols[possible_hugo_cols %in% colnames(cancer_dt)]
+
+cancer_genes <- unique(toupper(trimws(cancer_dt[[hugo_col]])))
+cancer_genes <- cancer_genes[!is.na(cancer_genes) & cancer_genes != ""]
+
+message("Number of cancer genes: ", length(cancer_genes))
+```
+```{r}
+# -------------------------------
+# Read MAF
+# -------------------------------
+
+maf_dt <- fread(maf_file, sep = "\t", header = TRUE, data.table = TRUE)
+
+required_cols <- c(
+  "Hugo_Symbol",
+  "Tumor_Sample_Barcode",
+  "Variant_Classification"
+)
+
+missing_cols <- setdiff(required_cols, colnames(maf_dt))
+
+if (length(missing_cols) > 0) {
+  stop(
+    "Missing required columns in MAF: ",
+    paste(missing_cols, collapse = ", ")
+  )
+}
+
+maf_dt[, Hugo_Symbol_clean := toupper(trimws(Hugo_Symbol))]
+
+# -------------------------------
+# Define non-silent / protein-altering variants
+# -------------------------------
+
+nonsilent_classes <- c(
+  "Missense_Mutation",
+  "Nonsense_Mutation",
+  "Nonstop_Mutation",
+  "Frame_Shift_Del",
+  "Frame_Shift_Ins",
+  "In_Frame_Del",
+  "In_Frame_Ins",
+  "Splice_Site",
+  "Splice_Region",
+  "Translation_Start_Site"
+)
+```
+
+
+```{r}
+# -------------------------------
+# Filter MAF to cancer genes + nonsilent variants
+# -------------------------------
+
+cancer_maf <- maf_dt[
+  Hugo_Symbol_clean %in% cancer_genes &
+    Variant_Classification %in% nonsilent_classes
+]
+
+message("Total MAF rows: ", nrow(maf_dt))
+message("Cancer-gene nonsilent MAF rows: ", nrow(cancer_maf))
+
+if (nrow(cancer_maf) == 0) {
+  stop("No cancer-gene nonsilent mutations found. Please check gene symbols and variant classes.")
+}
+cat("Cancer-gene nonsilent MAF rows:", nrow(cancer_maf), "\n")
+
+cat("Unique mutated cancer genes:", uniqueN(cancer_maf$Hugo_Symbol), "\n")
+
+cat("Unique mutated samples:", uniqueN(cancer_maf$Tumor_Sample_Barcode), "\n")
+
+cat(
+  "Unique gene-sample mutation pairs:",
+  uniqueN(paste(cancer_maf$Hugo_Symbol, cancer_maf$Tumor_Sample_Barcode, sep = "__")),
+  "\n"
+)
+```
+```{r}
+# -------------------------------
+# Save filtered MAF
+# -------------------------------
+
+filtered_maf_file <- file.path(
+  out_dir,
+  "Tier1_common_cancerGeneList_nonsilent_filtered.maf"
+)
+
+fwrite(
+  cancer_maf[, !"Hugo_Symbol_clean"],
+  filtered_maf_file,
+  sep = "\t",
+  quote = FALSE,
+  na = ""
+)# -------------------------------
+# Save filtered MAF
+# -------------------------------
+
+filtered_maf_file <- file.path(
+  out_dir,
+  "Tier1_common_cancerGeneList_nonsilent_filtered.maf"
+)
+
+fwrite(
+  cancer_maf[, !"Hugo_Symbol_clean"],
+  filtered_maf_file,
+  sep = "\t",
+  quote = FALSE,
+  na = ""
+)
+
+# -------------------------------
+# Frequency summary
+# Frequency = number of unique mutated samples per gene
+# -------------------------------
+
+total_samples <- uniqueN(maf_dt$Tumor_Sample_Barcode)
+
+gene_summary <- cancer_maf[
+  ,
+  .(
+    Mutated_Samples = uniqueN(Tumor_Sample_Barcode),
+    Variant_Count = .N,
+    Variant_Classification = paste(sort(unique(Variant_Classification)), collapse = ";")
+  ),
+  by = .(Hugo_Symbol)
+]
+
+gene_summary[
+  ,
+  Frequency_Percent := round((Mutated_Samples / total_samples) * 100, 2)
+]
+
+setorder(
+  gene_summary,
+  -Mutated_Samples,
+  -Variant_Count,
+  Hugo_Symbol
+)
+
+# Save full summary
+summary_file <- file.path(
+  out_dir,
+  "Tier1_common_cancerGeneList_mutation_frequency_all_genes.tsv"
+)
+
+fwrite(
+  gene_summary,
+  summary_file,
+  sep = "\t",
+  quote = FALSE,
+  na = ""
+)
+
+# Top 100
+top100 <- head(gene_summary, 100)
+
+top100_file <- file.path(
+  out_dir,
+  "Tier1_common_cancerGeneList_top100_mutated_genes.tsv"
+)
+
+fwrite(
+  top100,
+  top50_file,
+  sep = "\t",
+  quote = FALSE,
+  na = ""
+)
+```
+
+```{r}
+# -------------------------------
+# Barplot: Top 100 frequently mutated cancer genes
+# -------------------------------
+
+top100[, Hugo_Symbol := factor(Hugo_Symbol, levels = rev(top100$Hugo_Symbol))]
+
+p <- ggplot(
+  top100,
+  aes(
+    x = Hugo_Symbol,
+    y = Mutated_Samples
+  )
+) +
+  geom_col(width = 0.75) +
+  geom_text(
+    aes(
+      label = paste0(Mutated_Samples, " / ", total_samples, " (", Frequency_Percent, "%)")
+    ),
+    hjust = -0.05,
+    size = 3
+  ) +
+  coord_flip() +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.18))
+  ) +
+  labs(
+    title = "Top 100 Frequently Mutated Cancer Genes",
+    subtitle = paste0(
+      "Filtered using cancerGeneList.tsv; frequency based on unique mutated samples, n = ",
+      total_samples,
+      " samples"
+    ),
+    x = "Cancer gene",
+    y = "Number of mutated samples"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 11),
+    axis.text.y = element_text(size = 9),
+    panel.grid.major.y = element_blank()
+  )
+
+pdf_file <- file.path(
+  out_dir,
+  "Tier1_common_cancerGeneList_top100_mutated_genes_barplot.pdf"
+)
+
+png_file <- file.path(
+  out_dir,
+  "Tier1_common_cancerGeneList_top100_mutated_genes_barplot.png"
+)
+
+ggsave(
+  filename = pdf_file,
+  plot = p,
+  width = 10,
+  height = 12
+)
+
+ggsave(
+  filename = png_file,
+  plot = p,
+  width = 10,
+  height = 12,
+  dpi = 300
+)
+```
+
+```{r}
+
+```
