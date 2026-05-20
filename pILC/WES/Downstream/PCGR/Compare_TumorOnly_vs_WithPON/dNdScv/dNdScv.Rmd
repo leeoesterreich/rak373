@@ -1,0 +1,757 @@
+---
+title: "dNdScv"
+output: html_document
+date: "2026-05-18"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# ============================================================
+# Run dNdScv from pILC WES cohort MAF
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dndscv)
+  library(ggplot2)
+})
+
+# -----------------------------
+# Paths
+# -----------------------------
+
+base_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Compare_TumorOnly_vs_WithPON"
+maf_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Compare_TumorOnly_vs_WithPON/maftools/Tier_1_common/Combined_MAF/Tier_1_common_all_samples.combined.maf"
+
+dndscv_dir <- file.path(base_dir, "dNdScv")
+results_dir <- file.path(dndscv_dir, "results")
+dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
+
+
+stopifnot(file.exists(maf_file))
+
+message("Input MAF: ", maf_file)
+message("Output directory: ", results_dir)
+```
+
+
+```{r}
+# -----------------------------
+# Read MAF
+# -----------------------------
+# skip = "Hugo_Symbol" handles MAF files with comment/header lines
+
+maf <- fread(
+  maf_file,
+  sep = "\t",
+  header = TRUE,
+  skip = "Hugo_Symbol",
+  data.table = TRUE,
+  showProgress = TRUE
+)
+
+message("Total MAF rows: ", nrow(maf))
+
+# -----------------------------
+# Check required columns
+# -----------------------------
+
+required_cols <- c(
+  "Tumor_Sample_Barcode",
+  "Chromosome",
+  "Start_Position",
+  "Reference_Allele",
+  "Tumor_Seq_Allele2",
+  "Variant_Classification"
+)
+
+missing_cols <- setdiff(required_cols, colnames(maf))
+
+if (length(missing_cols) > 0) {
+  stop("Missing required columns: ", paste(missing_cols, collapse = ", "))
+}
+```
+
+
+```{r}
+# -----------------------------
+# Keep coding variants, including Silent
+# -----------------------------
+# Important:
+# dNdScv needs synonymous/Silent mutations to estimate the background mutation rate.
+
+coding_classes <- c(
+  "Silent",
+  "Missense_Mutation",
+  "Nonsense_Mutation",
+  "Nonstop_Mutation",
+  "Splice_Site",
+  "Splice_Region",
+  "Translation_Start_Site",
+  "Frame_Shift_Del",
+  "Frame_Shift_Ins",
+  "In_Frame_Del",
+  "In_Frame_Ins"
+)
+
+maf_coding <- maf[Variant_Classification %in% coding_classes]
+
+message("Rows after coding filter including Silent: ", nrow(maf_coding))
+```
+
+
+```{r}
+# -----------------------------
+# Optional Variant_Type filter
+# -----------------------------
+# dNdScv is safest with SNP, INS, DEL.
+# Complex multinucleotide variants are excluded and saved separately.
+
+if ("Variant_Type" %in% colnames(maf_coding)) {
+  
+  maf_excluded_variant_type <- maf_coding[
+    !Variant_Type %in% c("SNP", "INS", "DEL")
+  ]
+  
+  fwrite(
+    maf_excluded_variant_type,
+    file.path(results_dir, "dNdScv_excluded_non_SNP_INS_DEL_variants.tsv"),
+    sep = "\t"
+  )
+  
+  maf_coding <- maf_coding[Variant_Type %in% c("SNP", "INS", "DEL")]
+  
+  message("Rows after keeping SNP/INS/DEL: ", nrow(maf_coding))
+}
+```
+
+
+```{r}
+# -----------------------------
+# Prepare dNdScv 5-column input
+# -----------------------------
+
+dnds_input <- maf_coding[
+  ,
+  .(
+    sampleID = Tumor_Sample_Barcode,
+    chr      = Chromosome,
+    pos      = Start_Position,
+    ref      = Reference_Allele,
+    mut      = Tumor_Seq_Allele2
+  )
+]
+
+# Clean chromosome format
+dnds_input[, chr := gsub("^chr", "", as.character(chr), ignore.case = TRUE)]
+dnds_input[, chr := as.character(chr)]
+
+# Keep standard chromosomes
+dnds_input <- dnds_input[chr %in% c(as.character(1:22), "X", "Y")]
+
+# Clean alleles
+dnds_input[, ref := toupper(as.character(ref))]
+dnds_input[, mut := toupper(as.character(mut))]
+
+# Remove incomplete rows
+dnds_input <- dnds_input[
+  !is.na(sampleID) &
+    !is.na(chr) &
+    !is.na(pos) &
+    !is.na(ref) &
+    !is.na(mut) &
+    sampleID != "" &
+    chr != "" &
+    ref != "" &
+    mut != "" &
+    ref != "." &
+    mut != "."
+]
+
+# Remove REF == ALT
+dnds_input <- dnds_input[ref != mut]
+
+# Remove duplicate mutation records
+dnds_input <- unique(dnds_input)
+
+message("Final dNdScv input rows: ", nrow(dnds_input))
+message("Number of samples: ", length(unique(dnds_input$sampleID)))
+
+# Save dNdScv input
+fwrite(
+  dnds_input,
+  file.path(results_dir, "dNdScv_input_5col.tsv"),
+  sep = "\t"
+)
+```
+
+
+```{r}
+# -----------------------------
+# Save QC summaries
+# -----------------------------
+
+qc_variant_class <- maf_coding[
+  ,
+  .N,
+  by = Variant_Classification
+][order(-N)]
+
+fwrite(
+  qc_variant_class,
+  file.path(results_dir, "QC_variant_class_counts_used_for_dNdScv.tsv"),
+  sep = "\t"
+)
+
+qc_sample_burden <- dnds_input[
+  ,
+  .N,
+  by = sampleID
+][order(-N)]
+
+fwrite(
+  qc_sample_burden,
+  file.path(results_dir, "QC_mutation_count_per_sample_used_for_dNdScv.tsv"),
+  sep = "\t"
+)
+```
+
+
+```{r}
+# -----------------------------
+# Run dNdScv
+# -----------------------------
+# use refdb = "hg38"
+
+message("Running dNdScv...")
+
+dndsout <- dndscv(
+  mutations = as.data.frame(dnds_input),
+  refdb = "hg38",
+  outmats = TRUE
+)
+
+message("dNdScv finished.")
+
+# Save full R object
+saveRDS(
+  dndsout,
+  file.path(results_dir, "dNdScv_output_object.rds")
+)
+
+# -----------------------------
+# Export main output tables
+# -----------------------------
+
+sel_cv <- as.data.table(dndsout$sel_cv)
+
+fwrite(
+  sel_cv,
+  file.path(results_dir, "dNdScv_gene_selection_results_sel_cv.tsv"),
+  sep = "\t"
+)
+
+global_dnds <- as.data.table(
+  dndsout$globaldnds,
+  keep.rownames = "category"
+)
+
+fwrite(
+  global_dnds,
+  file.path(results_dir, "dNdScv_global_dnds.tsv"),
+  sep = "\t"
+)
+
+annotmuts <- as.data.table(dndsout$annotmuts)
+
+fwrite(
+  annotmuts,
+  file.path(results_dir, "dNdScv_annotated_mutations.tsv"),
+  sep = "\t"
+)
+
+genemuts <- as.data.table(dndsout$genemuts)
+
+fwrite(
+  genemuts,
+  file.path(results_dir, "dNdScv_gene_observed_expected_mutations.tsv"),
+  sep = "\t"
+)
+```
+
+
+```{r}
+# -----------------------------
+# Significant driver candidates
+# -----------------------------
+
+sig_q10 <- sel_cv[
+  (!is.na(qglobal_cv) & qglobal_cv < 0.10) |
+    (!is.na(qallsubs_cv) & qallsubs_cv < 0.10)
+][order(qglobal_cv, qallsubs_cv)]
+
+fwrite(
+  sig_q10,
+  file.path(results_dir, "dNdScv_significant_genes_q_lt_0.10.tsv"),
+  sep = "\t"
+)
+
+sig_q05 <- sel_cv[
+  (!is.na(qglobal_cv) & qglobal_cv < 0.05) |
+    (!is.na(qallsubs_cv) & qallsubs_cv < 0.05)
+][order(qglobal_cv, qallsubs_cv)]
+
+fwrite(
+  sig_q05,
+  file.path(results_dir, "dNdScv_significant_genes_q_lt_0.05.tsv"),
+  sep = "\t"
+)
+```
+
+
+```{r}
+# -----------------------------
+# Confidence intervals
+# -----------------------------
+
+message("Calculating gene-level confidence intervals...")
+
+ci <- geneci(dndsout)
+
+ci_dt <- as.data.table(
+  ci,
+  keep.rownames = "gene_name"
+)
+
+fwrite(
+  ci_dt,
+  file.path(results_dir, "dNdScv_gene_dnds_confidence_intervals.tsv"),
+  sep = "\t"
+)
+
+# -----------------------------
+# Plot all significant genes
+# -----------------------------
+
+plot_dt <- copy(sel_cv)
+
+# Keep genes significant by either global or substitution-only test
+plot_dt <- plot_dt[
+  (!is.na(qglobal_cv) & qglobal_cv < 0.05) |
+    (!is.na(qallsubs_cv) & qallsubs_cv < 0.05)
+]
+
+# Use the best available q-value for plotting
+plot_dt[
+  ,
+  q_for_plot := pmin(
+    fifelse(is.na(qglobal_cv), Inf, qglobal_cv),
+    fifelse(is.na(qallsubs_cv), Inf, qallsubs_cv)
+  )
+]
+
+plot_dt <- plot_dt[
+  is.finite(q_for_plot) & !is.na(q_for_plot)
+][order(q_for_plot)]
+
+plot_dt[, neglog10q := -log10(q_for_plot)]
+
+# Keep all genes, ordered by significance
+plot_dt[, gene_name := factor(gene_name, levels = rev(gene_name))]
+
+# Create plot object
+p_all36 <- ggplot(plot_dt, aes(x = gene_name, y = neglog10q)) +
+  geom_col() +
+  coord_flip() +
+  theme_bw(base_size = 12) +
+  theme(
+    axis.text.y = element_text(size = 9),
+    plot.title = element_text(face = "bold")
+  ) +
+  labs(
+    title = "Significant candidate driver genes by dNdScv",
+    subtitle = "Genes significant by global or substitution-only test",
+    x = "Gene",
+    y = "-log10(best q-value)"
+  )
+
+print(p_all36)
+
+# Save PDF
+ggsave(
+  filename = file.path(results_dir, "dNdScv_all_significant_driver_genes.pdf"),
+  plot = p_all36,
+  width = 8,
+  height = 10
+)
+
+# Save PNG
+ggsave(
+  filename = file.path(results_dir, "dNdScv_all_significant_driver_genes.png"),
+  plot = p_all36,
+  width = 8,
+  height = 10,
+  dpi = 300
+)
+
+message("All dNdScv outputs saved to:")
+message(results_dir)
+```
+```{r}
+# ============================================================
+# dNdScv visualization: bubble cloud + evidence comparison
+# ============================================================
+
+library(data.table)
+library(ggplot2)
+
+results_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Compare_TumorOnly_vs_WithPON/dNdScv/results/"
+
+sel_cv <- fread(file.path(results_dir, "dNdScv_gene_selection_results_sel_cv.tsv"))
+
+# ------------------------------------------------------------
+# Helper columns
+# ------------------------------------------------------------
+
+sel_cv[, total_events := n_mis + n_non + n_spl + n_ind]
+
+sel_cv[, trunc_splice := n_non + n_spl]
+
+sel_cv[, evidence_group := fifelse(
+  !is.na(qglobal_cv) & qglobal_cv < 0.05 &
+    !is.na(qallsubs_cv) & qallsubs_cv < 0.05,
+  "Both",
+  fifelse(
+    !is.na(qglobal_cv) & qglobal_cv < 0.05,
+    "Global only",
+    fifelse(
+      !is.na(qallsubs_cv) & qallsubs_cv < 0.05,
+      "Substitution only",
+      "Not significant"
+    )
+  )
+)]
+
+sel_cv[, dominant_signal := fifelse(
+  n_ind >= pmax(n_mis, trunc_splice),
+  "Indel-dominant",
+  fifelse(
+    n_mis >= pmax(trunc_splice, n_ind),
+    "Missense-dominant",
+    "Trunc/splice-dominant"
+  )
+)]
+
+dominant_signal_colors <- c(
+  "Missense-dominant"     = "#1F78B4",  # blue
+  "Trunc/splice-dominant" = "#E31A1C",  # red
+  "Indel-dominant"        = "#6A3D9A"   # purple
+)
+
+evidence_group_colors <- c(
+  "Both"              = "#1B9E77",  # green
+  "Global only"       = "#D95F02",  # orange
+  "Substitution only" = "#7570B3",  # violet
+  "Not significant"   = "grey70"
+)
+
+sel_cv[, dominant_signal := factor(
+  dominant_signal,
+  levels = c(
+    "Missense-dominant",
+    "Trunc/splice-dominant",
+    "Indel-dominant"
+  )
+)]
+
+sel_cv[, evidence_group := factor(
+  evidence_group,
+  levels = c(
+    "Both",
+    "Global only",
+    "Substitution only",
+    "Not significant"
+  )
+)]
+
+# ============================================================
+# Plot 1: Bubble cloud of genes with qglobal_cv < 0.05
+# Bubble cloud of global significant genes
+# x-axis      = -log10(qglobal_cv)
+# y-axis      = gene name
+# bubble size = total selected mutations
+# bubble color = dominant signal type
+# ============================================================
+
+plot_dt <- sel_cv[
+  !is.na(qglobal_cv) & qglobal_cv < 0.05
+][order(qglobal_cv)]
+
+plot_dt[, neglog10_qglobal := -log10(pmax(qglobal_cv, .Machine$double.xmin))]
+
+plot_dt[, gene_name := factor(
+  gene_name,
+  levels = rev(plot_dt$gene_name)
+)]
+
+p1 <- ggplot(plot_dt, aes(
+  x = neglog10_qglobal,
+  y = gene_name,
+  size = total_events,
+  color = dominant_signal
+)) +
+  geom_point(alpha = 0.85) +
+  scale_color_manual(
+    values = dominant_signal_colors,
+    drop = FALSE
+  ) +
+  scale_size_continuous(
+    range = c(3, 10)
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.text.y = element_text(size = 10),
+    legend.position = "right"
+  ) +
+  labs(
+    title = "dNdScv candidate driver genes",
+    subtitle = "Primary analysis: global combined test (qglobal_cv < 0.05)",
+    x = expression(-log[10](qglobal_cv)),
+    y = "Gene",
+    size = "Total events",
+    color = "Dominant signal"
+  )
+
+print(p1)
+
+ggsave(
+  filename = file.path(results_dir, "dNdScv_bubble_cloud_qglobal_lt_0.05.pdf"),
+  plot = p1,
+  width = 9,
+  height = 7
+)
+
+ggsave(
+  filename = file.path(results_dir, "dNdScv_bubble_cloud_qglobal_lt_0.05.png"),
+  plot = p1,
+  width = 9,
+  height = 7,
+  dpi = 300
+)
+
+# ============================================================
+# Plot 2: qglobal_cv vs qallsubs_cv comparison
+# Comparison plot show which genes are significant in both- substitution-only vs global-only
+# x-axis = -log10(qallsubs_cv)
+# y-axis = -log10(qglobal_cv)
+# ============================================================
+
+plot2_dt <- sel_cv[
+  !is.na(qglobal_cv) & !is.na(qallsubs_cv)
+]
+
+plot2_dt[, neglog10_qglobal := -log10(pmax(qglobal_cv, .Machine$double.xmin))]
+plot2_dt[, neglog10_qallsubs := -log10(pmax(qallsubs_cv, .Machine$double.xmin))]
+
+sig_cutoff <- -log10(0.05)
+
+p2 <- ggplot(plot2_dt, aes(
+  x = neglog10_qglobal,
+  y = neglog10_qallsubs,
+  color = evidence_group
+)) +
+  geom_point(
+    aes(size = total_events),
+    alpha = 0.85
+  ) +
+  geom_vline(
+    xintercept = sig_cutoff,
+    linetype = "dashed",
+    linewidth = 0.4,
+    color = "grey40"
+  ) +
+  geom_hline(
+    yintercept = sig_cutoff,
+    linetype = "dashed",
+    linewidth = 0.4,
+    color = "grey40"
+  ) +
+  scale_color_manual(
+    values = evidence_group_colors,
+    drop = FALSE
+  ) +
+  scale_size_continuous(
+    range = c(2, 8)
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "right"
+  ) +
+  labs(
+    title = "Comparison of global and substitution-specific dNdScv evidence",
+    subtitle = "Dashed lines indicate q-value threshold of 0.05",
+    x = expression(-log[10](qglobal_cv)),
+    y = expression(-log[10](qallsubs_cv)),
+    color = "Evidence group",
+    size = "Total events"
+  )
+
+print(p2)
+
+ggsave(
+  filename = file.path(results_dir, "dNdScv_qglobal_vs_qallsubs_comparison.pdf"),
+  plot = p2,
+  width = 8,
+  height = 7
+)
+
+ggsave(
+  filename = file.path(results_dir, "dNdScv_qglobal_vs_qallsubs_comparison.png"),
+  plot = p2,
+  width = 8,
+  height = 7,
+  dpi = 300
+)
+```
+```{r}
+# ============================================================
+# Word clouds for dNdScv results
+# 1) qglobal_cv < 0.05
+# 2) qallsubs_cv < 0.05
+# ============================================================
+
+library(data.table)
+library(ggplot2)
+library(ggwordcloud)
+library(scales)
+
+# -----------------------------
+# Input
+# -----------------------------
+results_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Compare_TumorOnly_vs_WithPON/dNdScv/results/"
+
+sel_cv <- fread(
+  file.path(results_dir, "dNdScv_gene_selection_results_sel_cv.tsv")
+)
+
+# -----------------------------
+# Helper columns
+# -----------------------------
+sel_cv[, total_events := n_mis + n_non + n_spl + n_ind]
+sel_cv[, total_subs_events := n_mis + n_non + n_spl]
+
+# ============================================================
+# Function to create word cloud
+# ============================================================
+make_dndscv_wordcloud <- function(
+    dt,
+    q_col,
+    q_label,
+    burden_col,
+    subtitle_text,
+    out_prefix,
+    width = 10,
+    height = 7
+) {
+  
+  # Filter significant genes
+  plot_dt <- dt[
+    !is.na(get(q_col)) & get(q_col) < 0.05
+  ][order(get(q_col))]
+  
+  if (nrow(plot_dt) == 0) {
+    message("No significant genes found for ", q_col, ". Skipping word cloud.")
+    return(NULL)
+  }
+  
+  # Combined weight:
+  # larger words = stronger significance + higher mutation burden
+  plot_dt[, weight_plot_raw := (-log10(get(q_col))) * log2(get(burden_col) + 1)]
+  
+  # Rescale for better display
+  plot_dt[, weight_plot := rescale(weight_plot_raw, to = c(6, 22))]
+  
+  # Unique color per gene
+  gene_colors <- setNames(
+    hcl.colors(nrow(plot_dt), palette = "Dynamic"),
+    plot_dt$gene_name
+  )
+  
+  # Plot
+  p_wc <- ggplot(
+    plot_dt,
+    aes(
+      label = gene_name,
+      size = weight_plot,
+      color = gene_name
+    )
+  ) +
+    geom_text_wordcloud_area(
+      rm_outside = TRUE
+    ) +
+    scale_size_area(max_size = 20) +
+    scale_color_manual(values = gene_colors) +
+    theme_minimal(base_size = 14) +
+    theme(
+      legend.position = "none",
+      plot.title = element_text(face = "bold", size = 18, hjust = 0.5),
+      plot.subtitle = element_text(size = 12, hjust = 0.5)
+    ) +
+    labs(
+      title = "dNdScv Candidate Driver Genes",
+      subtitle = subtitle_text
+    )
+  
+  print(p_wc)
+  
+  # Save PNG
+  ggsave(
+    file.path(results_dir, paste0(out_prefix, ".png")),
+    plot = p_wc,
+    width = width,
+    height = height,
+    dpi = 300
+  )
+  
+  # Save PDF
+  ggsave(
+    file.path(results_dir, paste0(out_prefix, ".pdf")),
+    plot = p_wc,
+    width = width,
+    height = height
+  )
+  
+  return(p_wc)
+}
+
+# ============================================================
+# Word cloud 1: qglobal_cv < 0.05
+# Word size reflects global significance + total mutation burden
+# ============================================================
+p_wc_qglobal <- make_dndscv_wordcloud(
+  dt = sel_cv,
+  q_col = "qglobal_cv",
+  q_label = "qglobal_cv",
+  burden_col = "total_events",
+  subtitle_text = "Word size reflects global significance and total mutation burden",
+  out_prefix = "dNdScv_wordcloud_gene_colored_qglobal_lt_0.05"
+)
+
+# ============================================================
+# Word cloud 2: qallsubs_cv < 0.05
+# Word size reflects substitution significance + substitution burden
+# ============================================================
+p_wc_qallsubs <- make_dndscv_wordcloud(
+  dt = sel_cv,
+  q_col = "qallsubs_cv",
+  q_label = "qallsubs_cv",
+  burden_col = "total_subs_events",
+  subtitle_text = "Word size reflects substitution-specific significance and substitution burden",
+  out_prefix = "dNdScv_wordcloud_gene_colored_qallsubs_lt_0.05"
+)
+```
