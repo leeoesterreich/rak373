@@ -407,6 +407,7 @@ message(results_dir)
 
 library(data.table)
 library(ggplot2)
+library(ggrepel)
 
 results_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Compare_TumorOnly_vs_WithPON/dNdScv/results/"
 
@@ -559,6 +560,11 @@ plot2_dt[, neglog10_qallsubs := -log10(pmax(qallsubs_cv, .Machine$double.xmin))]
 
 sig_cutoff <- -log10(0.05)
 
+# Label only genes significant in BOTH qglobal_cv and qallsubs_cv
+both_label_dt <- plot2_dt[
+  evidence_group == "Both"
+]
+
 p2 <- ggplot(plot2_dt, aes(
   x = neglog10_qglobal,
   y = neglog10_qallsubs,
@@ -579,6 +585,19 @@ p2 <- ggplot(plot2_dt, aes(
     linetype = "dashed",
     linewidth = 0.4,
     color = "grey40"
+  ) +
+  ggrepel::geom_text_repel(
+    data = both_label_dt,
+    aes(label = gene_name),
+    color = "black",
+    fontface = "bold",
+    size = 3.3,
+    box.padding = 0.4,
+    point.padding = 0.3,
+    min.segment.length = 0,
+    max.overlaps = Inf,
+    seed = 42,
+    show.legend = FALSE
   ) +
   scale_color_manual(
     values = evidence_group_colors,
