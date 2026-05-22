@@ -10,7 +10,7 @@ knitr::opts_chunk$set(echo = TRUE)
 ```{r}
 # ============================================================
 # Plot top 100 frequently mutated cancer genes from MAF
-# Based on user-provided cancerGeneList.tsv
+# Based on cancerGeneList.tsv by OncoKB (https://www.oncokb.org/cancer-genes)
 # ============================================================
 
 suppressPackageStartupMessages({
