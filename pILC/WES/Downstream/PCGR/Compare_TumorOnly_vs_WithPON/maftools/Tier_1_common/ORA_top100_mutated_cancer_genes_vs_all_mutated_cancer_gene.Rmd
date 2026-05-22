@@ -7,7 +7,7 @@ date: "2026-05-18"
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 # ============================================================
-# ORA analysis for top 100 mutated cancer genes vs all 949 mutated cancer genes
+# ORA analysis for top 100 mutated cancer genes vs all 949 mutated cancer genes based on OncoKB cancerGeneList.tsv
 # Purpose: recurrence-enriched pathways
 # Query/input:
 #   Top 100 frequently mutated cancer genes

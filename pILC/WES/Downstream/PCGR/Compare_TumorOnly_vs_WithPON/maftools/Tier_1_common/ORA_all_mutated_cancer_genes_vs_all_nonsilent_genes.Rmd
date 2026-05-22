@@ -8,7 +8,7 @@ date: "2026-05-18"
 knitr::opts_chunk$set(echo = TRUE)
 # ============================================================
 # ORA for all nonsilently mutated cancer genes
-# Purpose: cancer-gene-list pathway enrichment among all mutated genes
+# Purpose: cancer-gene-list (by OncoKB) pathway enrichment among all mutated genes
 # just to check, it is biologically biased by design because the query genes are already selected from a cancer gene list.
 # Query/input:
 #   All nonsilently mutated cancer genes in the cohort
