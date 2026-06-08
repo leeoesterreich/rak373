@@ -1,0 +1,767 @@
+---
+title: "pILC_KEGG_ssGSEA"
+output: html_document
+date: "2026-06-07"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+suppressPackageStartupMessages({
+  library(data.table)
+  library(GSVA)
+  library(msigdbr)
+  library(AnnotationDbi)
+  library(org.Hs.eg.db)
+  library(pheatmap)
+  library(ggplot2)
+})
+```
+# Define input and output paths
+
+```{r paths}
+WORK_DIR <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/GSEA/Updated"
+
+log2tpm_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/4_Count_file_pILC/Max_TPM/tpm_matrix_pILC_log2TPM.txt"
+
+RESULT_DIR <- file.path(WORK_DIR, "results")
+PLOT_DIR   <- file.path(WORK_DIR, "plots")
+
+dir.create(RESULT_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(PLOT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+log2tpm_file
+RESULT_DIR
+PLOT_DIR
+```
+
+# Read log2TPM expression matrix
+
+```{r read-expression}
+expr_dt <- fread(log2tpm_file)
+
+dim(expr_dt)
+head(expr_dt[, 1:5])
+```
+
+```{r build-expression-matrix}
+gene_col <- colnames(expr_dt)[1]
+
+gene_ids <- as.character(expr_dt[[gene_col]])
+
+expr_mat <- as.matrix(expr_dt[, -1, with = FALSE])
+mode(expr_mat) <- "numeric"
+
+rownames(expr_mat) <- gene_ids
+
+dim(expr_mat)
+head(rownames(expr_mat), 20)
+```
+
+# Clean expression matrix
+
+```{r clean-expression}
+expr_mat_annot <- expr_mat
+
+expr_mat_annot <- expr_mat_annot[
+  !is.na(rownames(expr_mat_annot)) &
+    rownames(expr_mat_annot) != "",
+]
+
+expr_mat_annot <- expr_mat_annot[
+  rowSums(is.finite(expr_mat_annot)) == ncol(expr_mat_annot),
+]
+
+dim(expr_mat_annot)
+```
+
+# Remove duplicated gene symbols
+
+If duplicated gene symbols exist, keep the gene row with the highest mean expression.
+
+```{r remove-duplicates}
+gene_mean <- rowMeans(expr_mat_annot, na.rm = TRUE)
+
+expr_mat_annot <- expr_mat_annot[
+  order(rownames(expr_mat_annot), -gene_mean),
+]
+
+expr_mat_annot <- expr_mat_annot[!duplicated(rownames(expr_mat_annot)), ]
+
+dim(expr_mat_annot)
+head(rownames(expr_mat_annot))
+```
+
+# 9. Save cleaned gene-symbol log2TPM matrix
+
+```{r save-cleaned-expression}
+clean_expr_file <- file.path(
+  RESULT_DIR,
+  "pILC_log2TPM_gene_symbol_matrix.tsv"
+)
+
+fwrite(
+  data.table(
+    gene_symbol = rownames(expr_mat_annot),
+    expr_mat_annot
+  ),
+  clean_expr_file,
+  sep = "\t"
+)
+
+clean_expr_file
+```
+
+# Load KEGG pathway gene sets
+
+```{r load-kegg}
+get_kegg_sets <- function() {
+  kegg_sets <- tryCatch(
+    {
+      msigdbr(
+        species = "Homo sapiens",
+        collection = "C2",
+        subcollection = "CP:KEGG_LEGACY"
+      )
+    },
+    error = function(e) {
+      message("Trying older msigdbr syntax...")
+      msigdbr(
+        species = "Homo sapiens",
+        category = "C2",
+        subcategory = "CP:KEGG_LEGACY"
+      )
+    }
+  )
+  
+  return(kegg_sets)
+}
+
+kegg_sets <- get_kegg_sets()
+
+dim(kegg_sets)
+head(kegg_sets)
+```
+
+# Create KEGG pathway list.
+
+```{r create-kegg-list}
+kegg_pathways <- split(
+  kegg_sets$gene_symbol,
+  kegg_sets$gs_name
+)
+
+kegg_pathways <- lapply(kegg_pathways, unique)
+
+length(kegg_pathways)
+head(names(kegg_pathways))
+```
+
+# Check overlap between RNA-seq genes and KEGG genes
+
+```{r gene-overlap}
+all_kegg_genes <- unique(unlist(kegg_pathways))
+
+overlap_genes <- intersect(
+  rownames(expr_mat_annot),
+  all_kegg_genes
+)
+
+length(overlap_genes)
+length(overlap_genes) / length(all_kegg_genes)
+
+head(overlap_genes, 20)
+```
+# Run KEGG ssGSEA using GSVA
+
+This produces a pathway-by-sample matrix.
+
+Rows = KEGG pathways
+Columns = pILC samples
+Values = ssGSEA pathway activity scores
+
+```{r run-ssgsea}
+run_ssgsea <- function(expr_mat, pathway_list) {
+  
+  if ("ssgseaParam" %in% getNamespaceExports("GSVA")) {
+    
+    message("Using newer GSVA syntax with ssgseaParam()")
+    
+    ssgsea_param <- ssgseaParam(
+      exprData = expr_mat,
+      geneSets = pathway_list,
+      minSize = 10,
+      maxSize = 500
+    )
+    
+    scores <- gsva(ssgsea_param)
+    
+  } else {
+    
+    message("Using older GSVA syntax")
+    
+    scores <- gsva(
+      expr = expr_mat,
+      gset.idx.list = pathway_list,
+      method = "ssgsea",
+      min.sz = 10,
+      max.sz = 500,
+      verbose = TRUE
+    )
+  }
+  
+  return(scores)
+}
+
+kegg_ssgsea_scores <- run_ssgsea(
+  expr_mat = expr_mat_annot,
+  pathway_list = kegg_pathways
+)
+
+dim(kegg_ssgsea_scores)
+kegg_ssgsea_scores[1:5, 1:5]
+```
+
+# Save KEGG ssGSEA pathway scores
+
+```{r save-ssgsea}
+ssgsea_out <- file.path(
+  RESULT_DIR,
+  "pILC_KEGG_ssGSEA_pathway_scores.tsv"
+)
+
+fwrite(
+  data.table(
+    pathway = rownames(kegg_ssgsea_scores),
+    kegg_ssgsea_scores
+  ),
+  ssgsea_out,
+  sep = "\t"
+)
+
+ssgsea_out
+```
+
+# Identify most variable KEGG pathways across pILC samples
+
+Because all samples are pILC, the key question is not differential enrichment between groups. Instead, the useful question is:
+
+```text
+Which KEGG pathways show the most heterogeneity across pILC samples?
+```
+
+```{r pathway-variability}
+pathway_var <- apply(
+  kegg_ssgsea_scores,
+  1,
+  var,
+  na.rm = TRUE
+)
+
+pathway_mean <- rowMeans(
+  kegg_ssgsea_scores,
+  na.rm = TRUE
+)
+
+pathway_var_df <- data.frame(
+  pathway = names(pathway_var),
+  variance = as.numeric(pathway_var),
+  mean_score = as.numeric(pathway_mean),
+  stringsAsFactors = FALSE
+)
+
+pathway_var_df <- pathway_var_df[
+  order(-pathway_var_df$variance),
+]
+
+head(pathway_var_df, 30)
+```
+
+Save pathway variability table.
+
+```{r save-pathway-variability}
+pathway_var_out <- file.path(
+  RESULT_DIR,
+  "pILC_KEGG_ssGSEA_pathway_variability.tsv"
+)
+
+fwrite(
+  pathway_var_df,
+  pathway_var_out,
+  sep = "\t"
+)
+
+pathway_var_out
+```
+
+# Plot top 20 variable KEGG pathways
+
+```{r heatmap-top20, fig.width=10, fig.height=8}
+top_n <- 20
+
+top_variable_pathways <- pathway_var_df$pathway[1:top_n]
+
+mat_top <- kegg_ssgsea_scores[
+  top_variable_pathways,
+  ,
+  drop = FALSE
+]
+
+mat_top_z <- t(scale(t(mat_top)))
+
+rownames(mat_top_z) <- gsub("^KEGG_", "", rownames(mat_top_z))
+rownames(mat_top_z) <- gsub("^KEGG_LEGACY_", "", rownames(mat_top_z))
+rownames(mat_top_z) <- gsub("_", " ", rownames(mat_top_z))
+
+pheatmap(
+  mat_top_z,
+  clustering_distance_rows = "correlation",
+  clustering_distance_cols = "correlation",
+  clustering_method = "complete",
+  show_colnames = TRUE,
+  fontsize_row = 8,
+  main = "Top variable KEGG pathway activity across pILC samples"
+)
+```
+
+Save heatmap as PDF.
+
+```{r save-heatmap-pdf}
+heatmap_file <- file.path(
+  PLOT_DIR,
+  "Top20_variable_KEGG_ssGSEA_heatmap.pdf"
+)
+
+pdf(heatmap_file, width = 10, height = 8)
+
+pheatmap(
+  mat_top_z,
+  clustering_distance_rows = "correlation",
+  clustering_distance_cols = "correlation",
+  clustering_method = "complete",
+  show_colnames = TRUE,
+  fontsize_row = 8,
+  main = "Top variable KEGG pathway activity across pILC samples"
+)
+
+dev.off()
+
+heatmap_file
+```
+
+# Plot pathway score distribution
+
+```{r pathway-score-distribution, fig.width=7, fig.height=5}
+score_df <- data.frame(
+  score = as.numeric(kegg_ssgsea_scores)
+)
+
+ggplot(score_df, aes(x = score)) +
+  geom_histogram(bins = 50) +
+  theme_bw(base_size = 12) +
+  labs(
+    title = "Distribution of KEGG ssGSEA pathway scores",
+    x = "ssGSEA pathway score",
+    y = "Frequency"
+  )
+```
+
+Save distribution plot.
+
+```{r save-score-distribution}
+score_dist_file <- file.path(
+  PLOT_DIR,
+  "KEGG_ssGSEA_score_distribution.pdf"
+)
+
+p_score <- ggplot(score_df, aes(x = score)) +
+  geom_histogram(bins = 50) +
+  theme_bw(base_size = 12) +
+  labs(
+    title = "Distribution of KEGG ssGSEA pathway scores",
+    x = "ssGSEA pathway score",
+    y = "Frequency"
+  )
+
+ggsave(
+  filename = score_dist_file,
+  plot = p_score,
+  width = 7,
+  height = 5
+)
+
+score_dist_file
+```
+```{r}
+# ------------------------------------------------------------
+# Identify commonly enriched KEGG pathways across pILC samples
+# ------------------------------------------------------------
+
+# For each sample, define "high pathway activity" as top 25% of ssGSEA scores
+top_fraction <- 0.25
+
+high_pathway_mat <- apply(
+  kegg_ssgsea_scores,
+  2,
+  function(x) {
+    cutoff <- quantile(x, probs = 1 - top_fraction, na.rm = TRUE)
+    x >= cutoff
+  }
+)
+
+# Convert to matrix and preserve pathway/sample names
+high_pathway_mat <- as.matrix(high_pathway_mat)
+rownames(high_pathway_mat) <- rownames(kegg_ssgsea_scores)
+colnames(high_pathway_mat) <- colnames(kegg_ssgsea_scores)
+
+# Count in how many samples each pathway is high
+common_pathway_df <- data.frame(
+  pathway = rownames(kegg_ssgsea_scores),
+  n_samples_high = rowSums(high_pathway_mat),
+  percent_samples_high = rowSums(high_pathway_mat) / ncol(kegg_ssgsea_scores) * 100,
+  mean_score = rowMeans(kegg_ssgsea_scores, na.rm = TRUE),
+  median_score = apply(kegg_ssgsea_scores, 1, median, na.rm = TRUE),
+  stringsAsFactors = FALSE
+)
+
+common_pathway_df <- common_pathway_df[
+  order(
+    -common_pathway_df$n_samples_high,
+    -common_pathway_df$median_score
+  ),
+]
+
+head(common_pathway_df, 20)
+```
+```{r}
+common_pathway_out <- file.path(
+  RESULT_DIR,
+  "pILC_common_enriched_KEGG_pathways.tsv"
+)
+
+fwrite(
+  common_pathway_df,
+  common_pathway_out,
+  sep = "\t"
+)
+
+common_pathway_out
+```
+```{r}
+top_n <- 20
+
+top_common_df <- head(common_pathway_df, top_n)
+
+top_common_df$pathway_clean <- top_common_df$pathway
+top_common_df$pathway_clean <- gsub("^KEGG_", "", top_common_df$pathway_clean)
+top_common_df$pathway_clean <- gsub("_", " ", top_common_df$pathway_clean)
+
+top_common_df$pathway_clean <- factor(
+  top_common_df$pathway_clean,
+  levels = rev(top_common_df$pathway_clean)
+)
+
+p_common <- ggplot(
+  top_common_df,
+  aes(
+    x = pathway_clean,
+    y = percent_samples_high
+  )
+) +
+  geom_col() +
+  coord_flip() +
+  theme_bw(base_size = 12) +
+  labs(
+    title = "Commonly enriched KEGG pathways across pILC samples",
+    x = "KEGG pathway",
+    y = "Samples with high pathway activity (%)"
+  )
+
+p_common
+```
+```{r}
+common_barplot_file <- file.path(
+  PLOT_DIR,
+  "Top20_common_enriched_KEGG_pathways_barplot.pdf"
+)
+
+ggsave(
+  filename = common_barplot_file,
+  plot = p_common,
+  width = 9,
+  height = 8
+)
+
+common_barplot_file
+```
+```{r}
+top_common_pathways <- top_common_df$pathway
+
+mat_common <- kegg_ssgsea_scores[
+  top_common_pathways,
+  ,
+  drop = FALSE
+]
+
+# Z-score by pathway for visualization
+mat_common_z <- t(scale(t(mat_common)))
+
+rownames(mat_common_z) <- gsub("^KEGG_", "", rownames(mat_common_z))
+rownames(mat_common_z) <- gsub("_", " ", rownames(mat_common_z))
+
+pheatmap(
+  mat_common_z,
+  clustering_distance_rows = "correlation",
+  clustering_distance_cols = "correlation",
+  clustering_method = "complete",
+  show_colnames = TRUE,
+  fontsize_row = 8,
+  main = "Commonly enriched KEGG pathways across pILC samples"
+)
+```
+```{r}
+common_heatmap_file <- file.path(
+  PLOT_DIR,
+  "Top30_common_enriched_KEGG_pathways_heatmap.pdf"
+)
+
+pdf(common_heatmap_file, width = 10, height = 8)
+
+pheatmap(
+  mat_common_z,
+  clustering_distance_rows = "correlation",
+  clustering_distance_cols = "correlation",
+  clustering_method = "complete",
+  show_colnames = TRUE,
+  fontsize_row = 8,
+  main = "Commonly enriched KEGG pathways across pILC samples"
+)
+
+dev.off()
+
+common_heatmap_file
+```
+```{r}
+# Check which DNA repair-related KEGG pathways exist
+grep(
+  "REPAIR|RECOMBINATION|DNA|FANCONI|P53|CELL_CYCLE",
+  rownames(kegg_ssgsea_scores),
+  value = TRUE
+)
+```
+```{r}
+dna_repair_pathways <- c(
+  "KEGG_BASE_EXCISION_REPAIR",
+  "KEGG_DNA_REPLICATION",
+  "KEGG_HOMOLOGOUS_RECOMBINATION",
+  "KEGG_MISMATCH_REPAIR",
+  "KEGG_NUCLEOTIDE_EXCISION_REPAIR",
+  "KEGG_P53_SIGNALING_PATHWAY",
+  "KEGG_CELL_CYCLE",
+  "KEGG_CYTOSOLIC_DNA_SENSING_PATHWAY"
+)
+
+dna_repair_pathways <- intersect(
+  dna_repair_pathways,
+  rownames(kegg_ssgsea_scores)
+)
+
+dna_repair_pathways
+```
+```{r}
+dna_repair_scores <- kegg_ssgsea_scores[
+  dna_repair_pathways,
+  ,
+  drop = FALSE
+]
+
+dim(dna_repair_scores)
+
+dna_repair_scores[, 1:5]
+```
+```{r}
+dna_repair_out <- file.path(
+  RESULT_DIR,
+  "pILC_DNA_repair_DDR_KEGG_ssGSEA_scores.tsv"
+)
+
+fwrite(
+  data.table(
+    pathway = rownames(dna_repair_scores),
+    dna_repair_scores
+  ),
+  dna_repair_out,
+  sep = "\t"
+)
+
+dna_repair_out
+```
+```{r}
+dna_repair_z <- t(scale(t(dna_repair_scores)))
+
+rownames(dna_repair_z) <- gsub("^KEGG_", "", rownames(dna_repair_z))
+rownames(dna_repair_z) <- gsub("_", " ", rownames(dna_repair_z))
+
+dna_repair_heatmap_file <- file.path(
+  PLOT_DIR,
+  "DNA_repair_DDR_KEGG_ssGSEA_heatmap.pdf"
+)
+
+pdf(dna_repair_heatmap_file, width = 10, height = 5.5)
+
+pheatmap(
+  dna_repair_z,
+  clustering_distance_rows = "correlation",
+  clustering_distance_cols = "correlation",
+  clustering_method = "complete",
+  show_colnames = TRUE,
+  fontsize_row = 9,
+  main = "DNA repair and DNA damage response KEGG pathway activity in pILC"
+)
+
+dev.off()
+
+dna_repair_heatmap_file
+```
+```{r}
+dna_repair_summary <- data.frame(
+  pathway = rownames(dna_repair_scores),
+  mean_score = rowMeans(dna_repair_scores, na.rm = TRUE),
+  median_score = apply(dna_repair_scores, 1, median, na.rm = TRUE),
+  sd_score = apply(dna_repair_scores, 1, sd, na.rm = TRUE),
+  min_score = apply(dna_repair_scores, 1, min, na.rm = TRUE),
+  max_score = apply(dna_repair_scores, 1, max, na.rm = TRUE),
+  stringsAsFactors = FALSE
+)
+
+dna_repair_summary <- dna_repair_summary[
+  order(-dna_repair_summary$median_score),
+]
+
+dna_repair_summary
+```
+```{r}
+dna_repair_summary_out <- file.path(
+  RESULT_DIR,
+  "pILC_DNA_repair_DDR_KEGG_ssGSEA_summary.tsv"
+)
+
+fwrite(
+  dna_repair_summary,
+  dna_repair_summary_out,
+  sep = "\t"
+)
+
+dna_repair_summary_out
+```
+```{r}
+dna_repair_summary$pathway_clean <- dna_repair_summary$pathway
+dna_repair_summary$pathway_clean <- gsub("^KEGG_", "", dna_repair_summary$pathway_clean)
+dna_repair_summary$pathway_clean <- gsub("_", " ", dna_repair_summary$pathway_clean)
+
+dna_repair_summary$pathway_clean <- factor(
+  dna_repair_summary$pathway_clean,
+  levels = rev(dna_repair_summary$pathway_clean)
+)
+
+p_dna_repair_bar <- ggplot(
+  dna_repair_summary,
+  aes(
+    x = pathway_clean,
+    y = median_score
+  )
+) +
+  geom_col() +
+  coord_flip() +
+  theme_bw(base_size = 12) +
+  labs(
+    title = "DNA repair and DDR KEGG pathway activity in pILC",
+    x = "KEGG pathway",
+    y = "Median ssGSEA score"
+  )
+
+p_dna_repair_bar
+```
+```{r}
+dna_repair_barplot_file <- file.path(
+  PLOT_DIR,
+  "DNA_repair_DDR_KEGG_ssGSEA_barplot.pdf"
+)
+
+ggsave(
+  filename = dna_repair_barplot_file,
+  plot = p_dna_repair_bar,
+  width = 8,
+  height = 5
+)
+
+dna_repair_barplot_file
+```
+```{r}
+dna_repair_sample_score <- data.frame(
+  Sample = colnames(dna_repair_scores),
+  DNA_repair_DDR_score = colMeans(dna_repair_scores, na.rm = TRUE),
+  stringsAsFactors = FALSE
+)
+
+dna_repair_sample_score <- dna_repair_sample_score[
+  order(-dna_repair_sample_score$DNA_repair_DDR_score),
+]
+
+dna_repair_sample_score
+```
+```{r}
+dna_repair_sample_score_out <- file.path(
+  RESULT_DIR,
+  "pILC_sample_level_DNA_repair_DDR_activity_score.tsv"
+)
+
+fwrite(
+  dna_repair_sample_score,
+  dna_repair_sample_score_out,
+  sep = "\t"
+)
+
+dna_repair_sample_score_out
+```
+```{r}
+dna_repair_sample_score$Sample <- factor(
+  dna_repair_sample_score$Sample,
+  levels = dna_repair_sample_score$Sample
+)
+
+p_sample_dna_repair <- ggplot(
+  dna_repair_sample_score,
+  aes(
+    x = Sample,
+    y = DNA_repair_DDR_score
+  )
+) +
+  geom_col() +
+  theme_bw(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)
+  ) +
+  labs(
+    title = "Sample-level DNA repair and DDR pathway activity in pILC",
+    x = "Sample",
+    y = "Mean ssGSEA score across DNA repair/DDR KEGG pathways"
+  )
+
+p_sample_dna_repair
+```
+```{r}
+sample_dna_repair_file <- file.path(
+  PLOT_DIR,
+  "Sample_level_DNA_repair_DDR_activity_score.pdf"
+)
+
+ggsave(
+  filename = sample_dna_repair_file,
+  plot = p_sample_dna_repair,
+  width = 10,
+  height = 5
+)
+
+sample_dna_repair_file
+```
+

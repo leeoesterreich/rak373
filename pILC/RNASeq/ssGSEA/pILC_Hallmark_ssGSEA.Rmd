@@ -1,0 +1,443 @@
+---
+title: "MSigDB Hallmark ssGSEA Pathway Activity Analysis in pILC RNA-seq Samples"
+output: html_document
+date: "2026-06-07"
+---
+
+# Analysis overview
+
+This analysis performs sample-level pathway activity scoring in 31 pILC RNA-seq samples using the MSigDB Hallmark gene sets.
+
+Because all samples belong to the same biological group, pILC, this analysis does not perform DESeq2-based differential expression or classic preranked GSEA. Instead, the ssGSEA method is used to estimate pathway activity for each Hallmark gene set in each sample.
+
+The workflow is:
+
+```text
+log2TPM expression matrix
+        ↓
+confirm gene-symbol format
+        ↓
+load MSigDB Hallmark gene sets
+        ↓
+check gene overlap
+        ↓
+run ssGSEA using GSVA
+        ↓
+save Hallmark pathway score matrix
+        ↓
+extract DNA repair / DDR-related Hallmark programs
+        ↓
+plot heatmap, bubble plot, and sample-level DDR score
+```
+
+# Set up R environment
+
+```{r setup, message=FALSE, warning=FALSE}
+options(stringsAsFactors = FALSE)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE
+)
+```
+# Load libraries
+
+```{r load-libraries, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(data.table)
+  library(GSVA)
+  library(msigdbr)
+  library(pheatmap)
+  library(ggplot2)
+})
+```
+
+# Define input and output paths
+
+```{r paths}
+WORK_DIR <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/GSEA/Updated/Hallmark_ssGSEA"
+
+log2tpm_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/4_Count_file_pILC/Max_TPM/tpm_matrix_pILC_log2TPM.txt"
+
+RESULT_DIR <- file.path(WORK_DIR, "results")
+PLOT_DIR   <- file.path(WORK_DIR, "plots")
+
+dir.create(WORK_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(RESULT_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(PLOT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+log2tpm_file
+RESULT_DIR
+PLOT_DIR
+```
+
+# Read log2TPM expression matrix
+
+```{r read-expression}
+expr_dt <- fread(log2tpm_file)
+
+dim(expr_dt)
+head(expr_dt[, 1:5])
+```
+
+The first column should contain gene symbols.
+
+```{r build-expression-matrix}
+gene_col <- colnames(expr_dt)[1]
+
+gene_ids <- as.character(expr_dt[[gene_col]])
+
+expr_mat <- as.matrix(expr_dt[, -1, with = FALSE])
+mode(expr_mat) <- "numeric"
+
+rownames(expr_mat) <- gene_ids
+
+dim(expr_mat)
+head(rownames(expr_mat), 20)
+```
+
+# Clean expression matrix
+
+```{r clean-expression}
+expr_mat_annot <- expr_mat
+
+expr_mat_annot <- expr_mat_annot[
+  !is.na(rownames(expr_mat_annot)) &
+    rownames(expr_mat_annot) != "",
+]
+
+expr_mat_annot <- expr_mat_annot[
+  rowSums(is.finite(expr_mat_annot)) == ncol(expr_mat_annot),
+]
+
+dim(expr_mat_annot)
+```
+
+# Remove duplicated gene symbols
+
+If duplicated gene symbols exist, keep the row with the highest average expression.
+
+```{r remove-duplicated-symbols}
+gene_mean <- rowMeans(expr_mat_annot, na.rm = TRUE)
+
+expr_mat_annot <- expr_mat_annot[
+  order(rownames(expr_mat_annot), -gene_mean),
+]
+
+expr_mat_annot <- expr_mat_annot[
+  !duplicated(rownames(expr_mat_annot)),
+]
+
+dim(expr_mat_annot)
+head(rownames(expr_mat_annot))
+```
+
+# Save cleaned expression matrix
+
+```{r save-clean-expression}
+clean_expr_file <- file.path(
+  RESULT_DIR,
+  "pILC_log2TPM_gene_symbol_matrix_for_Hallmark_ssGSEA.tsv"
+)
+
+fwrite(
+  data.table(
+    gene_symbol = rownames(expr_mat_annot),
+    expr_mat_annot
+  ),
+  clean_expr_file,
+  sep = "\t"
+)
+
+clean_expr_file
+```
+
+# Load MSigDB Hallmark gene sets
+
+```{r load-hallmark}
+get_hallmark_sets <- function() {
+  
+  hallmark_sets <- tryCatch(
+    {
+      msigdbr(
+        species = "Homo sapiens",
+        collection = "H"
+      )
+    },
+    error = function(e) {
+      message("Trying older msigdbr syntax...")
+      msigdbr(
+        species = "Homo sapiens",
+        category = "H"
+      )
+    }
+  )
+  
+  return(hallmark_sets)
+}
+
+hallmark_sets <- get_hallmark_sets()
+
+dim(hallmark_sets)
+head(hallmark_sets)
+```
+
+Create Hallmark pathway list.
+
+```{r create-hallmark-list}
+hallmark_pathways <- split(
+  hallmark_sets$gene_symbol,
+  hallmark_sets$gs_name
+)
+
+hallmark_pathways <- lapply(
+  hallmark_pathways,
+  unique
+)
+
+length(hallmark_pathways)
+head(names(hallmark_pathways), 20)
+```
+
+Expected number of Hallmark gene sets is around 50.
+
+# Check overlap between expression genes and Hallmark genes
+
+```{r hallmark-gene-overlap}
+all_hallmark_genes <- unique(unlist(hallmark_pathways))
+
+overlap_hallmark_genes <- intersect(
+  rownames(expr_mat_annot),
+  all_hallmark_genes
+)
+
+length(overlap_hallmark_genes)
+length(overlap_hallmark_genes) / length(all_hallmark_genes)
+
+head(overlap_hallmark_genes, 20)
+```
+
+# Run Hallmark ssGSEA using GSVA
+
+This produces a pathway-by-sample matrix.
+
+Rows = Hallmark pathways
+Columns = pILC samples
+Values = ssGSEA pathway activity scores
+
+```{r run-hallmark-ssgsea}
+run_ssgsea <- function(expr_mat, pathway_list) {
+  
+  if ("ssgseaParam" %in% getNamespaceExports("GSVA")) {
+    
+    message("Using newer GSVA syntax with ssgseaParam()")
+    
+    ssgsea_param <- ssgseaParam(
+      exprData = expr_mat,
+      geneSets = pathway_list,
+      minSize = 10,
+      maxSize = 500
+    )
+    
+    scores <- gsva(ssgsea_param)
+    
+  } else {
+    
+    message("Using older GSVA syntax")
+    
+    scores <- gsva(
+      expr = expr_mat,
+      gset.idx.list = pathway_list,
+      method = "ssgsea",
+      min.sz = 10,
+      max.sz = 500,
+      verbose = TRUE
+    )
+  }
+  
+  return(scores)
+}
+
+hallmark_ssgsea_scores <- run_ssgsea(
+  expr_mat = expr_mat_annot,
+  pathway_list = hallmark_pathways
+)
+
+dim(hallmark_ssgsea_scores)
+hallmark_ssgsea_scores[1:5, 1:5]
+```
+
+# Save Hallmark ssGSEA score matrix
+
+```{r save-hallmark-scores}
+hallmark_ssgsea_out <- file.path(
+  RESULT_DIR,
+  "pILC_Hallmark_ssGSEA_pathway_scores.tsv"
+)
+
+fwrite(
+  data.table(
+    pathway = rownames(hallmark_ssgsea_scores),
+    hallmark_ssgsea_scores
+  ),
+  hallmark_ssgsea_out,
+  sep = "\t"
+)
+
+hallmark_ssgsea_out
+```
+
+# Plot all Hallmark pathways as heatmap
+
+Because Hallmark contains a compact set of pathways, all pathways can be shown together.
+
+```{r hallmark-all-heatmap, fig.width=10, fig.height=11}
+hallmark_z <- t(scale(t(hallmark_ssgsea_scores)))
+
+rownames(hallmark_z) <- gsub("^HALLMARK_", "", rownames(hallmark_z))
+rownames(hallmark_z) <- gsub("_", " ", rownames(hallmark_z))
+
+pheatmap(
+  hallmark_z,
+  clustering_distance_rows = "correlation",
+  clustering_distance_cols = "correlation",
+  clustering_method = "complete",
+  show_colnames = TRUE,
+  fontsize_row = 8,
+  main = "MSigDB Hallmark pathway activity across pILC samples"
+)
+```
+
+Save heatmap.
+
+```{r save-hallmark-all-heatmap}
+hallmark_heatmap_file <- file.path(
+  PLOT_DIR,
+  "pILC_Hallmark_ssGSEA_all_pathways_heatmap.pdf"
+)
+
+pdf(hallmark_heatmap_file, width = 10, height = 11)
+
+pheatmap(
+  hallmark_z,
+  clustering_distance_rows = "correlation",
+  clustering_distance_cols = "correlation",
+  clustering_method = "complete",
+  show_colnames = TRUE,
+  fontsize_row = 8,
+  main = "MSigDB Hallmark pathway activity across pILC samples"
+)
+
+dev.off()
+
+hallmark_heatmap_file
+```
+```{r}
+# ------------------------------------------------------------
+# Bubble plot summary for all Hallmark pathways
+# ------------------------------------------------------------
+
+top_fraction <- 0.25
+
+high_hallmark_mat <- apply(
+  hallmark_ssgsea_scores,
+  2,
+  function(x) {
+    cutoff <- quantile(x, probs = 1 - top_fraction, na.rm = TRUE)
+    x >= cutoff
+  }
+)
+
+high_hallmark_mat <- as.matrix(high_hallmark_mat)
+rownames(high_hallmark_mat) <- rownames(hallmark_ssgsea_scores)
+colnames(high_hallmark_mat) <- colnames(hallmark_ssgsea_scores)
+
+hallmark_bubble_df <- data.frame(
+  pathway = rownames(hallmark_ssgsea_scores),
+  mean_score = rowMeans(hallmark_ssgsea_scores, na.rm = TRUE),
+  median_score = apply(hallmark_ssgsea_scores, 1, median, na.rm = TRUE),
+  sd_score = apply(hallmark_ssgsea_scores, 1, sd, na.rm = TRUE),
+  n_samples_high = rowSums(high_hallmark_mat),
+  percent_samples_high = rowSums(high_hallmark_mat) / ncol(hallmark_ssgsea_scores) * 100,
+  stringsAsFactors = FALSE
+)
+
+hallmark_bubble_df <- hallmark_bubble_df[
+  order(-hallmark_bubble_df$median_score),
+]
+
+hallmark_bubble_df$pathway_clean <- hallmark_bubble_df$pathway
+hallmark_bubble_df$pathway_clean <- gsub("^HALLMARK_", "", hallmark_bubble_df$pathway_clean)
+hallmark_bubble_df$pathway_clean <- gsub("_", " ", hallmark_bubble_df$pathway_clean)
+
+head(hallmark_bubble_df, 20)
+```
+```{r}
+top_n <- 20
+
+top_hallmark_bubble_df <- head(hallmark_bubble_df, top_n)
+
+top_hallmark_bubble_df$pathway_clean <- factor(
+  top_hallmark_bubble_df$pathway_clean,
+  levels = rev(top_hallmark_bubble_df$pathway_clean)
+)
+```
+
+```{r}
+library(ggplot2)
+
+p_hallmark_bubble <- ggplot(
+  top_hallmark_bubble_df,
+  aes(
+    x = median_score,
+    y = pathway_clean,
+    size = percent_samples_high,
+    color = median_score
+  )
+) +
+  geom_point(alpha = 0.85) +
+  scale_size_continuous(range = c(3, 10)) +
+  theme_bw(base_size = 13) +
+  labs(
+    title = "Hallmark ssGSEA pathway activity across pILC samples",
+    x = "Median ssGSEA score",
+    y = "Hallmark pathway",
+    size = "Samples high (%)",
+    color = "Median score"
+  )
+
+p_hallmark_bubble
+```
+```{r}
+hallmark_bubble_pdf <- file.path(
+  PLOT_DIR,
+  "pILC_Hallmark_ssGSEA_top_pathways_bubbleplot.pdf"
+)
+
+hallmark_bubble_png <- file.path(
+  PLOT_DIR,
+  "pILC_Hallmark_ssGSEA_top_pathways_bubbleplot.png"
+)
+
+ggsave(
+  filename = hallmark_bubble_pdf,
+  plot = p_hallmark_bubble,
+  width = 9,
+  height = 7,
+  bg = "white"
+)
+
+ggsave(
+  filename = hallmark_bubble_png,
+  plot = p_hallmark_bubble,
+  width = 9,
+  height = 7,
+  dpi = 300,
+  bg = "white"
+)
+
+hallmark_bubble_pdf
+hallmark_bubble_png
+```
+
