@@ -1,0 +1,624 @@
+---
+title: "Longitudinal CNV Alteration Landscape in Selected Representative cfDNA Cases"
+output: html_document
+date: "2026-06-11"
+---
+These samples are selected from 6 categories (Strong increase, Strong decrease, Transient peak then drop, Rebound / fluctuating, Persistent high, Stable low)
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(data.table)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(readxl)
+library(readr)
+library(tibble)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+```
+
+```{r paths}
+# ===============================
+# Paths
+# ===============================
+
+selected_file <- "/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/AURORA/ichorCNA/Plot/Selected_representative_patients.csv"
+
+clinical_file <- "/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/AURORA/Clinical_data/Metasheet_Analysis.with_Histology_Receptor_status.xlsx"
+
+cnr_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/AURORA/CNVKit/Annotated_cnr_file"
+
+out_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/AURORA/CNVKit/Selected_patient_CNV_heatmap"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+out_pdf <- file.path(out_dir, "Selected_representative_patients_longitudinal_gene_CNV_heatmap.pdf")
+out_png <- file.path(out_dir, "Selected_representative_patients_longitudinal_gene_CNV_heatmap.png")
+
+out_matrix <- file.path(out_dir, "Selected_representative_patients_longitudinal_gene_CNV_state_matrix.tsv")
+out_annotation <- file.path(out_dir, "Selected_representative_patients_longitudinal_CNV_sample_annotation.tsv")
+out_manifest <- file.path(out_dir, "Selected_representative_patients_longitudinal_CNR_manifest.tsv")
+```
+
+```{r genes}
+# ===============================
+# Genes of interest
+# Based on Pedram Razavi et al. 2018
+# ===============================
+
+genes_of_interest <- c(
+  "ERBB2", "FGFR1", "NF1", "GNAS", "PAK1", "PIK3CA", "CDH1",
+  "AKT1", "GATA3", "ESR1", "FOXA1", "KMT2C", "ARID1A", "TBX3",
+  "MYC", "MCL1", "MAP3K1", "RECQL4", "RARA", "CCND1", "TP53"
+)
+```
+
+```{r helper-functions}
+# ===============================
+# Helper functions
+# ===============================
+
+first_non_missing <- function(x) {
+  x <- x[!is.na(x) & x != ""]
+  if (length(x) == 0) return(NA_character_)
+  return(as.character(x[1]))
+}
+
+clean_molecular_subtype <- function(x) {
+  x <- as.character(x)
+  x <- str_trim(x)
+  x <- str_replace_all(x, "\u2212", "-")  # unicode minus to normal hyphen
+  x <- str_replace_all(x, "–", "-")
+  x <- str_replace_all(x, "—", "-")
+
+  case_when(
+    x == "HR+/HER2-" ~ "HR+/HER2-",
+    x == "HR+/HER2+" ~ "HR+/HER2+",
+    x == "HR-/HER2+" ~ "HR-/HER2+",
+    x == "HR-/HER2-" ~ "HR-/HER2-",
+    TRUE ~ "Unknown"
+  )
+}
+
+clean_histology <- function(x) {
+  x <- as.character(x)
+  x <- str_trim(x)
+
+  case_when(
+    is.na(x) | x == "" ~ "other",
+    x == "Ductal" ~ "Ductal",
+    x == "Lobular" ~ "Lobular",
+    x %in% c("Mixed Ductal and Lobular", "Mixed") ~ "Mixed Ductal and Lobular",
+    x %in% c("Missing", "Unknown", "NA", "nan", "None") ~ "other",
+    TRUE ~ "other"
+  )
+}
+
+extract_patient_from_cnr <- function(x) {
+  basename(x) %>%
+    str_remove("\\.annotated\\.cnr$") %>%
+    str_extract("^[^-]+")
+}
+
+extract_sample_from_cnr <- function(x) {
+  basename(x) %>%
+    str_remove("\\.annotated\\.cnr$")
+}
+
+extract_draw_num <- function(x) {
+  nb <- str_extract(x, "NB[0-9]+")
+  as.numeric(str_remove(nb, "NB"))
+}
+
+# ===============================
+# Collapse multiple segment-level calls within one sample-gene
+# Important:
+# This does NOT collapse across longitudinal samples.
+# It only handles cases where the same gene appears in multiple CNR rows/bins
+# within the same sample.
+# ===============================
+
+collapse_sample_gene <- function(x) {
+  x <- unique(na.omit(x))
+  x <- x[x != ""]
+
+  if (length(x) == 0) return("NEUT")
+  if (all(x == "NEUT")) return("NEUT")
+
+  gain_states <- c("GAIN", "AMP", "HLAMP")
+  loss_states <- c("HETD", "HOMD")
+
+  # same sample/gene contains both gain-side and loss-side events
+  if (any(x %in% gain_states) & any(x %in% loss_states)) return("MIXED")
+
+  # strongest gain-side state
+  if ("HLAMP" %in% x) return("HLAMP")
+  if ("AMP"   %in% x) return("AMP")
+  if ("GAIN"  %in% x) return("GAIN")
+
+  # strongest loss-side state
+  if ("HOMD"  %in% x) return("HOMD")
+  if ("HETD"  %in% x) return("HETD")
+
+  return("NEUT")
+}
+```
+
+```{r selected-patients}
+# ===============================
+# Read selected representative patients
+# ===============================
+
+selected_patients <- read_csv(selected_file, show_col_types = FALSE) %>%
+  mutate(Patient_Identifier = as.character(Patient_Identifier)) %>%
+  filter(!is.na(Patient_Identifier), Patient_Identifier != "") %>%
+  distinct(Patient_Identifier)
+
+selected_ids <- selected_patients$Patient_Identifier
+
+cat("========== Selected representative patients ==========\n")
+cat("Number of selected patients:", length(selected_ids), "\n\n")
+print(selected_ids)
+```
+
+```{r find-matching-cnr-files}
+# ===============================
+# Find all annotated CNR files matching selected Patient_Identifier
+# Example:
+# ARWN-NB4.annotated.cnr
+# Patient_Identifier = ARWN
+# sample_id = ARWN-NB4
+# ===============================
+
+all_cnr_files <- list.files(
+  cnr_dir,
+  pattern = "\\.annotated\\.cnr$",
+  full.names = TRUE
+)
+
+cnr_manifest <- tibble(
+  cnr_file = all_cnr_files,
+  file_name = basename(all_cnr_files),
+  sample_id = map_chr(all_cnr_files, extract_sample_from_cnr),
+  Patient_Identifier = map_chr(all_cnr_files, extract_patient_from_cnr)
+) %>%
+  mutate(
+    draw_num = map_dbl(sample_id, extract_draw_num),
+    draw_sort = if_else(is.na(draw_num), Inf, draw_num)
+  ) %>%
+  filter(Patient_Identifier %in% selected_ids) %>%
+  arrange(Patient_Identifier, draw_sort, sample_id)
+
+matched_ids <- unique(cnr_manifest$Patient_Identifier)
+missing_ids <- setdiff(selected_ids, matched_ids)
+
+cat("========== CNR matching summary ==========\n")
+cat("Selected patients:", length(selected_ids), "\n")
+cat("Selected patients with CNR files:", length(matched_ids), "\n")
+cat("Selected patients missing CNR files:", length(missing_ids), "\n")
+cat("Total longitudinal CNR files included:", nrow(cnr_manifest), "\n\n")
+
+cat("Patients missing CNR files:\n")
+print(missing_ids)
+
+cat("\nCNR sample count per matched patient:\n")
+cnr_manifest %>%
+  count(Patient_Identifier, name = "n_cnr_samples") %>%
+  arrange(desc(n_cnr_samples), Patient_Identifier) %>%
+  print(n = Inf)
+
+cat("\nCNR files included:\n")
+cnr_manifest %>%
+  select(Patient_Identifier, sample_id, draw_num, file_name) %>%
+  print(n = Inf)
+
+if (nrow(cnr_manifest) == 0) {
+  stop("No matching CNR files found for selected Patient_Identifier values.")
+}
+```
+
+```{r clinical-annotation}
+# ===============================
+# Read clinical metasheet annotation
+# ===============================
+
+clinical_df <- read_excel(clinical_file) %>%
+  mutate(
+    Patient_Identifier = as.character(Patient_Identifier),
+
+    # Convert AUP-ARWN-NB4 to ARWN-NB4
+    sample_id = as.character(Collaborator_sample_id),
+    sample_id = str_remove(sample_id, "^AUP-"),
+
+    Histological_subtype = as.character(Histological_subtype),
+    Molecular_subtype = as.character(Molecular_subtype),
+    Tumor_Fraction = suppressWarnings(as.numeric(Tumor_Fraction))
+  ) %>%
+  group_by(Patient_Identifier, sample_id) %>%
+  summarise(
+    Histological_subtype = first_non_missing(Histological_subtype),
+    Molecular_subtype = first_non_missing(Molecular_subtype),
+    Tumor_Fraction = suppressWarnings(mean(Tumor_Fraction, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Tumor_Fraction = if_else(is.nan(Tumor_Fraction), NA_real_, Tumor_Fraction),
+    Histology_group = clean_histology(Histological_subtype),
+    Molecular_subtype_clean = clean_molecular_subtype(Molecular_subtype)
+  )
+
+sample_annot <- cnr_manifest %>%
+  left_join(
+    clinical_df,
+    by = c("sample_id", "Patient_Identifier")
+  ) %>%
+  mutate(
+    Histology_group = if_else(is.na(Histology_group), "other", Histology_group),
+    Molecular_subtype_clean = if_else(is.na(Molecular_subtype_clean), "Unknown", Molecular_subtype_clean),
+    Tumor_Fraction_percent = Tumor_Fraction * 100
+  ) %>%
+  arrange(Patient_Identifier, draw_sort, sample_id)
+
+cat("========== Annotation summary for plotted samples ==========\n\n")
+
+cat("Histology groups:\n")
+print(table(sample_annot$Histology_group, useNA = "ifany"))
+
+cat("\nMolecular subtype groups:\n")
+print(table(sample_annot$Molecular_subtype_clean, useNA = "ifany"))
+
+cat("\nSamples without clinical Tumor_Fraction annotation:\n")
+sample_annot %>%
+  filter(is.na(Tumor_Fraction)) %>%
+  select(Patient_Identifier, sample_id, file_name) %>%
+  print(n = Inf)
+```
+
+```{r read-cnr-and-use-corrected-call}
+# ===============================
+# Read CNR files and use sample-specific Corrected_Call directly
+# Example column:
+# ARWN-NB4.Corrected_Call
+# ===============================
+
+read_one_cnr <- function(cnr_file, sample_id, patient_id) {
+
+  x <- fread(cnr_file)
+
+  if (!"gene" %in% colnames(x)) {
+    stop("No 'gene' column found in: ", cnr_file)
+  }
+
+  call_col <- grep("\\.Corrected_Call$", colnames(x), value = TRUE)
+
+  if (length(call_col) == 0) {
+    stop("No '.Corrected_Call' column found in: ", cnr_file)
+  }
+
+  if (length(call_col) > 1) {
+    stop("More than one '.Corrected_Call' column found in: ", cnr_file)
+  }
+
+  x %>%
+    as_tibble() %>%
+    mutate(
+      sample_id = sample_id,
+      Patient_Identifier = patient_id,
+
+      # Use corrected CNV call directly from annotated CNR
+      cnv_state = as.character(.data[[call_col]]),
+
+      # Clean gene column
+      gene = as.character(gene),
+      gene = str_replace_all(gene, "\\s+", "")
+    ) %>%
+    separate_rows(gene, sep = ",|;") %>%
+    mutate(
+      gene = str_trim(gene),
+      cnv_state = str_trim(cnv_state),
+      cnv_state = str_to_upper(cnv_state),
+      cnv_state = if_else(is.na(cnv_state) | cnv_state == "", "NEUT", cnv_state)
+    ) %>%
+    filter(
+      gene %in% genes_of_interest
+    ) %>%
+    group_by(Patient_Identifier, sample_id, gene) %>%
+    summarise(
+      # Collapse only within same sample-gene
+      # This does not collapse longitudinal samples.
+      cnv_state = collapse_sample_gene(cnv_state),
+      n_segments = n(),
+      .groups = "drop"
+    )
+}
+
+cnv_long <- pmap_dfr(
+  list(
+    cnr_manifest$cnr_file,
+    cnr_manifest$sample_id,
+    cnr_manifest$Patient_Identifier
+  ),
+  read_one_cnr
+)
+
+# Add missing sample-gene combinations as NEUT
+# This guarantees every plotted sample has all genes of interest.
+cnv_complete <- expand_grid(
+  sample_id = cnr_manifest$sample_id,
+  gene = genes_of_interest
+) %>%
+  left_join(
+    cnr_manifest %>% select(sample_id, Patient_Identifier),
+    by = "sample_id"
+  ) %>%
+  left_join(
+    cnv_long,
+    by = c("Patient_Identifier", "sample_id", "gene")
+  ) %>%
+  mutate(
+    cnv_state = if_else(is.na(cnv_state), "NEUT", cnv_state)
+  )
+
+cat("========== CNV state summary ==========\n")
+cnv_complete %>%
+  count(cnv_state, name = "n_sample_gene_calls") %>%
+  arrange(desc(n_sample_gene_calls)) %>%
+  print(n = Inf)
+```
+
+```{r make-cnv-matrix}
+# ===============================
+# Make CNV heatmap matrix
+# Rows = genes
+# Columns = longitudinal samples
+# ===============================
+
+sample_order <- sample_annot %>%
+  arrange(Patient_Identifier, draw_sort, sample_id) %>%
+  pull(sample_id)
+
+cnv_mat <- cnv_complete %>%
+  mutate(
+    gene = factor(gene, levels = genes_of_interest),
+    sample_id = factor(sample_id, levels = sample_order)
+  ) %>%
+  select(gene, sample_id, cnv_state) %>%
+  pivot_wider(
+    names_from = sample_id,
+    values_from = cnv_state,
+    values_fill = "NEUT"
+  ) %>%
+  arrange(gene)
+
+cnv_mat_df <- as.data.frame(cnv_mat)
+rownames(cnv_mat_df) <- as.character(cnv_mat_df$gene)
+cnv_mat_df$gene <- NULL
+
+cnv_mat_df <- cnv_mat_df[genes_of_interest, sample_order, drop = FALSE]
+
+cat("========== Heatmap matrix dimension ==========\n")
+cat("Genes:", nrow(cnv_mat_df), "\n")
+cat("Samples:", ncol(cnv_mat_df), "\n")
+```
+
+```{r heatmap-annotation}
+# ===============================
+# Heatmap annotation
+# ===============================
+
+annot_df <- sample_annot %>%
+  arrange(Patient_Identifier, draw_sort, sample_id) %>%
+  select(
+    sample_id,
+    Patient_Identifier,
+    Histology_group,
+    Molecular_subtype_clean,
+    Tumor_Fraction_percent
+  ) %>%
+  as.data.frame()
+
+rownames(annot_df) <- as.character(annot_df$sample_id)
+
+# CNV colors
+cnv_cols <- c(
+  "HLAMP" = "#8B0000",
+  "AMP"   = "#D73027",
+  "GAIN"  = "#FC8D59",
+  "NEUT"  = "grey90",
+  "HETD"  = "#91BFDB",
+  "HOMD"  = "#4575B4",
+  "MIXED" = "purple"
+)
+
+histology_cols <- c(
+  "Ductal" = "#4DBBD5",
+  "Lobular" = "#E64B35",
+  "Mixed Ductal and Lobular" = "#00A087",
+  "other" = "grey70"
+)
+
+subtype_cols <- c(
+  "HR+/HER2-" = "#3C5488",
+  "HR+/HER2+" = "#F39B7F",
+  "HR-/HER2+" = "#8491B4",
+  "HR-/HER2-" = "#91D1C2",
+  "Unknown" = "grey70"
+)
+
+tfx_col_fun <- colorRamp2(
+  c(0, 10, 50, 100),
+  c("white", "lightgrey", "orange", "red")
+)
+
+top_ha <- HeatmapAnnotation(
+  Histology = annot_df$Histology_group,
+  Subtype = annot_df$Molecular_subtype_clean,
+  TFx_percent = pmin(annot_df$Tumor_Fraction_percent, 50),
+
+  col = list(
+    Histology = histology_cols,
+    Subtype = subtype_cols,
+    TFx_percent = tf_col_fun
+  ),
+
+  na_col = "grey90",
+
+  # changes the displayed annotation name on the left side
+  annotation_label = c(
+    Histology = "Histology",
+    Subtype = "Subtype",
+    TFx_percent = "TFx (in %)"
+  ),
+
+  show_legend = c(
+    Histology = TRUE,
+    Subtype = TRUE,
+    TFx_percent = TRUE
+  ),
+
+  annotation_legend_param = list(
+    Histology = list(title = "Histology"),
+    Subtype = list(title = "Subtype"),
+    TFx_percent = list(
+      title = "Tumor fraction (%)",
+      at = c(0, 10, 20, 30, 40, 50),
+      labels = c("0", "10", "20", "30", "40", "≥50")
+    )
+  ),
+
+  annotation_name_side = "left",
+  show_annotation_name = TRUE
+)
+```
+
+```{r patient-boundaries}
+# ===============================
+# Patient boundary positions for dotted vertical lines
+# ===============================
+
+patient_by_sample <- sample_annot %>%
+  arrange(Patient_Identifier, draw_sort, sample_id) %>%
+  pull(Patient_Identifier)
+
+patient_runs <- rle(patient_by_sample)
+
+boundary_positions <- cumsum(patient_runs$lengths)
+boundary_positions <- boundary_positions[-length(boundary_positions)]
+
+cat("========== Patient boundary positions ==========\n")
+print(boundary_positions)
+```
+
+```{r plot-heatmap-pdf, fig.width=18, fig.height=7}
+# ===============================
+# Plot heatmap as PDF
+# ===============================
+
+ht <- Heatmap(
+  as.matrix(cnv_mat_df),
+  name = "CNV state",
+  col = cnv_cols,
+  top_annotation = top_ha,
+
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+
+  show_row_names = TRUE,
+  row_names_side = "left",
+  show_column_names = TRUE,
+  column_names_rot = 90,
+  column_names_gp = gpar(fontsize = 7),
+  row_names_gp = gpar(fontsize = 9),
+
+  rect_gp = gpar(col = "white", lwd = 0.5),
+
+  heatmap_legend_param = list(
+    title = "CNV state",
+    at = c("HLAMP", "AMP", "GAIN", "NEUT", "HETD", "HOMD", "MIXED")
+  )
+)
+
+pdf(out_pdf, width = 18, height = 7)
+
+draw(
+  ht,
+  heatmap_legend_side = "right",
+  annotation_legend_side = "right",
+  merge_legends = TRUE
+)
+
+decorate_heatmap_body("CNV state", {
+  n_cols <- ncol(cnv_mat_df)
+
+  for (b in boundary_positions) {
+    grid.lines(
+      x = unit(c(b / n_cols, b / n_cols), "npc"),
+      y = unit(c(0, 1), "npc"),
+      gp = gpar(lty = 3, lwd = 1.2, col = "black")
+    )
+  }
+})
+
+dev.off()
+
+cat("Saved PDF:\n", out_pdf, "\n")
+```
+
+```{r plot-heatmap-png, fig.width=18, fig.height=7}
+png(out_png, width = 5400, height = 2100, res = 300)
+
+draw(
+  ht,
+  heatmap_legend_side = "right",
+  annotation_legend_side = "right",
+  merge_legends = TRUE
+)
+
+decorate_heatmap_body("CNV state", {
+  n_cols <- ncol(cnv_mat_df)
+
+  for (b in boundary_positions) {
+    grid.lines(
+      x = unit(c(b / n_cols, b / n_cols), "npc"),
+      y = unit(c(0, 1), "npc"),
+      gp = gpar(lty = 3, lwd = 1.2, col = "black")
+    )
+  }
+})
+
+dev.off()
+print (ht)
+cat("Saved PNG:\n", out_png, "\n")
+```
+
+```{r save-outputs}
+# ===============================
+# Save matrix, annotation, and manifest used for plot
+# ===============================
+
+write_tsv(
+  cnv_mat_df %>%
+    rownames_to_column("gene"),
+  out_matrix
+)
+
+write_tsv(
+  sample_annot,
+  out_annotation
+)
+
+write_tsv(
+  cnr_manifest,
+  out_manifest
+)
+
+cat("========== Saved output files ==========\n")
+cat("CNV matrix:\n", out_matrix, "\n")
+cat("Sample annotation:\n", out_annotation, "\n")
+cat("CNR manifest:\n", out_manifest, "\n")
+```
+```
+
+
