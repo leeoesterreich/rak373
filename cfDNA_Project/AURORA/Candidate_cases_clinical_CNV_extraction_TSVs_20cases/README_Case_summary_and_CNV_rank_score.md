@@ -223,22 +223,6 @@ Final case selection should also consider:
 
 ---
 
-## Suggested future use
-
-Use `CNV_rank_score` to shortlist candidate cases, then inspect the sample-level blood draw table to determine whether the case has a clear clinical story.
-
-A useful downstream case-study figure may include:
-
-```text
-Panel A: Treatment timeline
-Panel B: TFx trajectory
-Panel C: CNV burden trajectory
-Panel D: Gene-level CNV states for selected genes
-Panel E: GRIFFIN/nucleosome profile over the same timepoints
-```
-
----
-
 ## Key caution
 
 `CNV_rank_score` is not a formal biological score and should not be used alone to claim clinical or biological significance.
