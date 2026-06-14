@@ -1,0 +1,7 @@
+site_lists:
+  site_ESR1: /ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/AURORA/Griffin/griffin_nucleosome_profiling/sites/ESR1.hg38.10000.txt
+  site_TP53: /ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/AURORA/Griffin/griffin_nucleosome_profiling/sites/TP53.hg38.10000.txt
+  site_MYC: /ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/AURORA/Griffin/griffin_nucleosome_profiling/sites/MYC.hg38.10000.txt
+  site_GATA3: /ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/AURORA/Griffin/griffin_nucleosome_profiling/sites/GATA3.hg38.10000.txt
+  site_FOXA1: /ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/AURORA/Griffin/griffin_nucleosome_profiling/sites/FOXA1.hg38.10000.txt
+  site_CTCF: /ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/AURORA/Griffin/griffin_nucleosome_profiling/sites/CTCF.hg38.1000.txt

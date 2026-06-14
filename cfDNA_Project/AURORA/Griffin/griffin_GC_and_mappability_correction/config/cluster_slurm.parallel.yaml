@@ -1,0 +1,41 @@
+# cluster_slurm.yaml for Griffin GC and mappability correction
+
+__default__:
+  time: "24:00:00"
+  mem: 4G
+  ncpus: 1
+  ntasks: 1
+  output: "logs/cluster/{rule}.{wildcards.samples}.%j.out"
+  JobName: "{rule}.{wildcards.samples}"
+
+GC_counts:
+  time: "48:00:00"
+  mem: 8G
+  ncpus: 8
+  ntasks: 1
+  output: "logs/cluster/GC_counts.{wildcards.samples}.%j.out"
+  JobName: "GC_counts.{wildcards.samples}"
+
+GC_bias:
+  time: "24:00:00"
+  mem: 4G
+  ncpus: 1
+  ntasks: 1
+  output: "logs/cluster/GC_bias.{wildcards.samples}.%j.out"
+  JobName: "GC_bias.{wildcards.samples}"
+
+mappability_bias:
+  time: "48:00:00"
+  mem: 8G
+  ncpus: 8
+  ntasks: 1
+  output: "logs/cluster/mappability_bias.{wildcards.samples}.%j.out"
+  JobName: "mappability_bias.{wildcards.samples}"
+
+make_samples_yaml:
+  time: "02:00:00"
+  mem: 2G
+  ncpus: 1
+  ntasks: 1
+  output: "logs/cluster/make_samples_yaml.%j.out"
+  JobName: "make_samples_yaml"
