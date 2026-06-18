@@ -210,7 +210,7 @@ top100_file <- file.path(
 
 fwrite(
   top100,
-  top50_file,
+  top100_file,
   sep = "\t",
   quote = FALSE,
   na = ""
@@ -288,5 +288,45 @@ ggsave(
 ```
 
 ```{r}
+# -------------------------------
+# Genes altered in at least 20% of samples
+# Frequency = number of unique mutated samples per gene / total samples
+# -------------------------------
 
+altered_20pct_genes <- gene_summary[
+  Frequency_Percent >= 20
+]
+
+setorder(
+  altered_20pct_genes,
+  -Frequency_Percent,
+  -Mutated_Samples,
+  -Variant_Count,
+  Hugo_Symbol
+)
+
+altered_20pct_file <- file.path(
+  out_dir,
+  "Tier1_common_cancerGeneList_genes_altered_atleast_20percent_samples.tsv"
+)
+
+fwrite(
+  altered_20pct_genes,
+  altered_20pct_file,
+  sep = "\t",
+  quote = FALSE,
+  na = ""
+)
+
+cat(
+  "Genes altered in at least 20% samples:",
+  nrow(altered_20pct_genes),
+  "\n"
+)
+
+cat(
+  "Saved altered >=20% gene summary to:",
+  altered_20pct_file,
+  "\n"
+)
 ```

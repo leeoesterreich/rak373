@@ -1,0 +1,203 @@
+---
+title: "Oncoplot_dNdScv_Sign_gene"
+output: html_document
+date: "2026-05-20"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# ============================================================
+# Oncoplot for significant candidate driver genes from dNdScv
+# Genes are taken from the dNdScv bar plot
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(maftools)
+})
+
+# -------------------------------
+# Input MAF
+# -------------------------------
+
+maf_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Compare_TumorOnly_vs_WithPON/maftools/Tier_1_common/Combined_MAF/Tier_1_common_all_samples.combined.maf"
+
+# -------------------------------
+# Output directory
+# -------------------------------
+
+out_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Compare_TumorOnly_vs_WithPON/maftools/Tier_1_common/plots/dNdScv_gene/"
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# -------------------------------
+# dNdScv significant candidate driver genes
+# Listed in the bar plot
+# -------------------------------
+
+driver_genes <- c(
+  "CDH1", "EIF1AX", "C18orf63", "GORASP1", "ADCY2", "CTNNA1", "PIK3CA", "GGT7", "TYW1", 
+  "GNAQ", "TSPAN18", "NINJ2", "VPS39", "C9orf153", "MTMR2", "AGAP2", "RTKN", "CPLX2",
+  "ZMYM3", "CD2BP2", "TDG", "ORM1", "ERVMER34-1", "DDO", "SYTL3", "TARS2", "FOXK1",
+  "DLK2", "ZNF536", "THAP12", "JPH1", "ZNF831", "PHLDB3", "HSD17B14", "RBFOX1", "MEOX1"
+)
+
+# -------------------------------
+# Read MAF
+# -------------------------------
+
+maf_dt <- fread(
+  maf_file,
+  sep = "\t",
+  header = TRUE,
+  data.table = TRUE
+)
+
+required_cols <- c(
+  "Hugo_Symbol",
+  "Tumor_Sample_Barcode",
+  "Variant_Classification"
+)
+
+missing_cols <- setdiff(required_cols, colnames(maf_dt))
+
+if (length(missing_cols) > 0) {
+  stop(
+    "Missing required columns in MAF: ",
+    paste(missing_cols, collapse = ", ")
+  )
+}
+
+# -------------------------------
+# Check which genes are present in MAF
+# -------------------------------
+
+maf_genes <- unique(maf_dt$Hugo_Symbol)
+
+genes_present <- driver_genes[driver_genes %in% maf_genes]
+genes_missing <- setdiff(driver_genes, maf_genes)
+
+message("Total dNdScv candidate genes: ", length(driver_genes))
+message("Genes present in MAF: ", length(genes_present))
+message("Genes missing from MAF: ", length(genes_missing))
+
+if (length(genes_missing) > 0) {
+  message("Missing genes:")
+  message(paste(genes_missing, collapse = ", "))
+}
+
+if (length(genes_present) == 0) {
+  stop("None of the dNdScv candidate genes are present in the MAF.")
+}
+
+# -------------------------------
+# Save gene presence table
+# -------------------------------
+
+gene_check_dt <- data.table(
+  Hugo_Symbol = driver_genes,
+  Present_in_MAF = driver_genes %in% maf_genes
+)
+
+fwrite(
+  gene_check_dt,
+  file.path(out_dir, "dNdScv_candidate_driver_genes_MAF_presence_check.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  na = ""
+)
+
+# -------------------------------
+# Read MAF using maftools
+# -------------------------------
+
+maf_obj <- read.maf(
+  maf = maf_file,
+  useAll = TRUE,
+  verbose = FALSE
+)
+
+# -------------------------------
+# Save oncoplot PDF
+# -------------------------------
+
+pdf_file <- file.path(
+  out_dir,
+  "dNdScv_candidate_driver_genes_oncoplot.pdf"
+)
+
+pdf(
+  pdf_file,
+  width = 22,
+  height = 14,
+  onefile = FALSE
+)
+
+oncoplot(
+  maf = maf_obj,
+  genes = genes_present,
+  keepGeneOrder = TRUE,
+  removeNonMutated = FALSE,
+  sortByMutation = FALSE,
+  showTumorSampleBarcodes = TRUE,
+  draw_titv = FALSE,
+  fontSize = 1.1,
+  SampleNamefontSize = 1.5,
+  titleFontSize = 1.4,
+  legendFontSize = 1.2,
+  barcode_mar = 12,
+  gene_mar = 10,
+  barcodeSrt = 90,
+  titleText = "Significant candidate driver genes by dNdScv"
+)
+
+dev.off()
+
+# -------------------------------
+# Save oncoplot PNG
+# -------------------------------
+
+png_file <- file.path(
+  out_dir,
+  "dNdScv_candidate_driver_genes_oncoplot.png"
+)
+
+png(
+  png_file,
+  width = 6600,
+  height = 4200,
+  res = 300
+)
+
+oncoplot(
+  maf = maf_obj,
+  genes = genes_present,
+  keepGeneOrder = TRUE,
+  removeNonMutated = FALSE,
+  sortByMutation = FALSE,
+  showTumorSampleBarcodes = TRUE,
+  draw_titv = FALSE,
+  fontSize = 1.1,
+  SampleNamefontSize = 1.5,
+  barcodeSrt = 90,
+  barcode_mar = 12,
+  gene_mar = 10,
+  titleFontSize = 1.4,
+  legendFontSize = 1.1,
+  titleText = "Significant candidate driver genes by dNdScv"
+)
+
+dev.off()
+
+# -------------------------------
+# Done
+# -------------------------------
+
+message("Oncoplot saved:")
+message(pdf_file)
+message(png_file)
+```
+
