@@ -421,6 +421,116 @@ Between-treatment-lines
 No matched treatment context
 No clinical blood draw date or patient_id mapping
 ```
+## Treatment-context definition
+
+Treatment context was assigned at the **blood-draw level** by comparing each cfDNA blood draw day with the patient’s metastatic treatment timeline.
+
+Treatment start and end days were derived as:
+
+```text
+treatment_start_day = Days_From_Primary_Diagnosis
+treatment_end_day   = EndTrt_Days_From_Primary_Diagnosis
+```
+
+Only metastatic treatment categories were used to define the treatment timeline, including chemotherapy, hormonal therapy, targeted therapy, immunotherapy, and other metastatic therapies.
+
+---
+
+## Blood-draw treatment-context categories
+
+Each blood draw was assigned to one of the following treatment-context categories:
+
+### On-treatment
+
+A blood draw was classified as `On-treatment` when it occurred within a treatment interval:
+
+```text
+treatment_start_day <= blood_draw_day <= treatment_end_day
+```
+
+This required both treatment start and treatment end days to be available.
+
+### Between-treatment-lines
+
+A blood draw was classified as `Between-treatment-lines` when:
+
+```text
+a completed treatment occurred before the blood draw
+AND
+a subsequent treatment started after the blood draw
+AND
+the blood draw did not fall within an active treatment interval
+```
+
+Therefore, `Between-treatment-lines` represents an off-treatment interval after completion of a prior treatment line and before initiation of the next treatment line.
+
+### Post-treatment
+
+A blood draw was classified as `Post-treatment` when:
+
+```text
+a completed treatment occurred before the blood draw
+AND
+no subsequent treatment was recorded after the blood draw
+AND
+the blood draw did not fall within an active treatment interval
+```
+
+This means the blood draw occurred after a completed treatment in the available clinical timeline. It does not necessarily imply that no future treatment ever occurred outside the available records.
+
+### Pre-treatment
+
+A blood draw was classified as `Pre-treatment` when:
+
+```text
+no completed treatment occurred before the blood draw
+AND
+a subsequent treatment was recorded after the blood draw
+AND
+the blood draw did not fall within an active treatment interval
+```
+
+This represents a blood draw collected before the first matched treatment line in the available metastatic treatment timeline.
+
+### No matched treatment context
+
+A blood draw was classified as `No matched treatment context` when it could not be assigned to pre-treatment, on-treatment, between-treatment-lines, or post-treatment based on the available treatment timeline.
+
+This can occur when:
+
+```text
+no active treatment overlapped the draw
+AND
+no completed prior treatment was identified
+AND
+no subsequent treatment was identified
+```
+
+or when the blood draw day or patient mapping was missing.
+
+---
+
+## Final treatment-context grouping for analysis
+
+For downstream treatment-context association analysis, the original treatment-context labels were collapsed into three analysis groups:
+
+```text
+Pre-treatment
+→ Pre-treatment
+
+On-treatment
+→ On-treatment
+
+Post-treatment
+Between-treatment-lines
+→ Post-treatment/off-treatment
+
+No matched treatment context
+No clinical blood draw date or patient_id mapping
+→ Excluded
+```
+
+`Post-treatment` and `Between-treatment-lines` were combined because both represent blood draws collected outside an active treatment interval after a prior treatment exposure. This combined group was labeled `Post-treatment/off-treatment`.
 
 ## Strict active-treatment definition
 
