@@ -744,18 +744,6 @@ make_category_oncoplot <- function(category_name, genes) {
     return(NULL)
   }
 
-  # Preserve category gene order, but keep only genes present in MAF
-  present_keys <- genes_key[genes_key %in% unique(cat_maf$Gene_key)]
-
-  gene_lookup <- unique(cat_maf[, .(Gene_key, Hugo_Symbol)])
-
-  plot_genes <- sapply(
-    present_keys,
-    function(k) gene_lookup[Gene_key == k, Hugo_Symbol][1]
-  )
-
-  names(plot_genes) <- NULL
-
   # Fixed sample order from low TP number to high TP number
   plot_samples <- all_samples
 
@@ -791,6 +779,35 @@ make_category_oncoplot <- function(category_name, genes) {
     },
     by = .(Tumor_Sample_Barcode, Hugo_Symbol, Gene_key)
   ]
+
+  # ------------------------------------------------------------
+  # Order genes by alteration frequency: high to low
+  # Frequency = number of samples altered for that gene in this category
+  # Tie-breaker 1 = total MAF variant rows in that gene
+  # Tie-breaker 2 = original functional-category gene-list order
+  # ------------------------------------------------------------
+
+  gene_order_dt <- cell_dt[
+    ,
+    .(
+      n_altered_samples = uniqueN(Tumor_Sample_Barcode),
+      n_variant_rows = sum(n_variants),
+      category_order = match(Gene_key[1], genes_key)
+    ),
+    by = .(Gene_key, Hugo_Symbol)
+  ]
+
+  setorder(
+    gene_order_dt,
+    -n_altered_samples,
+    -n_variant_rows,
+    category_order,
+    Hugo_Symbol
+  )
+
+  plot_genes <- gene_order_dt$Hugo_Symbol
+  names(plot_genes) <- NULL
+
 
   category_safe <- safe_file_name(category_name)
 
