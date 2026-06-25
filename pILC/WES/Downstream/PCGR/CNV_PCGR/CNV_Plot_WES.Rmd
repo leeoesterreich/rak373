@@ -606,5 +606,70 @@ cat("[INFO] Saved PNG:", out_png, "\n")
 cat("[INFO] Saved PDF:", out_pdf, "\n")
 
 ```
+```{r}
+# ====================================================
+# Genes showing Gain in one patient and Hetdel/Homdel in another
+# ====================================================
+
+CNV_DIR <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/CNV_PCGR/Plot/Figures"
+
+cnv_long_file <- file.path(CNV_DIR, "WES_PCGR_CNV_combined_long.tsv")
+
+cnv_long <- read.delim(cnv_long_file, stringsAsFactors = FALSE)
+
+cnv_long2 <- cnv_long %>%
+  dplyr::mutate(
+    SYMBOL = trimws(SYMBOL),
+    Sample = trimws(Sample),
+    VARIANT_CLASS_norm = dplyr::case_when(
+      tolower(VARIANT_CLASS) == "gain" ~ "Gain",
+      tolower(VARIANT_CLASS) == "hetdel" ~ "Hetdel",
+      tolower(VARIANT_CLASS) == "homdel" ~ "Homdel",
+      TRUE ~ NA_character_
+    ),
+    cnv_priority = dplyr::case_when(
+      VARIANT_CLASS_norm == "Homdel" ~ 3,
+      VARIANT_CLASS_norm == "Hetdel" ~ 2,
+      VARIANT_CLASS_norm == "Gain" ~ 1,
+      TRUE ~ 0
+    )
+  ) %>%
+  dplyr::filter(!is.na(SYMBOL), SYMBOL != "", !is.na(VARIANT_CLASS_norm))
+
+# one call per gene per sample, same priority logic:
+# Homdel > Hetdel > Gain
+cnv_onecall <- cnv_long2 %>%
+  dplyr::arrange(Sample, SYMBOL, dplyr::desc(cnv_priority)) %>%
+  dplyr::distinct(Sample, SYMBOL, .keep_all = TRUE)
+
+gain_del_overlap <- cnv_onecall %>%
+  dplyr::group_by(SYMBOL) %>%
+  dplyr::summarise(
+    n_gain_samples = sum(VARIANT_CLASS_norm == "Gain"),
+    gain_samples = paste(sort(unique(Sample[VARIANT_CLASS_norm == "Gain"])), collapse = ";"),
+    n_hetdel_samples = sum(VARIANT_CLASS_norm == "Hetdel"),
+    hetdel_samples = paste(sort(unique(Sample[VARIANT_CLASS_norm == "Hetdel"])), collapse = ";"),
+    n_homdel_samples = sum(VARIANT_CLASS_norm == "Homdel"),
+    homdel_samples = paste(sort(unique(Sample[VARIANT_CLASS_norm == "Homdel"])), collapse = ";"),
+    n_deletion_samples = sum(VARIANT_CLASS_norm %in% c("Hetdel", "Homdel")),
+    deletion_samples = paste(sort(unique(Sample[VARIANT_CLASS_norm %in% c("Hetdel", "Homdel")])), collapse = ";"),
+    .groups = "drop"
+  ) %>%
+  dplyr::filter(n_gain_samples > 0, n_deletion_samples > 0) %>%
+  dplyr::arrange(dplyr::desc(n_gain_samples), dplyr::desc(n_deletion_samples), SYMBOL)
+
+write.table(
+  gain_del_overlap,
+  file.path(CNV_DIR, "WES_CNV_genes_both_Gain_and_Hetdel_Homdel.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE
+)
+
+cat("Genes with Gain in at least one patient and Hetdel/Homdel in another:", 
+    nrow(gain_del_overlap), "\n")
+
+print(gain_del_overlap)
+```
 
 

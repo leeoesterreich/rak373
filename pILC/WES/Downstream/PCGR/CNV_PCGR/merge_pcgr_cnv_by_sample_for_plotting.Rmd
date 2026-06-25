@@ -40,7 +40,7 @@ if (length(files) == 0) {
 
 # ===============================
 # Create file map
-# Strip _Tier1 / _Tier2 to get base sample name
+# Strip _Tier1 (Strong_clinical_significance) / _Tier2 (Potential_clinical_significance) to get base sample name
 # ===============================
 file_map <- tibble(
   file_path = files,
