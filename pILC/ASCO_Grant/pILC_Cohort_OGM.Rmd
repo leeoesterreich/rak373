@@ -1,0 +1,144 @@
+---
+title: "pILC_Cohort_OGM"
+output: html_document
+date: "2026-06-22"
+---
+# Samples with available Bionano OGM data
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# ---- Load Required Libraries ----
+library(readr)
+library(dplyr)
+library(tidyr)
+library(UpSetR)
+```
+
+```{r}
+# ===============================
+# Load cohort file
+# ===============================
+df <- read_csv(
+  "/ix1/alee/LO_LAB/Personal/Rahul/pILC/Grant/pILC_cohort.csv",
+  show_col_types = FALSE,
+  trim_ws = TRUE,
+  na = c("", "NA")
+)
+
+# ===============================
+# Clean column names
+# ===============================
+colnames(df) <- trimws(colnames(df))
+colnames(df) <- make.names(colnames(df), unique = TRUE)
+
+# ===============================
+# Expected platform order
+# ===============================
+platform_order <- c("OGM", "RNAseq", "IMPACTseq", "WGS", "VisiumHD", "WES", "Xenium")
+
+# Check required columns
+missing_cols <- setdiff(c("Sample", platform_order), colnames(df))
+if (length(missing_cols) > 0) {
+  stop(paste("Missing columns:", paste(missing_cols, collapse = ", ")))
+}
+
+# Keep only relevant columns
+df <- df %>%
+  select(Sample, all_of(platform_order))
+
+# ===============================
+# Keep only real sample rows
+# Sample must start with TP
+# ===============================
+df <- df %>%
+  mutate(Sample = trimws(as.character(Sample))) %>%
+  filter(grepl("^TP", Sample)) %>%
+  distinct(Sample, .keep_all = TRUE)
+
+# ===============================
+# Convert Y -> 1, all else -> 0
+# ===============================
+df_binary <- df %>%
+  mutate(across(-Sample, ~ ifelse(trimws(as.character(.)) == "Y", 1, 0))) %>%
+  mutate(across(-Sample, ~ replace_na(., 0)))
+
+# UpSet input
+df_upset <- df_binary %>%
+  select(-Sample) %>%
+  as.data.frame()
+
+# ===============================
+# Print summary
+# Order platforms by ascending sample count
+# low sample count first, high sample count last
+# ===============================
+platform_order <- names(sort(colSums(df_upset), decreasing = TRUE))
+
+cat("Platform order (ascending by sample count):\n")
+print(platform_order)
+
+cat("\nSamples per modality:\n")
+print(sort(colSums(df_upset), decreasing = TRUE))
+
+# ---- Print ----
+upset(
+  df_upset,
+  sets = platform_order,
+  nsets = length(platform_order),
+  keep.order = TRUE,
+  order.by = "freq",
+  decreasing = c(TRUE, FALSE),
+  main.bar.color = "steelblue",
+  sets.bar.color = "gray35",
+  text.scale = c(2.0, 2.0, 1.7, 1.5, 2.0, 1.8),
+  mb.ratio = c(0.65, 0.35)
+)
+
+# ---- Save Plot ----
+# ===============================
+# Save PNG
+# ===============================
+png(
+  "/ix1/alee/LO_LAB/Personal/Rahul/pILC/Grant/upset_plot.png",
+  width = 2200,
+  height = 1600,
+  res = 220
+)
+
+upset(
+  df_upset,
+  sets = platform_order,
+  nsets = length(platform_order),
+  keep.order = TRUE,
+  order.by = "freq",
+  decreasing = c(TRUE, FALSE),
+  main.bar.color = "steelblue",
+  sets.bar.color = "gray35",
+  text.scale = c(2.0, 2.0, 1.7, 1.5, 2.0, 1.8),
+  mb.ratio = c(0.65, 0.35)
+)
+
+dev.off()
+
+# ---- Save PDF ----
+pdf(
+  "/ix1/alee/LO_LAB/Personal/Rahul/pILC/Grant/upset_plot.pdf",
+  width = 14,
+  height = 10
+)
+
+upset(
+  df_upset,
+  sets = platform_order,
+  nsets = length(platform_order),
+  keep.order = TRUE,
+  order.by = "freq",
+  decreasing = c(TRUE, FALSE),
+  main.bar.color = "steelblue",
+  sets.bar.color = "gray35",
+  text.scale = c(2.0, 2.0, 1.7, 1.5, 2.0, 1.8),
+  mb.ratio = c(0.65, 0.35)
+)
+
+dev.off()
+```
+
