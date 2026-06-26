@@ -1,0 +1,328 @@
+---
+title: "Muatation_status_for selected_gene"
+output: html_document
+date: "2026-06-22"
+---
+# Mutation status for CDH1, PIK3CA, ERBB2, and ERBB3 in the 10 ER+ pILC samples with OGM data.
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r}
+# ============================================================
+# Mutation status for CDH1, PIK3CA, ERBB2, ERBB3
+# in 10 ER+ pILC samples with Bionano/OGM data
+# Source: combined Tier 1 common MAF
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(readr)
+})
+
+# -------------------------
+# Input
+# -------------------------
+maf_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Compare_TumorOnly_vs_WithPON/maftools/Tier_1_common/Combined_MAF/Tier_1_common_all_samples.combined.maf"
+
+out_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/Grant/WES"
+
+# -------------------------
+# 10 ER+ pILC samples with Bionano/OGM
+# -------------------------
+samples_10_erpos_bionano <- c(
+  "TP05-232",
+  "TP05-726",
+  "TP07-626",
+  "TP08-2202",
+  "TP11-1516",
+  "TP11-1780",
+  "TP12-880",
+  "TP13-820",
+  "TP14-385",
+  "TP15-M509"
+)
+
+# Genes requested
+genes_of_interest <- c("CDH1", "PIK3CA", "ERBB2", "ERBB3")
+
+# -------------------------
+# Read MAF
+# -------------------------
+maf <- fread(
+  maf_file,
+  data.table = FALSE,
+  sep = "\t",
+  quote = "",
+  fill = TRUE,
+  check.names = FALSE
+)
+
+cat("\nMAF dimensions:\n")
+print(dim(maf))
+
+cat("\nMAF columns:\n")
+print(colnames(maf))
+
+# -------------------------
+# Check required columns
+# -------------------------
+required_cols <- c(
+  "Tumor_Sample_Barcode",
+  "Hugo_Symbol",
+  "Variant_Classification"
+)
+
+missing_cols <- setdiff(required_cols, colnames(maf))
+
+if (length(missing_cols) > 0) {
+  stop(paste("Missing required MAF columns:", paste(missing_cols, collapse = ", ")))
+}
+
+# -------------------------
+# Harmonize sample IDs
+# Handles MAF names like TP05-232_T
+# -------------------------
+maf2 <- maf %>%
+  mutate(
+    Tumor_Sample_Barcode = trimws(as.character(Tumor_Sample_Barcode)),
+    Sample_clean = Tumor_Sample_Barcode %>%
+      str_remove("_T$") %>%
+      str_remove("_Tumor$") %>%
+      str_remove("-T$"),
+    Hugo_Symbol = trimws(as.character(Hugo_Symbol)),
+    Variant_Classification = trimws(as.character(Variant_Classification))
+  )
+
+cat("\nSamples in MAF after cleaning:\n")
+print(sort(unique(maf2$Sample_clean)))
+
+cat("\nChecking 10 ER+ Bionano samples against MAF:\n")
+sample_check <- tibble(
+  Sample = samples_10_erpos_bionano,
+  present_in_maf = Sample %in% unique(maf2$Sample_clean)
+)
+
+print(sample_check)
+
+# -------------------------
+# Non-silent / protein-altering mutation classes
+# -------------------------
+nonsilent_classes <- c(
+  "Missense_Mutation",
+  "Nonsense_Mutation",
+  "Frame_Shift_Del",
+  "Frame_Shift_Ins",
+  "In_Frame_Del",
+  "In_Frame_Ins",
+  "Splice_Site",
+  "Translation_Start_Site",
+  "Nonstop_Mutation",
+  "Start_Codon_Del",
+  "Start_Codon_Ins",
+  "Stop_Codon_Del",
+  "Stop_Codon_Ins"
+)
+
+# -------------------------
+# Filter to samples + genes
+# -------------------------
+maf_sub <- maf2 %>%
+  filter(
+    Sample_clean %in% samples_10_erpos_bionano,
+    Hugo_Symbol %in% genes_of_interest,
+    Variant_Classification %in% nonsilent_classes
+  )
+
+cat("\nDetected non-silent mutations in requested genes:\n")
+print(
+  maf_sub %>%
+    select(
+      Sample_clean,
+      Tumor_Sample_Barcode,
+      Hugo_Symbol,
+      Variant_Classification,
+      everything()
+    )
+)
+
+# -------------------------
+# Pick useful annotation columns if available
+# -------------------------
+candidate_annot_cols <- c(
+  "HGVSp_Short",
+  "HGVSp",
+  "Protein_Change",
+  "HGVSc",
+  "Variant_Classification",
+  "Variant_Type",
+  "Chromosome",
+  "Start_Position",
+  "Reference_Allele",
+  "Tumor_Seq_Allele2",
+  "t_depth",
+  "t_alt_count",
+  "t_ref_count",
+  "all_effects",
+  "ONCOGENIC",
+  "MUTATION_EFFECT",
+  "oncogenic",
+  "mutation_effect"
+)
+
+annot_cols <- intersect(candidate_annot_cols, colnames(maf_sub))
+
+# -------------------------
+# Detailed long table
+# -------------------------
+mutation_long <- maf_sub %>%
+  select(
+    Sample = Sample_clean,
+    Gene = Hugo_Symbol,
+    all_of(annot_cols)
+  ) %>%
+  arrange(Sample, Gene)
+
+# -------------------------
+# Summarize variant labels per Sample/Gene
+# -------------------------
+# -------------------------
+# Make sure protein annotation columns exist
+# This prevents errors if Protein_Change or HGVSp_Short is absent
+# -------------------------
+
+for (col in c("HGVSp_Short", "HGVSp", "Protein_Change")) {
+  if (!col %in% colnames(maf_sub)) {
+    maf_sub[[col]] <- NA_character_
+  }
+}
+
+# -------------------------
+# Summarize variant labels per Sample/Gene
+# -------------------------
+
+variant_summary <- maf_sub %>%
+  mutate(
+    HGVSp_Short = as.character(HGVSp_Short),
+    HGVSp = as.character(HGVSp),
+    Protein_Change = as.character(Protein_Change),
+
+    protein_label = case_when(
+      !is.na(HGVSp_Short) & HGVSp_Short != "" ~ HGVSp_Short,
+      !is.na(HGVSp) & HGVSp != "" ~ HGVSp,
+      !is.na(Protein_Change) & Protein_Change != "" ~ Protein_Change,
+      TRUE ~ Variant_Classification
+    ),
+
+    variant_label = paste0(protein_label, " [", Variant_Classification, "]")
+  ) %>%
+  group_by(Sample = Sample_clean, Gene = Hugo_Symbol) %>%
+  summarise(
+    mutation_status = paste(unique(variant_label), collapse = "; "),
+    n_mutations = n(),
+    .groups = "drop"
+  )
+
+# -------------------------
+# Make complete wide status table
+# -------------------------
+status_table <- expand_grid(
+  Sample = samples_10_erpos_bionano,
+  Gene = genes_of_interest
+) %>%
+  left_join(variant_summary, by = c("Sample", "Gene")) %>%
+  mutate(
+    mutation_status = ifelse(
+      is.na(mutation_status),
+      "No non-silent mutation detected in this MAF",
+      mutation_status
+    ),
+    n_mutations = replace_na(n_mutations, 0)
+  ) %>%
+  select(Sample, Gene, mutation_status, n_mutations) %>%
+  pivot_wider(
+    names_from = Gene,
+    values_from = mutation_status
+  )
+
+# -------------------------
+# Add WES availability note
+# Based on current cohort summary:
+# WES is missing for TP11-1516 and TP14-385
+# -------------------------
+wes_available <- tibble(
+  Sample = samples_10_erpos_bionano,
+  WES_available = ifelse(
+    Sample %in% c("TP11-1516", "TP14-385"),
+    "No",
+    "Yes"
+  )
+)
+
+status_table <- wes_available %>%
+  left_join(status_table, by = "Sample")
+
+cat("\n========== Final mutation status table ==========\n")
+print(status_table)
+
+# -------------------------
+# Gene-level mutation counts
+# Count only among WES-available samples
+# -------------------------
+gene_counts <- expand_grid(
+  Sample = samples_10_erpos_bionano,
+  Gene = genes_of_interest
+) %>%
+  left_join(
+    variant_summary %>% mutate(mutated = TRUE),
+    by = c("Sample", "Gene")
+  ) %>%
+  left_join(wes_available, by = "Sample") %>%
+  mutate(
+    mutated = replace_na(mutated, FALSE)
+  ) %>%
+  filter(WES_available == "Yes") %>%
+  group_by(Gene) %>%
+  summarise(
+    mutated_samples = sum(mutated),
+    total_wes_available_samples = n(),
+    mutation_frequency_percent = round(100 * mutated_samples / total_wes_available_samples, 1),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mutated_samples), Gene)
+
+cat("\n========== Gene-level mutation counts among WES-available samples ==========\n")
+print(gene_counts)
+
+# -------------------------
+# Save outputs
+# -------------------------
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+status_file <- file.path(
+  out_dir,
+  "ERpos_Bionano_n10_CDH1_PIK3CA_ERBB2_ERBB3_mutation_status.tsv"
+)
+
+long_file <- file.path(
+  out_dir,
+  "ERpos_Bionano_n10_CDH1_PIK3CA_ERBB2_ERBB3_mutation_details_long.tsv"
+)
+
+counts_file <- file.path(
+  out_dir,
+  "ERpos_Bionano_n10_CDH1_PIK3CA_ERBB2_ERBB3_gene_counts.tsv"
+)
+
+write_tsv(status_table, status_file)
+write_tsv(mutation_long, long_file)
+write_tsv(gene_counts, counts_file)
+
+cat("\nSaved files:\n")
+cat(status_file, "\n")
+cat(long_file, "\n")
+cat(counts_file, "\n")
+```
+

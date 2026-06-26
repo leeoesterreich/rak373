@@ -1,0 +1,1147 @@
+---
+title: "WES MAF plot: ER+ pILC Bionano subgroup"
+output: html_document
+date: "2026-06-22"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(maftools)
+})
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 12,
+  fig.height = 8
+)
+```
+
+# Goal
+
+This Rmd generates WES mutation summary plots for the **10 ER+ pILC samples with Bionano/OGM data**.
+
+Important note: this subgroup contains 10 ER+ Bionano/OGM samples, but WES is expected for only 8 of the 10 samples. Therefore, WES mutation plots are based on the WES-assessable samples present in the combined MAF.
+
+```{r paths-and-samples}
+# ============================================================
+# Input combined MAF
+# ============================================================
+
+combined_maf_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Compare_TumorOnly_vs_WithPON/maftools/Tier_1_common/Combined_MAF/Tier_1_common_all_samples.combined.maf"
+
+# ============================================================
+# Output directory for grant subgroup
+# ============================================================
+
+grant_out_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/Grant/WES_ERpos_Bionano_n10"
+combined_dir  <- file.path(grant_out_dir, "Combined_MAF")
+plot_dir      <- file.path(grant_out_dir, "plots")
+table_dir     <- file.path(grant_out_dir, "tables")
+
+dir.create(grant_out_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(combined_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(table_dir, recursive = TRUE, showWarnings = FALSE)
+
+# ============================================================
+# 10 ER+ pILC samples with Bionano/OGM data
+# ============================================================
+
+grant_samples_10 <- c(
+  "TP05-232",
+  "TP05-726",
+  "TP07-626",
+  "TP08-2202",
+  "TP11-1516",
+  "TP11-1780",
+  "TP12-880",
+  "TP13-820",
+  "TP14-385",
+  "TP15-M509"
+)
+
+# Subgroup MAF file that will be created by this Rmd
+grant_maf_file <- file.path(
+  combined_dir,
+  "ERpos_Bionano_n10_WES_available_samples.combined.maf"
+)
+
+combined_maf_file
+grant_out_dir
+```
+
+# Read combined MAF and subset to 10 ER+ Bionano samples
+
+```{r read-and-subset-maf}
+# ============================================================
+# Read existing combined MAF
+# ============================================================
+
+if (!file.exists(combined_maf_file)) {
+  stop("Combined MAF file does not exist: ", combined_maf_file)
+}
+
+combined_maf <- fread(
+  combined_maf_file,
+  sep = "\t",
+  header = TRUE,
+  data.table = TRUE,
+  fill = TRUE,
+  quote = ""
+)
+
+cat("Combined MAF dimensions:\n")
+print(dim(combined_maf))
+
+if (!"Tumor_Sample_Barcode" %in% colnames(combined_maf)) {
+  stop("Tumor_Sample_Barcode column is missing from the combined MAF.")
+}
+
+if (!"Hugo_Symbol" %in% colnames(combined_maf)) {
+  stop("Hugo_Symbol column is missing from the combined MAF.")
+}
+
+# ============================================================
+# Clean sample names
+# Handles names like TP05-232_T, TP05-232_Tumor, or TP05-232-T
+# ============================================================
+
+combined_maf[, Tumor_Sample_Barcode := trimws(as.character(Tumor_Sample_Barcode))]
+combined_maf[, Sample_clean := Tumor_Sample_Barcode]
+combined_maf[, Sample_clean := gsub("_T$", "", Sample_clean)]
+combined_maf[, Sample_clean := gsub("_Tumor$", "", Sample_clean)]
+combined_maf[, Sample_clean := gsub("-T$", "", Sample_clean)]
+
+# ============================================================
+# Subset to 10 grant samples
+# ============================================================
+
+combined_maf_grant <- combined_maf[Sample_clean %in% grant_samples_10]
+
+# Use clean sample names for maftools plotting
+combined_maf_grant[, Tumor_Sample_Barcode := Sample_clean]
+
+cat("\nNumber of rows in subgroup MAF:\n")
+print(nrow(combined_maf_grant))
+
+cat("\nNumber of WES-assessable samples present in subgroup MAF:\n")
+print(length(unique(combined_maf_grant$Tumor_Sample_Barcode)))
+
+cat("\nSamples present in subgroup MAF:\n")
+print(sort(unique(combined_maf_grant$Tumor_Sample_Barcode)))
+
+# ============================================================
+# Sanity check: which of the 10 ER+ Bionano samples are present?
+# ============================================================
+
+wes_sample_check <- data.table(
+  Sample = grant_samples_10,
+  Present_in_WES_MAF = grant_samples_10 %in% unique(combined_maf_grant$Tumor_Sample_Barcode)
+)
+
+cat("\n========== WES availability among 10 ER+ Bionano samples ==========" , "\n")
+print(wes_sample_check)
+
+cat("\nNumber of ER+ Bionano samples:", length(grant_samples_10), "\n")
+cat("Number present in WES MAF:", sum(wes_sample_check$Present_in_WES_MAF), "\n")
+cat("Number not present in WES MAF:", sum(!wes_sample_check$Present_in_WES_MAF), "\n")
+
+# Save sample availability table
+fwrite(
+  wes_sample_check,
+  file = file.path(table_dir, "ERpos_Bionano_n10_WES_sample_availability.tsv"),
+  sep = "\t"
+)
+
+if (nrow(combined_maf_grant) == 0) {
+  stop("No MAF rows found for the 10 ER+ Bionano samples. Check sample names in Tumor_Sample_Barcode.")
+}
+
+# Save subgroup MAF
+fwrite(
+  combined_maf_grant,
+  file = grant_maf_file,
+  sep = "\t",
+  quote = FALSE,
+  na = ""
+)
+
+grant_maf_file
+```
+
+# Basic MAF checks
+
+```{r maf-checks}
+# ============================================================
+# MAF checks
+# ============================================================
+
+cat("Subgroup MAF dimensions:\n")
+print(dim(combined_maf_grant))
+
+cat("\nFirst few rows of subgroup MAF:\n")
+print(
+  head(
+    combined_maf_grant[, .(
+      Hugo_Symbol,
+      Chromosome,
+      Start_Position,
+      End_Position,
+      Variant_Classification,
+      Variant_Type,
+      Tumor_Sample_Barcode
+    )]
+  )
+)
+```
+
+# Read subgroup MAF using maftools
+
+```{r read-maf-maftools}
+# ============================================================
+# Read subgroup MAF for maftools
+# ============================================================
+
+maf_nonsilent_grant <- read.maf(
+  maf = grant_maf_file,
+  useAll = TRUE,
+  verbose = TRUE
+)
+
+maf_all_grant <- maf_nonsilent_grant
+
+gene_summary_grant <- getGeneSummary(maf_nonsilent_grant)
+sample_summary_grant <- getSampleSummary(maf_nonsilent_grant)
+
+cat("\n========== Gene summary for ER+ Bionano WES subgroup ==========" , "\n")
+print(head(gene_summary_grant, 30))
+
+cat("\n========== Sample summary for ER+ Bionano WES subgroup ==========" , "\n")
+print(sample_summary_grant)
+
+# Save summary tables
+fwrite(
+  as.data.table(gene_summary_grant),
+  file = file.path(table_dir, "ERpos_Bionano_WES_gene_summary.tsv"),
+  sep = "\t"
+)
+
+fwrite(
+  as.data.table(sample_summary_grant),
+  file = file.path(table_dir, "ERpos_Bionano_WES_sample_summary.tsv"),
+  sep = "\t"
+)
+```
+
+# MAF summary plot
+
+```{r maf-summary-plot, fig.width=12, fig.height=8}
+# ============================================================
+# MAF summary plot: same style as original script
+# ============================================================
+
+pdf(
+  file.path(plot_dir, "ERpos_Bionano_WES_maf_summary.pdf"),
+  width = 12,
+  height = 8
+)
+
+plotmafSummary(
+  maf = maf_nonsilent_grant,
+  rmOutlier = TRUE,
+  addStat = "median",
+  dashboard = TRUE,
+  titvRaw = FALSE
+)
+
+dev.off()
+
+png(
+  filename = file.path(plot_dir, "ERpos_Bionano_WES_maf_summary.png"),
+  width = 12,
+  height = 8,
+  units = "in",
+  res = 300
+)
+
+plotmafSummary(
+  maf = maf_nonsilent_grant,
+  rmOutlier = TRUE,
+  addStat = "median",
+  dashboard = TRUE,
+  titvRaw = FALSE
+)
+
+dev.off()
+
+# Show in Rmd output
+plotmafSummary(
+  maf = maf_nonsilent_grant,
+  rmOutlier = TRUE,
+  addStat = "median",
+  dashboard = TRUE,
+  titvRaw = FALSE
+)
+```
+
+# Oncoplot: top 30 mutated genes
+
+```{r oncoplot-top30, fig.width=16, fig.height=10}
+# ============================================================
+# Oncoplot: top 30 mutated genes in ER+ Bionano WES subgroup
+# Same style as original script
+# ============================================================
+
+pdf(
+  file.path(plot_dir, "ERpos_Bionano_WES_oncoplot_top30.pdf"),
+  width = 16,
+  height = 10
+)
+
+oncoplot(
+  maf = maf_nonsilent_grant,
+  top = 30,
+  removeNonMutated = FALSE,
+  showTumorSampleBarcodes = FALSE,
+  fontSize = 0.8,
+  titleText = "ER+ pILC Bionano Subgroup: Top 30 Mutated Genes by WES"
+)
+
+dev.off()
+
+png(
+  filename = file.path(plot_dir, "ERpos_Bionano_WES_oncoplot_top30.png"),
+  width = 16,
+  height = 10,
+  units = "in",
+  res = 300
+)
+
+oncoplot(
+  maf = maf_nonsilent_grant,
+  top = 30,
+  removeNonMutated = FALSE,
+  showTumorSampleBarcodes = FALSE,
+  fontSize = 0.8,
+  titleText = "ER+ pILC Bionano Subgroup: Top 30 Mutated Genes by WES"
+)
+
+dev.off()
+
+# Show in Rmd output
+oncoplot(
+  maf = maf_nonsilent_grant,
+  top = 30,
+  removeNonMutated = FALSE,
+  showTumorSampleBarcodes = FALSE,
+  fontSize = 0.8,
+  titleText = "ER+ pILC Bionano Subgroup: Top 30 Mutated Genes by WES"
+)
+```
+
+# Breast cancer gene-focused oncoplot
+
+```{r breast-cancer-gene-oncoplot, fig.width=14, fig.height=8}
+# ============================================================
+# Breast cancer gene-focused oncoplot
+# Same style as original script, but focused on ER+ Bionano subgroup
+# ERBB3 is included here because it was specifically requested.
+# ============================================================
+
+breast_genes <- c(
+  "ERBB2", "ERBB3", "FGFR1", "NF1", "GNAS", "PAK1", "PIK3CA", "PTEN",
+  "AKT1", "GATA3", "ESR1", "FOXA1", "ARID1A", "TBX3", "MYC",
+  "MCL1", "MAP3K1", "RECQL4", "RARA", "CCND1", "CDH1", "TP53",
+  "BRCA1", "RICTOR", "FAT1", "JAK3", "CIC", "ARID2"
+)
+
+present_breast_genes <- breast_genes[breast_genes %in% gene_summary_grant$Hugo_Symbol]
+missing_breast_genes <- setdiff(breast_genes, present_breast_genes)
+
+cat("\nBreast/cancer-relevant genes mutated in subgroup:\n")
+print(present_breast_genes)
+
+cat("\nBreast/cancer-relevant genes not mutated/not present in subgroup MAF:\n")
+print(missing_breast_genes)
+
+# Save present/missing gene lists
+fwrite(
+  data.table(Breast_cancer_genes_present = present_breast_genes),
+  file = file.path(table_dir, "ERpos_Bionano_WES_breast_genes_present.tsv"),
+  sep = "\t"
+)
+
+fwrite(
+  data.table(Breast_cancer_genes_missing = missing_breast_genes),
+  file = file.path(table_dir, "ERpos_Bionano_WES_breast_genes_missing.tsv"),
+  sep = "\t"
+)
+
+if (length(present_breast_genes) > 0) {
+
+  pdf(
+    file.path(plot_dir, "ERpos_Bionano_WES_oncoplot_breast_genes.pdf"),
+    width = 14,
+    height = 8
+  )
+
+  oncoplot(
+    maf = maf_nonsilent_grant,
+    genes = present_breast_genes,
+    removeNonMutated = FALSE,
+    showTumorSampleBarcodes = TRUE,
+    fontSize = 0.8,
+    titleText = "ER+ pILC Bionano Subgroup: Breast Cancer Genes by WES"
+  )
+
+  dev.off()
+
+  png(
+    filename = file.path(plot_dir, "ERpos_Bionano_WES_oncoplot_breast_genes.png"),
+    width = 14,
+    height = 8,
+    units = "in",
+    res = 300
+  )
+
+  oncoplot(
+    maf = maf_nonsilent_grant,
+    genes = present_breast_genes,
+    removeNonMutated = FALSE,
+    showTumorSampleBarcodes = TRUE,
+    fontSize = 0.8,
+    titleText = "ER+ pILC Bionano Subgroup: Breast Cancer Genes by WES"
+  )
+
+  dev.off()
+
+  # Show in Rmd output
+  oncoplot(
+    maf = maf_nonsilent_grant,
+    genes = present_breast_genes,
+    removeNonMutated = FALSE,
+    showTumorSampleBarcodes = TRUE,
+    fontSize = 0.8,
+    titleText = "ER+ pILC Bionano Subgroup: Breast Cancer Genes by WES"
+  )
+
+} else {
+  message("No breast cancer genes from the selected list are mutated in this subgroup MAF.")
+}
+```
+
+# Mutation status for requested genes
+
+```{r requested-gene-status}
+# ============================================================
+# Mutation status table for CDH1, PIK3CA, ERBB2, ERBB3
+# This is useful for the grant text/table.
+# ============================================================
+
+requested_genes <- c("CDH1", "PIK3CA", "ERBB2", "ERBB3")
+
+# Non-silent / protein-altering classes commonly used for MAF summaries
+nonsilent_classes <- c(
+  "Missense_Mutation",
+  "Nonsense_Mutation",
+  "Frame_Shift_Del",
+  "Frame_Shift_Ins",
+  "In_Frame_Del",
+  "In_Frame_Ins",
+  "Splice_Site",
+  "Translation_Start_Site",
+  "Nonstop_Mutation",
+  "Start_Codon_Del",
+  "Start_Codon_Ins",
+  "Stop_Codon_Del",
+  "Stop_Codon_Ins"
+)
+
+maf_req <- copy(combined_maf_grant)
+
+if (!"Variant_Classification" %in% colnames(maf_req)) {
+  stop("Variant_Classification column is missing from subgroup MAF.")
+}
+
+maf_req <- maf_req[
+  Hugo_Symbol %in% requested_genes &
+    Variant_Classification %in% nonsilent_classes
+]
+
+# Add common annotation columns if missing, so downstream code does not fail
+for (col in c("HGVSp_Short", "HGVSp", "Protein_Change")) {
+  if (!col %in% colnames(maf_req)) {
+    maf_req[, (col) := NA_character_]
+  }
+}
+
+if (nrow(maf_req) > 0) {
+  maf_req[, protein_label := fifelse(
+    !is.na(HGVSp_Short) & HGVSp_Short != "",
+    HGVSp_Short,
+    fifelse(
+      !is.na(HGVSp) & HGVSp != "",
+      HGVSp,
+      fifelse(
+        !is.na(Protein_Change) & Protein_Change != "",
+        Protein_Change,
+        Variant_Classification
+      )
+    )
+  )]
+
+  maf_req[, variant_label := paste0(protein_label, " [", Variant_Classification, "]")]
+
+  requested_variant_summary <- maf_req[
+    , .(
+      mutation_status = paste(unique(variant_label), collapse = "; "),
+      n_mutations = .N
+    ),
+    by = .(Sample = Tumor_Sample_Barcode, Gene = Hugo_Symbol)
+  ]
+} else {
+  requested_variant_summary <- data.table(
+    Sample = character(),
+    Gene = character(),
+    mutation_status = character(),
+    n_mutations = integer()
+  )
+}
+
+# Complete sample-gene grid for 10 samples
+sample_gene_grid <- CJ(
+  Sample = grant_samples_10,
+  Gene = requested_genes,
+  unique = TRUE
+)
+
+requested_status_long <- merge(
+  sample_gene_grid,
+  requested_variant_summary,
+  by = c("Sample", "Gene"),
+  all.x = TRUE
+)
+
+requested_status_long <- merge(
+  requested_status_long,
+  wes_sample_check,
+  by = "Sample",
+  all.x = TRUE
+)
+
+requested_status_long[
+  Present_in_WES_MAF == FALSE,
+  mutation_status := "WES not available"
+]
+
+requested_status_long[
+  Present_in_WES_MAF == TRUE & is.na(mutation_status),
+  mutation_status := "No non-silent mutation detected in this MAF"
+]
+
+requested_status_long[is.na(n_mutations), n_mutations := 0]
+
+# Gene-level counts among WES-available samples
+requested_gene_counts <- requested_status_long[
+  Present_in_WES_MAF == TRUE,
+  .(
+    mutated_samples = sum(n_mutations > 0),
+    total_wes_available_samples = .N,
+    mutation_frequency_percent = round(100 * sum(n_mutations > 0) / .N, 1)
+  ),
+  by = Gene
+][order(-mutated_samples, Gene)]
+
+cat("\n========== Requested gene mutation counts ==========" , "\n")
+print(requested_gene_counts)
+
+cat("\n========== Requested gene mutation status, long format ==========" , "\n")
+print(requested_status_long)
+
+# Save long table
+fwrite(
+  requested_status_long,
+  file = file.path(table_dir, "ERpos_Bionano_WES_CDH1_PIK3CA_ERBB2_ERBB3_status_long.tsv"),
+  sep = "\t"
+)
+
+# Save gene counts
+fwrite(
+  requested_gene_counts,
+  file = file.path(table_dir, "ERpos_Bionano_WES_CDH1_PIK3CA_ERBB2_ERBB3_gene_counts.tsv"),
+  sep = "\t"
+)
+
+# Save wide table
+requested_status_wide <- dcast(
+  requested_status_long,
+  Sample + Present_in_WES_MAF ~ Gene,
+  value.var = "mutation_status"
+)
+
+fwrite(
+  requested_status_wide,
+  file = file.path(table_dir, "ERpos_Bionano_WES_CDH1_PIK3CA_ERBB2_ERBB3_status_wide.tsv"),
+  sep = "\t"
+)
+
+requested_status_wide
+```
+
+# Somatic interactions: top mutated genes
+
+```{r somatic-interactions-top25, fig.width=12, fig.height=10}
+# ============================================================
+# Somatic interaction analysis: top 25 mutated genes
+# Same style as original script, but guarded for small n.
+# For this small subgroup, treat this as exploratory only.
+# ============================================================
+
+if (nrow(gene_summary_grant) >= 5) {
+
+  interaction_table <- tryCatch(
+    {
+      somaticInteractions(
+        maf = maf_nonsilent_grant,
+        top = 25,
+        pvalue = c(0.05, 0.01),
+        returnAll = TRUE
+      )
+    },
+    error = function(e) {
+      message("[ERROR] somaticInteractions failed: ", e$message)
+      return(NULL)
+    }
+  )
+
+  if (!is.null(interaction_table)) {
+    interaction_table <- as.data.table(interaction_table)
+
+    fwrite(
+      interaction_table,
+      file = file.path(table_dir, "ERpos_Bionano_WES_somatic_interactions_top25_all_pairs.tsv"),
+      sep = "\t"
+    )
+  }
+
+  pdf(
+    file.path(plot_dir, "ERpos_Bionano_WES_somatic_interactions_top25.pdf"),
+    width = 12,
+    height = 10
+  )
+
+  try(
+    somaticInteractions(
+      maf = maf_nonsilent_grant,
+      top = 25,
+      pvalue = c(0.05, 0.01),
+      returnAll = TRUE
+    ),
+    silent = TRUE
+  )
+
+  dev.off()
+
+  png(
+    filename = file.path(plot_dir, "ERpos_Bionano_WES_somatic_interactions_top25.png"),
+    width = 12,
+    height = 10,
+    units = "in",
+    res = 300
+  )
+
+  try(
+    somaticInteractions(
+      maf = maf_nonsilent_grant,
+      top = 25,
+      pvalue = c(0.05, 0.01),
+      returnAll = TRUE
+    ),
+    silent = TRUE
+  )
+
+  dev.off()
+
+  # Show in Rmd output
+  try(
+    somaticInteractions(
+      maf = maf_nonsilent_grant,
+      top = 25,
+      pvalue = c(0.05, 0.01),
+      returnAll = TRUE
+    ),
+    silent = TRUE
+  )
+
+} else {
+  message("Fewer than 5 mutated genes; skipping top-25 somatic interaction analysis.")
+}
+```
+
+# Breast cancer gene somatic interactions
+
+```{r breast-gene-somatic-interactions, fig.width=12, fig.height=10}
+# ============================================================
+# Somatic interaction analysis restricted to breast cancer genes
+# Same style as original script, but focused on subgroup.
+# For this small subgroup, treat this as exploratory only.
+# ============================================================
+
+present_breast_genes <- breast_genes[breast_genes %in% gene_summary_grant$Hugo_Symbol]
+missing_breast_genes <- setdiff(breast_genes, present_breast_genes)
+
+breast_gene_summary <- data.table(
+  Total_breast_cancer_genes_in_list = length(breast_genes),
+  Breast_cancer_genes_mutated_in_subgroup = length(present_breast_genes),
+  Possible_pairwise_tests = ifelse(
+    length(present_breast_genes) >= 2,
+    choose(length(present_breast_genes), 2),
+    0
+  )
+)
+
+print(breast_gene_summary)
+
+fwrite(
+  breast_gene_summary,
+  file = file.path(table_dir, "ERpos_Bionano_WES_breast_gene_somatic_interaction_summary.tsv"),
+  sep = "\t"
+)
+
+if (length(present_breast_genes) >= 2) {
+
+  breast_interaction_table <- tryCatch(
+    {
+      somaticInteractions(
+        maf = maf_nonsilent_grant,
+        genes = present_breast_genes,
+        pvalue = c(0.05, 0.01),
+        returnAll = TRUE
+      )
+    },
+    error = function(e) {
+      message("[ERROR] Breast cancer gene somaticInteractions failed: ", e$message)
+      return(NULL)
+    }
+  )
+
+  if (!is.null(breast_interaction_table)) {
+
+    breast_interaction_table <- as.data.table(breast_interaction_table)
+
+    fwrite(
+      breast_interaction_table,
+      file = file.path(table_dir, "ERpos_Bionano_WES_somatic_interactions_breast_genes_all_pairs.tsv"),
+      sep = "\t"
+    )
+
+    p_col <- intersect(
+      c("pValue", "p.value", "pvalue", "P.value", "PValue"),
+      colnames(breast_interaction_table)
+    )
+
+    if (length(p_col) > 0) {
+      p_col <- p_col[1]
+      breast_interaction_table[, FDR := p.adjust(get(p_col), method = "BH")]
+
+      breast_sig_interactions <- breast_interaction_table[get(p_col) < 0.05]
+      breast_fdr_sig_interactions <- breast_interaction_table[FDR < 0.05]
+
+      fwrite(
+        breast_sig_interactions,
+        file = file.path(table_dir, "ERpos_Bionano_WES_somatic_interactions_breast_genes_significant_pairs_p005.tsv"),
+        sep = "\t"
+      )
+
+      fwrite(
+        breast_fdr_sig_interactions,
+        file = file.path(table_dir, "ERpos_Bionano_WES_somatic_interactions_breast_genes_FDR005_pairs.tsv"),
+        sep = "\t"
+      )
+
+      cat("\nNumber of nominally significant breast cancer gene pairs, p < 0.05:\n")
+      print(nrow(breast_sig_interactions))
+
+      cat("\nNumber of FDR-significant breast cancer gene pairs, FDR < 0.05:\n")
+      print(nrow(breast_fdr_sig_interactions))
+    }
+  }
+
+  pdf(
+    file.path(plot_dir, "ERpos_Bionano_WES_somatic_interactions_breast_genes.pdf"),
+    width = 12,
+    height = 10
+  )
+
+  try(
+    somaticInteractions(
+      maf = maf_nonsilent_grant,
+      genes = present_breast_genes,
+      pvalue = c(0.05, 0.01),
+      returnAll = TRUE
+    ),
+    silent = TRUE
+  )
+
+  dev.off()
+
+  png(
+    filename = file.path(plot_dir, "ERpos_Bionano_WES_somatic_interactions_breast_genes.png"),
+    width = 12,
+    height = 10,
+    units = "in",
+    res = 300
+  )
+
+  try(
+    somaticInteractions(
+      maf = maf_nonsilent_grant,
+      genes = present_breast_genes,
+      pvalue = c(0.05, 0.01),
+      returnAll = TRUE
+    ),
+    silent = TRUE
+  )
+
+  dev.off()
+
+  # Show in Rmd output
+  try(
+    somaticInteractions(
+      maf = maf_nonsilent_grant,
+      genes = present_breast_genes,
+      pvalue = c(0.05, 0.01),
+      returnAll = TRUE
+    ),
+    silent = TRUE
+  )
+
+} else {
+  message("Fewer than 2 breast cancer genes are mutated in this subgroup; skipping breast-gene somatic interaction analysis.")
+}
+```
+
+# Optional: TCGA/ICGC breast cancer gene somatic interactions
+
+```{r tcga-icgc-somatic-interactions, fig.width=12, fig.height=10}
+# ============================================================
+# Optional TCGA/ICGC breast cancer gene somatic interaction analysis
+# This section runs only if the gene-list file exists.
+# ============================================================
+
+tcga_icgc_gene_file <- "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Reference/Unique_genes_TCGA_ICGC.txt"
+
+if (file.exists(tcga_icgc_gene_file)) {
+
+  tcga_icgc_genes <- fread(tcga_icgc_gene_file, header = FALSE)$V1
+  tcga_icgc_genes <- unique(toupper(trimws(tcga_icgc_genes)))
+  tcga_icgc_genes <- tcga_icgc_genes[tcga_icgc_genes != "" & !is.na(tcga_icgc_genes)]
+
+  gene_summary_dt <- as.data.table(gene_summary_grant)
+  gene_summary_dt[, Hugo_upper := toupper(Hugo_Symbol)]
+
+  tcga_icgc_genes_present <- unique(
+    gene_summary_dt[Hugo_upper %in% tcga_icgc_genes, Hugo_Symbol]
+  )
+
+  cat("\nTotal TCGA/ICGC genes:", length(tcga_icgc_genes), "\n")
+  cat("TCGA/ICGC genes mutated in subgroup:", length(tcga_icgc_genes_present), "\n")
+
+  fwrite(
+    data.table(Gene = tcga_icgc_genes_present),
+    file = file.path(table_dir, "ERpos_Bionano_WES_TCGA_ICGC_genes_present.tsv"),
+    sep = "\t"
+  )
+
+  if (length(tcga_icgc_genes_present) >= 2) {
+
+    tcga_icgc_interactions <- tryCatch(
+      {
+        tmp_pdf <- tempfile(fileext = ".pdf")
+        pdf(tmp_pdf)
+        res <- somaticInteractions(
+          maf = maf_nonsilent_grant,
+          genes = tcga_icgc_genes_present,
+          pvalue = c(0.05, 0.01),
+          returnAll = TRUE
+        )
+        dev.off()
+        unlink(tmp_pdf)
+        res
+      },
+      error = function(e) {
+        message("[ERROR] TCGA/ICGC somaticInteractions failed: ", e$message)
+        return(NULL)
+      }
+    )
+
+    if (!is.null(tcga_icgc_interactions)) {
+      tcga_icgc_interactions <- as.data.table(tcga_icgc_interactions)
+
+      p_col <- intersect(
+        c("pValue", "p.value", "pvalue", "P.value", "PValue"),
+        colnames(tcga_icgc_interactions)
+      )
+
+      if (length(p_col) > 0) {
+        p_col <- p_col[1]
+        tcga_icgc_interactions[, FDR := p.adjust(get(p_col), method = "BH")]
+
+        sig_p005 <- tcga_icgc_interactions[get(p_col) < 0.05]
+        sig_fdr005 <- tcga_icgc_interactions[FDR < 0.05]
+
+        fwrite(
+          tcga_icgc_interactions,
+          file.path(table_dir, "ERpos_Bionano_WES_TCGA_ICGC_somatic_interactions_all_pairs_with_FDR.tsv"),
+          sep = "\t"
+        )
+
+        fwrite(
+          sig_p005,
+          file.path(table_dir, "ERpos_Bionano_WES_TCGA_ICGC_somatic_interactions_significant_pairs_p005.tsv"),
+          sep = "\t"
+        )
+
+        fwrite(
+          sig_fdr005,
+          file.path(table_dir, "ERpos_Bionano_WES_TCGA_ICGC_somatic_interactions_significant_pairs_FDR005.tsv"),
+          sep = "\t"
+        )
+
+        cat("\nNominally significant TCGA/ICGC pairs, p < 0.05:", nrow(sig_p005), "\n")
+        cat("FDR-significant TCGA/ICGC pairs, FDR < 0.05:", nrow(sig_fdr005), "\n")
+      }
+    }
+
+    pdf(
+      file.path(plot_dir, "ERpos_Bionano_WES_TCGA_ICGC_somatic_interactions.pdf"),
+      width = 12,
+      height = 10
+    )
+
+    try(
+      somaticInteractions(
+        maf = maf_nonsilent_grant,
+        genes = tcga_icgc_genes_present,
+        pvalue = c(0.05, 0.01)
+      ),
+      silent = TRUE
+    )
+
+    dev.off()
+
+    png(
+      file.path(plot_dir, "ERpos_Bionano_WES_TCGA_ICGC_somatic_interactions.png"),
+      width = 12,
+      height = 10,
+      units = "in",
+      res = 300
+    )
+
+    try(
+      somaticInteractions(
+        maf = maf_nonsilent_grant,
+        genes = tcga_icgc_genes_present,
+        pvalue = c(0.05, 0.01)
+      ),
+      silent = TRUE
+    )
+
+    dev.off()
+
+  } else {
+    message("Fewer than 2 TCGA/ICGC genes are mutated in this subgroup; skipping TCGA/ICGC somatic interaction plot.")
+  }
+
+} else {
+  message("TCGA/ICGC gene file not found. Skipping optional TCGA/ICGC somatic interaction section: ", tcga_icgc_gene_file)
+}
+```
+
+# Optional: Oncodrive positional clustering
+
+```{r oncodrive-positional-clustering, fig.width=10, fig.height=8}
+# ============================================================
+# Optional driver gene analysis based on positional clustering
+# Same as original idea, but adapted to subgroup.
+# This may be underpowered for n=8 WES-assessable samples.
+# ============================================================
+
+oncodrive_dir <- file.path(grant_out_dir, "Oncodrive_Positional_Clustering")
+dir.create(oncodrive_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Candidate amino-acid/protein-change columns commonly present in PCGR/vcf2maf/MAF files.
+aa_candidates <- c(
+  "Protein_Change",
+  "HGVSp_Short",
+  "HGVSp",
+  "AAChange",
+  "Amino_Acid_Change"
+)
+
+aa_col <- aa_candidates[aa_candidates %in% colnames(combined_maf_grant)][1]
+
+if (!is.na(aa_col) && length(aa_col) > 0) {
+
+  message("Using amino-acid change column for oncodrive: ", aa_col)
+
+  # For small cohorts, minMut = 3 is exploratory.
+  # If this returns too few/no results, use min_mut_oncodrive <- 2.
+  min_mut_oncodrive <- 3
+
+  ignore_genes_oncodrive <- c(
+    "TTN", "MUC16", "MUC4", "MUC5B", "MUC6", "MUC17",
+    "OBSCN", "RYR1", "RYR2", "RYR3", "DNAH5", "DNAH7", "DNAH9"
+  )
+
+  ignore_genes_oncodrive <- intersect(ignore_genes_oncodrive, gene_summary_grant$Hugo_Symbol)
+
+  oncodrive_res <- tryCatch(
+    {
+      oncodrive(
+        maf = maf_nonsilent_grant,
+        AACol = aa_col,
+        minMut = min_mut_oncodrive,
+        pvalMethod = "zscore",
+        ignoreGenes = ignore_genes_oncodrive
+      )
+    },
+    error = function(e) {
+      message("[ERROR] oncodrive failed: ", e$message)
+      return(NULL)
+    }
+  )
+
+  if (!is.null(oncodrive_res) && nrow(oncodrive_res) > 0) {
+
+    oncodrive_res_dt <- as.data.table(oncodrive_res)
+
+    sort_cols <- intersect(c("fdr", "pval"), colnames(oncodrive_res_dt))
+    if (length(sort_cols) > 0) {
+      setorderv(oncodrive_res_dt, cols = sort_cols, order = rep(1, length(sort_cols)))
+    }
+
+    fwrite(
+      oncodrive_res_dt,
+      file = file.path(table_dir, "ERpos_Bionano_WES_oncodrive_positional_clustering_all_results.tsv"),
+      sep = "\t",
+      quote = FALSE,
+      na = ""
+    )
+
+    write.csv(
+      oncodrive_res_dt,
+      file = file.path(table_dir, "ERpos_Bionano_WES_oncodrive_positional_clustering_all_results.csv"),
+      row.names = FALSE
+    )
+
+    if ("fdr" %in% colnames(oncodrive_res_dt)) {
+      oncodrive_sig <- oncodrive_res_dt[fdr <= 0.10]
+    } else if ("pval" %in% colnames(oncodrive_res_dt)) {
+      oncodrive_sig <- oncodrive_res_dt[pval <= 0.05]
+    } else {
+      oncodrive_sig <- oncodrive_res_dt[0]
+    }
+
+    write.csv(
+      oncodrive_sig,
+      file = file.path(table_dir, "ERpos_Bionano_WES_oncodrive_positional_clustering_significant_candidates.csv"),
+      row.names = FALSE
+    )
+
+    print(head(oncodrive_res_dt, 20))
+    message("Number of FDR <= 0.10 positional-clustering candidates: ", nrow(oncodrive_sig))
+
+    pdf(
+      file.path(plot_dir, "ERpos_Bionano_WES_oncodrive_positional_clustering_FDR0.10.pdf"),
+      width = 10,
+      height = 8
+    )
+
+    try(
+      plotOncodrive(
+        res = oncodrive_res_dt,
+        fdrCutOff = 0.10,
+        useFraction = TRUE,
+        labelSize = 0.7
+      ),
+      silent = TRUE
+    )
+
+    dev.off()
+
+    png(
+      filename = file.path(plot_dir, "ERpos_Bionano_WES_oncodrive_positional_clustering_FDR0.10.png"),
+      width = 10,
+      height = 8,
+      units = "in",
+      res = 300
+    )
+
+    try(
+      plotOncodrive(
+        res = oncodrive_res_dt,
+        fdrCutOff = 0.10,
+        useFraction = TRUE,
+        labelSize = 0.7
+      ),
+      silent = TRUE
+    )
+
+    dev.off()
+
+    # Show in Rmd output
+    try(
+      plotOncodrive(
+        res = oncodrive_res_dt,
+        fdrCutOff = 0.10,
+        useFraction = TRUE,
+        labelSize = 0.7
+      ),
+      silent = TRUE
+    )
+
+  } else {
+    message(
+      "No oncodrive results returned. Possible reasons: too few recurrently mutated genes, ",
+      "missing/poorly formatted protein-change values in ", aa_col, ", or minMut is too strict. ",
+      "Try min_mut_oncodrive <- 2 for exploratory analysis."
+    )
+  }
+
+} else {
+  message(
+    "No amino-acid change column found. Skipping oncodrive. Available columns are: ",
+    paste(colnames(combined_maf_grant), collapse = ", ")
+  )
+}
+```
+
+# Output summary
+
+```{r output-summary}
+cat("\n========== Output directories ==========" , "\n")
+cat("Grant output directory:\n", grant_out_dir, "\n")
+cat("Subgroup MAF file:\n", grant_maf_file, "\n")
+cat("Plot directory:\n", plot_dir, "\n")
+cat("Table directory:\n", table_dir, "\n")
+
+cat("\nMain plots generated:\n")
+cat("\n- ERpos_Bionano_WES_maf_summary.pdf/png")
+cat("\n- ERpos_Bionano_WES_oncoplot_top30.pdf/png")
+cat("\n- ERpos_Bionano_WES_oncoplot_breast_genes.pdf/png")
+cat("\n")
+
+cat("\nMain tables generated:\n")
+cat("\n- ERpos_Bionano_n10_WES_sample_availability.tsv")
+cat("\n- ERpos_Bionano_WES_gene_summary.tsv")
+cat("\n- ERpos_Bionano_WES_sample_summary.tsv")
+cat("\n- ERpos_Bionano_WES_CDH1_PIK3CA_ERBB2_ERBB3_gene_counts.tsv")
+cat("\n- ERpos_Bionano_WES_CDH1_PIK3CA_ERBB2_ERBB3_status_wide.tsv")
+cat("\n")
+```

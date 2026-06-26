@@ -1,0 +1,608 @@
+---
+title: "WES VAF summary - ER+ pILC Bionano subgroup"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    theme: readable
+date: "2026-06-25"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(readr)
+})
+
+graphics.off()
+gc()
+```
+
+# Purpose
+
+This Rmd summarizes WES mutation frequency and tumor VAF for selected genes in the **10 ER+ pILC Bionano/OGM subgroup**.
+
+Genes summarized:
+
+```{r genes-listed}
+vaf_genes <- c("CDH1", "PIK3CA", "ERBB2", "ERBB3")
+print(vaf_genes)
+```
+
+Tumor VAF is calculated from the WES MAF count columns as:
+
+```text
+Tumor VAF (%) = 100 * t_alt_count / t_depth
+```
+
+If `t_depth` is missing but `t_ref_count` and `t_alt_count` are present, the script also calculates a backup VAF:
+
+```text
+Tumor VAF (%) = 100 * t_alt_count / (t_ref_count + t_alt_count)
+```
+
+# 1. Paths and sample definitions
+
+```{r paths}
+# ============================================================
+# Input / output paths
+# ============================================================
+
+combined_maf_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Compare_TumorOnly_vs_WithPON/maftools/Tier_1_common/Combined_MAF/Tier_1_common_all_samples.combined.maf"
+
+out_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/Grant/WES"
+analysis_dir <- file.path(out_dir, "WES_VAF_CDH1_PIK3CA_ERBB2_ERBB3")
+table_dir <- file.path(analysis_dir, "tables")
+
+for (dd in c(out_dir, analysis_dir, table_dir)) {
+  dir.create(dd, recursive = TRUE, showWarnings = FALSE)
+}
+
+cat("Input combined MAF:\n", combined_maf_file, "\n\n")
+cat("Output directory:\n", analysis_dir, "\n")
+cat("Table directory:\n", table_dir, "\n\n")
+
+# ============================================================
+# 10 ER+ pILC samples with Bionano/OGM data
+# ============================================================
+
+grant_samples_10 <- c(
+  "TP05-232",
+  "TP05-726",
+  "TP07-626",
+  "TP08-2202",
+  "TP11-1516",
+  "TP11-1780",
+  "TP12-880",
+  "TP13-820",
+  "TP14-385",
+  "TP15-M509"
+)
+
+vaf_genes <- c("CDH1", "PIK3CA", "ERBB2", "ERBB3")
+
+cat("Grant samples:\n")
+print(grant_samples_10)
+
+cat("\nGenes for WES VAF summary:\n")
+print(vaf_genes)
+```
+
+# 2. Helper functions
+
+```{r helper-functions}
+clean_sample <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+
+  # MAF IDs may be TP05-232_T, TP05-232_Tumor, TP05-232-T, or TP05-232.T
+  x <- sub("_Tumor$", "", x)
+  x <- sub("_T$", "", x)
+  x <- sub("-T$", "", x)
+  x <- sub("\\.T$", "", x)
+
+  x
+}
+
+make_numeric_safely <- function(x) {
+  suppressWarnings(as.numeric(as.character(x)))
+}
+
+write_empty_table <- function(dt, file) {
+  fwrite(dt, file = file, sep = "\t", quote = FALSE, na = "")
+  cat("Saved empty table:\n  ", file, "\n")
+}
+```
+
+# 3. Read original combined MAF
+
+```{r read-maf}
+if (!file.exists(combined_maf_file)) {
+  stop("Combined MAF file does not exist: ", combined_maf_file)
+}
+
+combined_maf <- fread(
+  combined_maf_file,
+  sep = "\t",
+  header = TRUE,
+  data.table = TRUE,
+  fill = TRUE,
+  quote = "",
+  na.strings = c("", "NA", "NaN", "N/A", ".")
+)
+
+cat("Combined MAF dimensions:\n")
+print(dim(combined_maf))
+
+required_cols <- c(
+  "Tumor_Sample_Barcode",
+  "Hugo_Symbol",
+  "Variant_Classification",
+  "t_depth",
+  "t_ref_count",
+  "t_alt_count"
+)
+
+missing_cols <- setdiff(required_cols, colnames(combined_maf))
+
+if (length(missing_cols) > 0) {
+  stop("Missing required columns in combined MAF: ", paste(missing_cols, collapse = ", "))
+}
+
+combined_maf[, Tumor_Sample_Barcode := trimws(as.character(Tumor_Sample_Barcode))]
+combined_maf[, Hugo_Symbol := trimws(as.character(Hugo_Symbol))]
+combined_maf[, Variant_Classification := trimws(as.character(Variant_Classification))]
+combined_maf[, Sample_clean := clean_sample(Tumor_Sample_Barcode)]
+
+cat("\nFirst few cleaned sample IDs:\n")
+print(head(unique(combined_maf$Sample_clean), 20))
+```
+
+# 4. Subset to ER+ Bionano subgroup and define WES availability
+
+```{r subset-grant-samples}
+# Protein-altering / non-synonymous classes used for WES mutation summary.
+nonsyn_classes <- c(
+  "Missense_Mutation",
+  "Nonsense_Mutation",
+  "Frame_Shift_Del",
+  "Frame_Shift_Ins",
+  "In_Frame_Del",
+  "In_Frame_Ins",
+  "Splice_Site",
+  "Translation_Start_Site",
+  "Nonstop_Mutation",
+  "Start_Codon_Del",
+  "Start_Codon_Ins",
+  "Stop_Codon_Del",
+  "Stop_Codon_Ins"
+)
+
+combined_maf_grant_all <- combined_maf[
+  Sample_clean %in% grant_samples_10
+]
+
+combined_maf_grant <- combined_maf_grant_all[
+  Variant_Classification %in% nonsyn_classes
+]
+
+# Use clean sample names downstream.
+combined_maf_grant_all[, Tumor_Sample_Barcode := Sample_clean]
+combined_maf_grant[, Tumor_Sample_Barcode := Sample_clean]
+
+# WES-available samples are samples present in the original combined MAF.
+# This captures WES availability independent of whether the selected genes are mutated.
+wes_samples_available <- grant_samples_10[
+  grant_samples_10 %in% unique(combined_maf_grant_all$Tumor_Sample_Barcode)
+]
+
+wes_sample_check <- data.table(
+  Sample = grant_samples_10,
+  Present_in_original_combined_MAF = grant_samples_10 %in% unique(combined_maf_grant_all$Tumor_Sample_Barcode),
+  Has_non_synonymous_WES_call_any_gene = grant_samples_10 %in% unique(combined_maf_grant$Tumor_Sample_Barcode)
+)
+
+cat("\n========== WES availability among 10 ER+ Bionano samples ==========\n")
+print(wes_sample_check)
+
+cat("\nWES-available samples:\n")
+print(wes_samples_available)
+cat("Number of WES-available samples:", length(wes_samples_available), "\n\n")
+
+fwrite(
+  wes_sample_check,
+  file = file.path(table_dir, "ERpos_Bionano_n10_WES_sample_availability_from_original_combined_MAF.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  na = ""
+)
+```
+
+# 5. Diagnostic check of WES VAF columns
+
+```{r vaf-column-diagnostic}
+vaf_check_dt <- combined_maf_grant[
+  Hugo_Symbol %in% vaf_genes,
+  .(
+    Tumor_Sample_Barcode,
+    Hugo_Symbol,
+    Variant_Classification,
+    t_depth,
+    t_ref_count,
+    t_alt_count,
+    HGVSp_Short = if ("HGVSp_Short" %in% colnames(combined_maf_grant)) HGVSp_Short else NA_character_,
+    Source_MAF_File = if ("Source_MAF_File" %in% colnames(combined_maf_grant)) Source_MAF_File else NA_character_
+  )
+]
+
+cat("\n========== Raw WES VAF-related columns for selected genes ==========\n")
+print(vaf_check_dt)
+
+vaf_missingness <- vaf_check_dt[
+  ,
+  .(
+    n_rows = .N,
+    t_depth_nonmissing = sum(!is.na(t_depth) & as.character(t_depth) != ""),
+    t_ref_count_nonmissing = sum(!is.na(t_ref_count) & as.character(t_ref_count) != ""),
+    t_alt_count_nonmissing = sum(!is.na(t_alt_count) & as.character(t_alt_count) != "")
+  )
+]
+
+cat("\n========== Missingness of WES VAF columns ==========\n")
+print(vaf_missingness)
+
+fwrite(
+  vaf_check_dt,
+  file = file.path(table_dir, "ERpos_Bionano_WES_CDH1_PIK3CA_ERBB2_ERBB3_raw_VAF_column_check.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  na = ""
+)
+
+fwrite(
+  vaf_missingness,
+  file = file.path(table_dir, "ERpos_Bionano_WES_CDH1_PIK3CA_ERBB2_ERBB3_VAF_column_missingness.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  na = ""
+)
+```
+
+# 6. WES VAF calculation and summary tables
+
+```{r wes-vaf-summary}
+wes_vaf_genes <- copy(
+  combined_maf_grant[
+    Hugo_Symbol %in% vaf_genes
+  ]
+)
+
+# Add optional columns if missing, so downstream table code is stable.
+optional_cols <- c(
+  "Chromosome",
+  "Start_Position",
+  "End_Position",
+  "Reference_Allele",
+  "Tumor_Seq_Allele2",
+  "HGVSp_Short",
+  "HGVSp",
+  "HGVSc",
+  "Source_MAF_File"
+)
+
+for (cc in optional_cols) {
+  if (!cc %in% colnames(wes_vaf_genes)) {
+    wes_vaf_genes[, (cc) := NA_character_]
+  }
+}
+
+# Convert count columns to numeric.
+wes_vaf_genes[, t_depth_num := make_numeric_safely(t_depth)]
+wes_vaf_genes[, t_ref_count_num := make_numeric_safely(t_ref_count)]
+wes_vaf_genes[, t_alt_count_num := make_numeric_safely(t_alt_count)]
+
+# Primary VAF calculation: t_alt_count / t_depth.
+wes_vaf_genes[, Tumor_VAF_percent := fifelse(
+  !is.na(t_depth_num) & t_depth_num > 0 & !is.na(t_alt_count_num),
+  100 * t_alt_count_num / t_depth_num,
+  NA_real_
+)]
+
+wes_vaf_genes[, VAF_Source := fifelse(
+  !is.na(Tumor_VAF_percent),
+  "t_alt_count / t_depth",
+  NA_character_
+)]
+
+# Backup VAF calculation: t_alt_count / (t_ref_count + t_alt_count)
+# This is used only when t_depth-based VAF is not available.
+wes_vaf_genes[
+  is.na(Tumor_VAF_percent) &
+    !is.na(t_ref_count_num) &
+    !is.na(t_alt_count_num) &
+    (t_ref_count_num + t_alt_count_num) > 0,
+  `:=`(
+    Tumor_VAF_percent = 100 * t_alt_count_num / (t_ref_count_num + t_alt_count_num),
+    VAF_Source = "t_alt_count / (t_ref_count + t_alt_count)"
+  )
+]
+
+cat("\n========== WES selected-gene rows with VAF calculation status ==========\n")
+print(
+  wes_vaf_genes[
+    ,
+    .(
+      Tumor_Sample_Barcode,
+      Hugo_Symbol,
+      Variant_Classification,
+      t_depth,
+      t_ref_count,
+      t_alt_count,
+      Tumor_VAF_percent = round(Tumor_VAF_percent, 2),
+      VAF_Source,
+      HGVSp_Short,
+      Source_MAF_File
+    )
+  ][order(Hugo_Symbol, Tumor_Sample_Barcode, -Tumor_VAF_percent)]
+)
+
+# Keep all mutation rows for mutation-frequency summary.
+# For VAF summaries, VAF values may be NA if count columns are empty.
+
+# ------------------------------------------------------------
+# Variant-level WES VAF table
+# ------------------------------------------------------------
+
+variant_vaf_table <- wes_vaf_genes[
+  ,
+  .(
+    Sample = Tumor_Sample_Barcode,
+    Gene = Hugo_Symbol,
+    Variant_Classification,
+    Chromosome,
+    Start_Position,
+    End_Position,
+    Reference_Allele,
+    Tumor_Seq_Allele2,
+    HGVSp_Short,
+    HGVSp,
+    HGVSc,
+    t_depth = t_depth_num,
+    t_ref_count = t_ref_count_num,
+    t_alt_count = t_alt_count_num,
+    Tumor_VAF_percent = round(Tumor_VAF_percent, 2),
+    VAF_Source,
+    Source_MAF_File
+  )
+][order(Gene, Sample, -Tumor_VAF_percent)]
+
+cat("\n========== Variant-level WES VAF table ==========\n")
+print(variant_vaf_table)
+
+fwrite(
+  variant_vaf_table,
+  file = file.path(table_dir, "ERpos_Bionano_WES_CDH1_PIK3CA_ERBB2_ERBB3_variant_level_VAF.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  na = ""
+)
+
+# ------------------------------------------------------------
+# Sample-gene WES summary
+# One row per sample/gene. If multiple variants are present,
+# keep max VAF for comparison but list all VAFs.
+# ------------------------------------------------------------
+
+sample_gene_vaf_summary <- wes_vaf_genes[
+  ,
+  .(
+    n_variants = .N,
+    max_VAF_percent = if (all(is.na(Tumor_VAF_percent))) NA_real_ else round(max(Tumor_VAF_percent, na.rm = TRUE), 2),
+    median_VAF_percent = if (all(is.na(Tumor_VAF_percent))) NA_real_ else round(median(Tumor_VAF_percent, na.rm = TRUE), 2),
+    VAF_percent_list = if (all(is.na(Tumor_VAF_percent))) NA_character_ else paste(round(Tumor_VAF_percent[!is.na(Tumor_VAF_percent)], 2), collapse = "; "),
+    Variant_Classification_List = paste(unique(Variant_Classification), collapse = "; "),
+    HGVSp_Short_List = paste(unique(na.omit(HGVSp_Short)), collapse = "; "),
+    VAF_Source_List = paste(unique(na.omit(VAF_Source)), collapse = "; ")
+  ),
+  by = .(
+    Sample = Tumor_Sample_Barcode,
+    Gene = Hugo_Symbol
+  )
+][order(Gene, Sample)]
+
+cat("\n========== Sample-gene WES VAF summary ==========\n")
+print(sample_gene_vaf_summary)
+
+fwrite(
+  sample_gene_vaf_summary,
+  file = file.path(table_dir, "ERpos_Bionano_WES_CDH1_PIK3CA_ERBB2_ERBB3_sample_gene_VAF_summary.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  na = ""
+)
+
+# ------------------------------------------------------------
+# Gene-level WES summary
+# Uses one value per sample/gene = max VAF.
+# Mutation frequency does not require VAF to be calculable.
+# ------------------------------------------------------------
+
+gene_level_vaf_summary <- sample_gene_vaf_summary[
+  ,
+  .(
+    mutated_samples = uniqueN(Sample),
+    median_VAF_percent = if (all(is.na(max_VAF_percent))) NA_real_ else round(median(max_VAF_percent, na.rm = TRUE), 2),
+    mean_VAF_percent = if (all(is.na(max_VAF_percent))) NA_real_ else round(mean(max_VAF_percent, na.rm = TRUE), 2),
+    min_VAF_percent = if (all(is.na(max_VAF_percent))) NA_real_ else round(min(max_VAF_percent, na.rm = TRUE), 2),
+    max_VAF_percent = if (all(is.na(max_VAF_percent))) NA_real_ else round(max(max_VAF_percent, na.rm = TRUE), 2)
+  ),
+  by = Gene
+]
+
+gene_level_vaf_summary <- merge(
+  data.table(Gene = vaf_genes),
+  gene_level_vaf_summary,
+  by = "Gene",
+  all.x = TRUE,
+  sort = FALSE
+)
+
+gene_level_vaf_summary[is.na(mutated_samples), `:=`(
+  mutated_samples = 0,
+  median_VAF_percent = NA_real_,
+  mean_VAF_percent = NA_real_,
+  min_VAF_percent = NA_real_,
+  max_VAF_percent = NA_real_
+)]
+
+gene_level_vaf_summary[, WES_assessable_samples := length(wes_samples_available)]
+
+gene_level_vaf_summary[, mutation_frequency_percent := round(
+  100 * mutated_samples / WES_assessable_samples,
+  1
+)]
+
+setcolorder(
+  gene_level_vaf_summary,
+  c(
+    "Gene",
+    "mutated_samples",
+    "WES_assessable_samples",
+    "mutation_frequency_percent",
+    "median_VAF_percent",
+    "mean_VAF_percent",
+    "min_VAF_percent",
+    "max_VAF_percent"
+  )
+)
+
+cat("\n========== Gene-level WES VAF summary ==========\n")
+print(gene_level_vaf_summary)
+
+fwrite(
+  gene_level_vaf_summary,
+  file = file.path(table_dir, "ERpos_Bionano_WES_CDH1_PIK3CA_ERBB2_ERBB3_gene_level_VAF_summary.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  na = ""
+)
+```
+
+# 7. Complete sample x gene WES table
+
+```{r complete-sample-gene-table}
+sample_gene_complete <- CJ(
+  Sample = grant_samples_10,
+  Gene = vaf_genes
+)
+
+sample_gene_complete <- merge(
+  sample_gene_complete,
+  sample_gene_vaf_summary,
+  by = c("Sample", "Gene"),
+  all.x = TRUE,
+  sort = FALSE
+)
+
+sample_gene_complete[, WES_available := Sample %in% wes_samples_available]
+
+sample_gene_complete[, Mutation_status := fifelse(
+  !WES_available,
+  "WES not available",
+  fifelse(is.na(n_variants), "No mutation detected", "Mutated")
+)]
+
+sample_gene_complete[is.na(n_variants), n_variants := 0]
+
+sample_gene_complete <- sample_gene_complete[
+  ,
+  .(
+    Sample,
+    Gene,
+    WES_available,
+    Mutation_status,
+    n_variants,
+    max_VAF_percent,
+    median_VAF_percent,
+    VAF_percent_list,
+    Variant_Classification_List,
+    HGVSp_Short_List,
+    VAF_Source_List
+  )
+][order(Sample, Gene)]
+
+cat("\n========== Complete sample x gene WES VAF table ==========\n")
+print(sample_gene_complete)
+
+fwrite(
+  sample_gene_complete,
+  file = file.path(table_dir, "ERpos_Bionano_WES_CDH1_PIK3CA_ERBB2_ERBB3_complete_sample_gene_VAF_table.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  na = ""
+)
+
+# Wide table for quick visual inspection.
+sample_gene_complete[, VAF_display := fifelse(
+  Mutation_status == "WES not available",
+  "WES not available",
+  fifelse(
+    Mutation_status == "No mutation detected",
+    "No mutation",
+    fifelse(
+      is.na(VAF_percent_list) | VAF_percent_list == "",
+      "Mutated; VAF unavailable",
+      paste0(VAF_percent_list, "%")
+    )
+  )
+)]
+
+wes_vaf_wide_table <- dcast(
+  sample_gene_complete,
+  Sample + WES_available ~ Gene,
+  value.var = "VAF_display"
+)
+
+cat("\n========== WES VAF wide table ==========\n")
+print(wes_vaf_wide_table)
+
+fwrite(
+  wes_vaf_wide_table,
+  file = file.path(table_dir, "ERpos_Bionano_WES_CDH1_PIK3CA_ERBB2_ERBB3_wide_VAF_table.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  na = ""
+)
+```
+
+# 8. WES vs IMPACT-ready summary text
+
+```{r summary-text}
+cat("\n========== Key output files ==========\n")
+cat("Gene-level WES VAF summary:\n")
+cat(file.path(table_dir, "ERpos_Bionano_WES_CDH1_PIK3CA_ERBB2_ERBB3_gene_level_VAF_summary.tsv"), "\n\n")
+
+cat("Complete sample x gene WES table:\n")
+cat(file.path(table_dir, "ERpos_Bionano_WES_CDH1_PIK3CA_ERBB2_ERBB3_complete_sample_gene_VAF_table.tsv"), "\n\n")
+
+cat("Wide WES VAF table:\n")
+cat(file.path(table_dir, "ERpos_Bionano_WES_CDH1_PIK3CA_ERBB2_ERBB3_wide_VAF_table.tsv"), "\n\n")
+
+cat("Raw VAF column check:\n")
+cat(file.path(table_dir, "ERpos_Bionano_WES_CDH1_PIK3CA_ERBB2_ERBB3_raw_VAF_column_check.tsv"), "\n\n")
+```
+
+# 9. Session information
+
+```{r session-info}
+sessionInfo()
+```
