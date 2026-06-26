@@ -1,0 +1,617 @@
+---
+title: "pILC_RNASeq_Heatmap_Bionano_n10"
+output: html_document
+date: "2026-06-23"
+---
+# ============================================================
+# RNA-seq heatmap for ER+ pILC Bionano subgroup
+# Input: log2TPM matrix
+# Main figure: same WES/IMPACT breast/cancer gene panel
+# Optional figure: top variable expressed genes
+# Output: /ix1/alee/LO_LAB/Personal/Rahul/pILC/Grant/RNASeq/
+# ============================================================
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r}
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(stringr)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(grid)
+})
+
+graphics.off()
+gc()
+
+# ============================================================
+# Paths
+# ============================================================
+
+tpm_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/4_Count_file_pILC/Max_TPM/tpm_matrix_pILC_log2TPM.txt"
+
+clinical_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/Grant/pILC_ClinicoPathological_details.csv"
+
+out_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/Grant/RNASeq"
+table_dir <- file.path(out_dir, "tables")
+plot_dir <- file.path(out_dir, "plots")
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(table_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+
+# ============================================================
+# ER+ Bionano subgroup
+# 10 samples total; RNA-seq expected for 9 of 10
+# ============================================================
+
+grant_samples_10 <- c(
+  "TP05-232",
+  "TP05-726",
+  "TP07-626",
+  "TP08-2202",
+  "TP11-1516",
+  "TP11-1780",
+  "TP12-880",
+  "TP13-820",
+  "TP14-385",
+  "TP15-M509"
+)
+
+# Same WES/IMPACT breast/cancer gene panel
+breast_genes <- c(
+  "ERBB2", "FGFR1", "NF1", "GNAS", "PAK1", "PIK3CA", "PTEN",
+  "AKT1", "GATA3", "ESR1", "FOXA1", "ARID1A", "TBX3", "MYC",
+  "MCL1", "MAP3K1", "RECQL4", "RARA", "CCND1", "CDH1", "TP53",
+  "BRCA1", "RICTOR", "FAT1", "JAK3", "CIC", "ARID2", "ERBB3"
+)
+
+# ============================================================
+# Helper functions
+# ============================================================
+
+parse_percent_value <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+  x[x %in% c("", "NA", "N/A", "NaN", "nan")] <- NA_character_
+
+  is_less_than <- grepl("^<", x)
+
+  val <- suppressWarnings(
+    as.numeric(gsub("[^0-9.]", "", x))
+  )
+
+  val[is_less_than & !is.na(val)] <- val[is_less_than & !is.na(val)] / 2
+
+  return(val)
+}
+
+clean_grade_status <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+  x <- gsub("\\s+", " ", x)
+
+  out <- x
+  out[x %in% c("", "NA", "N/A", "NaN", "nan") | is.na(x)] <- "Unknown"
+
+  return(out)
+}
+
+zscore_rows <- function(mat) {
+  z <- t(scale(t(mat)))
+  z[is.na(z)] <- 0
+  z[z > 2.5] <- 2.5
+  z[z < -2.5] <- -2.5
+  z
+}
+
+# ============================================================
+# Read RNA-seq log2TPM matrix
+# ============================================================
+
+cat("Reading TPM matrix:\n", tpm_file, "\n\n")
+
+tpm_dt <- fread(
+  tpm_file,
+  sep = "\t",
+  header = TRUE,
+  data.table = TRUE,
+  check.names = FALSE
+)
+
+if (!"Gene" %in% colnames(tpm_dt)) {
+  stop("Input TPM matrix must contain a column named 'Gene'.")
+}
+
+tpm_dt[, Gene := trimws(as.character(Gene))]
+
+# Convert expression columns to numeric
+sample_cols_all <- setdiff(colnames(tpm_dt), "Gene")
+
+for (cc in sample_cols_all) {
+  tpm_dt[, (cc) := suppressWarnings(as.numeric(get(cc)))]
+}
+
+# If duplicate gene symbols exist, keep mean expression per gene
+tpm_dt <- tpm_dt[
+  !is.na(Gene) & Gene != "",
+  lapply(.SD, mean, na.rm = TRUE),
+  by = Gene,
+  .SDcols = sample_cols_all
+]
+
+# ============================================================
+# Identify RNA-seq available subgroup samples
+# ============================================================
+
+rna_available_samples <- grant_samples_10[
+  grant_samples_10 %in% colnames(tpm_dt)
+]
+
+rna_missing_samples <- setdiff(grant_samples_10, rna_available_samples)
+
+cat("========== RNA-seq availability in ER+ Bionano subgroup ==========\n")
+cat("Total ER+ Bionano samples:", length(grant_samples_10), "\n")
+cat("RNA-seq available:", length(rna_available_samples), "\n")
+cat("RNA-seq missing:", length(rna_missing_samples), "\n\n")
+
+cat("RNA-seq available samples:\n")
+print(rna_available_samples)
+
+cat("\nRNA-seq missing samples:\n")
+print(rna_missing_samples)
+
+rna_availability <- data.table(
+  Sample = grant_samples_10,
+  RNAseq_available = grant_samples_10 %in% rna_available_samples
+)
+
+fwrite(
+  rna_availability,
+  file = file.path(table_dir, "ERpos_Bionano_n10_RNAseq_sample_availability.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  na = ""
+)
+
+# ============================================================
+# Read clinical annotation
+# Same bottom annotation style as WES/IMPACT ComplexHeatmap
+# ============================================================
+
+clinical_dt <- fread(
+  clinical_file,
+  sep = ",",
+  header = TRUE,
+  data.table = TRUE,
+  fill = TRUE,
+  na.strings = c("", "NA", "NaN", "N/A")
+)
+
+clinical_dt[, Sample_key := trimws(as.character(Sample))]
+
+clinical_dt[, tumor_cellularity_pct := parse_percent_value(`tumor_cellularity (%)`)]
+
+clinical_dt[, pleomorphic_component_cellularity_pct := parse_percent_value(
+  `pleomorphic_invasive_compoent_cellularity (%)`
+)]
+
+clinical_dt[, TILs_pct := parse_percent_value(`TILs (%)`)]
+
+clinical_dt[, Grade_clean := clean_grade_status(`Grade/Differentiation-Desc`)]
+
+clinical_plot_dt <- unique(
+  clinical_dt[
+    ,
+    .(
+      Sample_key,
+      tumor_cellularity_pct,
+      pleomorphic_component_cellularity_pct,
+      TILs_pct,
+      Grade_clean
+    )
+  ],
+  by = "Sample_key"
+)
+
+sample_clin_dt <- data.table(
+  Tumor_Sample_Barcode = rna_available_samples,
+  Sample_key = rna_available_samples
+)
+
+sample_clin_dt <- merge(
+  sample_clin_dt,
+  clinical_plot_dt,
+  by = "Sample_key",
+  all.x = TRUE,
+  sort = FALSE
+)
+
+sample_clin_dt <- sample_clin_dt[
+  match(rna_available_samples, Tumor_Sample_Barcode)
+]
+
+fwrite(
+  sample_clin_dt,
+  file = file.path(table_dir, "ERpos_Bionano_RNAseq_sample_order_and_clinical_annotation.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  na = ""
+)
+
+clinical_anno_df <- data.frame(
+  `Tumor cell. (%)` = sample_clin_dt$tumor_cellularity_pct,
+  `Pleomorphic (%)` = sample_clin_dt$pleomorphic_component_cellularity_pct,
+  `TILs (%)` = sample_clin_dt$TILs_pct,
+  Grade = sample_clin_dt$Grade_clean,
+  check.names = FALSE
+)
+
+rownames(clinical_anno_df) <- rna_available_samples
+
+grade_cols <- c(
+  "Grade I" = "#A6CEE3",
+  "Grade II" = "#33A02C",
+  "Grade III" = "#1F78B4",
+  "Cell type not determined" = "#E31A1C",
+  "Unknown" = "#BDBDBD"
+)
+
+observed_grade_levels <- unique(na.omit(clinical_anno_df$Grade))
+observed_grade_levels <- observed_grade_levels[observed_grade_levels != ""]
+
+missing_grade_levels <- setdiff(observed_grade_levels, names(grade_cols))
+
+grade_cols_local <- grade_cols
+
+if (length(missing_grade_levels) > 0) {
+  extra_grade_cols <- hcl.colors(length(missing_grade_levels), palette = "Dark 3")
+  names(extra_grade_cols) <- missing_grade_levels
+  grade_cols_local <- c(grade_cols_local, extra_grade_cols)
+}
+
+clinical_anno_cols <- list(
+  `Tumor cell. (%)` = colorRamp2(
+    c(0, 50, 100),
+    c("#F7FBFF", "#6BAED6", "#08306B")
+  ),
+  `Pleomorphic (%)` = colorRamp2(
+    c(0, 50, 100),
+    c("#F7FCF5", "#74C476", "#00441B")
+  ),
+  `TILs (%)` = colorRamp2(
+    c(0, 30, 100),
+    c("#FFF5F0", "#FB6A4A", "#67000D")
+  ),
+  Grade = grade_cols_local
+)
+
+bottom_clin_ha <- HeatmapAnnotation(
+  ` ` = anno_empty(
+    height = unit(0.2, "mm"),
+    border = FALSE
+  ),
+  df = clinical_anno_df,
+  col = clinical_anno_cols,
+  na_col = "grey90",
+  which = "column",
+  annotation_name_side = "left",
+  annotation_name_rot = 0,
+  annotation_name_gp = gpar(fontsize = 8),
+  simple_anno_size = unit(0.22, "cm"),
+  gap = unit(c(0.4, rep(0.5, ncol(clinical_anno_df) - 1)), "mm"),
+  show_annotation_name = c(
+    ` ` = FALSE,
+    `Tumor cell. (%)` = TRUE,
+    `Pleomorphic (%)` = TRUE,
+    `TILs (%)` = TRUE,
+    Grade = TRUE
+  ),
+  annotation_legend_param = list(
+    `Tumor cell. (%)` = list(title = "Tumor cell. (%)"),
+    `Pleomorphic (%)` = list(title = "Pleomorphic (%)"),
+    `TILs (%)` = list(title = "TILs (%)"),
+    Grade = list(title = "Grade")
+  )
+)
+
+# ============================================================
+# Main heatmap: same WES/IMPACT breast/cancer gene panel
+# ============================================================
+
+panel_genes_present <- breast_genes[
+  breast_genes %in% tpm_dt$Gene
+]
+
+panel_genes_missing <- setdiff(breast_genes, panel_genes_present)
+
+cat("\n========== Breast/cancer panel genes in RNA-seq matrix ==========\n")
+cat("Panel genes present:", length(panel_genes_present), "\n")
+cat("Panel genes missing:", length(panel_genes_missing), "\n\n")
+
+cat("Missing panel genes:\n")
+print(panel_genes_missing)
+
+fwrite(
+  data.table(
+    Gene = breast_genes,
+    Present_in_RNAseq_TPM_matrix = breast_genes %in% tpm_dt$Gene
+  ),
+  file = file.path(table_dir, "ERpos_Bionano_RNAseq_WES_IMPACT_panel_gene_presence.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  na = ""
+)
+
+expr_panel_dt <- tpm_dt[
+  Gene %in% panel_genes_present,
+  c("Gene", rna_available_samples),
+  with = FALSE
+]
+
+# Preserve original panel gene order
+expr_panel_dt[, Gene := factor(Gene, levels = panel_genes_present)]
+expr_panel_dt <- expr_panel_dt[order(Gene)]
+expr_panel_dt[, Gene := as.character(Gene)]
+
+expr_panel_mat <- as.matrix(expr_panel_dt[, ..rna_available_samples])
+rownames(expr_panel_mat) <- expr_panel_dt$Gene
+
+expr_panel_z <- zscore_rows(expr_panel_mat)
+
+fwrite(
+  data.table(Gene = rownames(expr_panel_mat), expr_panel_mat),
+  file = file.path(table_dir, "ERpos_Bionano_RNAseq_WES_IMPACT_panel_log2TPM_matrix.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  na = ""
+)
+
+fwrite(
+  data.table(Gene = rownames(expr_panel_z), expr_panel_z),
+  file = file.path(table_dir, "ERpos_Bionano_RNAseq_WES_IMPACT_panel_rowZ_matrix.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  na = ""
+)
+
+cell_size_mm <- 4   # smaller: 2.5 or 2.0; larger: 3.5 or 4.0
+
+heatmap_body_width_mm  <- max(45, cell_size_mm * ncol(expr_panel_z))
+heatmap_body_height_mm <- max(55, cell_size_mm * nrow(expr_panel_z))
+
+plot_width  <- max(8, min(18, heatmap_body_width_mm / 25.4 + 5.0))
+plot_height <- max(8, min(20, heatmap_body_height_mm / 25.4 + 4.8))
+
+expr_col_fun <- colorRamp2(
+  c(-2.5, 0, 2.5),
+  c("#2166AC", "white", "#B2182B")
+)
+
+# Distance between title and heatmap body
+ht_opt$TITLE_PADDING = unit(c(2, 10), "mm")
+
+ht_panel <- Heatmap(
+  expr_panel_z,
+  name = "Row Z-score",
+  col = expr_col_fun,
+
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  column_order = rna_available_samples,
+
+  show_row_names = TRUE,
+  show_column_names = FALSE,
+  row_names_side = "left",
+  row_names_gp = gpar(fontsize = 8),
+
+  column_title = paste0(
+    "ER+ pILC Bionano Subgroup: RNA-seq Expression\n",
+    "WES/IMPACT Gene Panel | genes: ", nrow(expr_panel_z),
+    " | samples: ", ncol(expr_panel_z)
+  ),
+  column_title_gp = gpar(fontsize = 9, fontface = "bold"),
+
+  width = unit(heatmap_body_width_mm, "mm"),
+  height = unit(heatmap_body_height_mm, "mm"),
+
+  bottom_annotation = bottom_clin_ha,
+
+  column_gap = unit(0.05, "mm"),
+  row_gap = unit(0.05, "mm"),
+
+  heatmap_legend_param = list(
+    title = "Expression\nrow Z-score",
+    title_gp = gpar(fontsize = 9, fontface = "bold"),
+    labels_gp = gpar(fontsize = 8)
+  )
+)
+
+pdf_file <- file.path(
+  plot_dir,
+  "ERpos_Bionano_RNAseq_heatmap_WES_IMPACT_gene_panel_rowZ.pdf"
+)
+
+png_file <- file.path(
+  plot_dir,
+  "ERpos_Bionano_RNAseq_heatmap_WES_IMPACT_gene_panel_rowZ.png"
+)
+
+pdf(pdf_file, width = plot_width, height = plot_height)
+
+draw(
+  ht_panel,
+  heatmap_legend_side = "right",
+  annotation_legend_side = "right",
+  merge_legends = FALSE,
+  padding = unit(c(4, 22, 6, 4), "mm")
+)
+
+dev.off()
+
+png(
+  filename = png_file,
+  width = plot_width,
+  height = plot_height,
+  units = "in",
+  res = 300
+)
+
+draw(
+  ht_panel,
+  heatmap_legend_side = "right",
+  annotation_legend_side = "right",
+  merge_legends = FALSE,
+  padding = unit(c(4, 22, 6, 4), "mm")
+)
+
+dev.off()
+
+cat("\nSaved main RNA-seq panel heatmap:\n")
+cat(pdf_file, "\n")
+cat(png_file, "\n")
+
+# ============================================================
+# Optional heatmap: top variable genes within RNA-seq available samples
+# This is useful as supplemental/internal feasibility QC
+# ============================================================
+
+top_n_variable <- 50
+
+expr_all_mat <- as.matrix(tpm_dt[, ..rna_available_samples])
+rownames(expr_all_mat) <- tpm_dt$Gene
+
+gene_var <- apply(expr_all_mat, 1, var, na.rm = TRUE)
+
+gene_var_dt <- data.table(
+  Gene = rownames(expr_all_mat),
+  variance = gene_var
+)
+
+gene_var_dt <- gene_var_dt[
+  is.finite(variance)
+][
+  order(-variance)
+]
+
+top_variable_genes <- head(gene_var_dt$Gene, top_n_variable)
+
+expr_var_mat <- expr_all_mat[top_variable_genes, , drop = FALSE]
+expr_var_z <- zscore_rows(expr_var_mat)
+
+fwrite(
+  gene_var_dt,
+  file = file.path(table_dir, "ERpos_Bionano_RNAseq_all_genes_variance_rank.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  na = ""
+)
+
+fwrite(
+  data.table(Gene = rownames(expr_var_z), expr_var_z),
+  file = file.path(table_dir, paste0("ERpos_Bionano_RNAseq_top", top_n_variable, "_variable_genes_rowZ_matrix.tsv")),
+  sep = "\t",
+  quote = FALSE,
+  na = ""
+)
+
+# ============================================================
+# Optional heatmap: top variable genes
+# Cell size and plot size must be defined BEFORE Heatmap()
+# ============================================================
+
+cell_size_mm <- 4.0
+
+heatmap_body_width_mm_var <- max(40, cell_size_mm * ncol(expr_var_z))
+heatmap_body_height_mm_var <- max(45, cell_size_mm * nrow(expr_var_z))
+
+plot_width_var <- max(7, min(16, heatmap_body_width_mm_var / 25.4 + 5.0))
+plot_height_var <- max(7, min(18, heatmap_body_height_mm_var / 25.4 + 4.8))
+
+# Control distance between title and heatmap body
+ht_opt$TITLE_PADDING = unit(c(2, 10), "mm")
+
+ht_var <- Heatmap(
+  expr_var_z,
+  name = "Row Z-score",
+  col = expr_col_fun,
+
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+
+  show_row_names = TRUE,
+  show_column_names = FALSE,
+  row_names_side = "left",
+  row_names_gp = gpar(fontsize = 6),
+
+  column_title = paste0(
+    "ER+ pILC Bionano Subgroup: Top ",
+    top_n_variable,
+    " Variable RNA-seq Genes\n",
+    "samples: ", ncol(expr_var_z)
+  ),
+  column_title_gp = gpar(fontsize = 9, fontface = "bold"),
+
+  width = unit(heatmap_body_width_mm_var, "mm"),
+  height = unit(heatmap_body_height_mm_var, "mm"),
+
+  bottom_annotation = bottom_clin_ha,
+
+  column_gap = unit(0.05, "mm"),
+  row_gap = unit(0.05, "mm"),
+
+  heatmap_legend_param = list(
+    title = "Expression\nrow Z-score",
+    title_gp = gpar(fontsize = 9, fontface = "bold"),
+    labels_gp = gpar(fontsize = 8)
+  )
+)
+
+pdf_file_var <- file.path(
+  plot_dir,
+  paste0("ERpos_Bionano_RNAseq_heatmap_top", top_n_variable, "_variable_genes_rowZ.pdf")
+)
+
+png_file_var <- file.path(
+  plot_dir,
+  paste0("ERpos_Bionano_RNAseq_heatmap_top", top_n_variable, "_variable_genes_rowZ.png")
+)
+
+pdf(pdf_file_var, width = plot_width_var, height = plot_height_var)
+
+draw(
+  ht_var,
+  heatmap_legend_side = "right",
+  annotation_legend_side = "right",
+  merge_legends = FALSE,
+  padding = unit(c(4, 22, 6, 4), "mm")
+)
+
+dev.off()
+
+png(
+  filename = png_file_var,
+  width = plot_width_var,
+  height = plot_height_var,
+  units = "in",
+  res = 300
+)
+
+draw(
+  ht_var,
+  heatmap_legend_side = "right",
+  annotation_legend_side = "right",
+  merge_legends = FALSE,
+  padding = unit(c(4, 22, 6, 4), "mm")
+)
+
+dev.off()
+
+cat("\nSaved optional top-variable-gene RNA-seq heatmap:\n")
+cat(pdf_file_var, "\n")
+cat(png_file_var, "\n")
+```
+
