@@ -1,0 +1,915 @@
+---
+title: "pILC RNA-seq Hallmark ssGSEA Sample-Level Bubble Dotplot - Scaled Color Gene Ratio Y Dendrogram"
+output: html_document
+date: "2026-06-26"
+---
+
+# ============================================================
+# RNA-seq Hallmark ssGSEA dotplot for ER+ pILC Bionano/grant subgroup
+# Input: log2TPM matrix
+# Gene sets: MSigDB Hallmark GMT file
+# Analysis: ssGSEA using only selected 10 samples
+# Plot: Hallmark pathway summary dotplot and sample-level bubble dotplot similar to example
+# Updated sample-level plot: pathway-wise 0-1 scaled ssGSEA color, gene ratio (%) size, Y-axis dendrogram
+# ============================================================
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = TRUE)
+```
+
+```{r}
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(ggplot2)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(grid)
+})
+
+if (!requireNamespace("GSVA", quietly = TRUE)) {
+  stop("The GSVA package is required for ssGSEA. Install/load GSVA before running this Rmd.")
+}
+
+if (!requireNamespace("ComplexHeatmap", quietly = TRUE)) {
+  stop("The ComplexHeatmap package is required to draw the Y-axis dendrogram bubble plot.")
+}
+
+if (!requireNamespace("circlize", quietly = TRUE)) {
+  stop("The circlize package is required for the ssGSEA score color scale.")
+}
+
+graphics.off()
+gc()
+
+# ============================================================
+# Paths
+# ============================================================
+
+tpm_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/4_Count_file_pILC/Max_TPM/tpm_matrix_pILC_log2TPM.txt"
+
+hallmark_gmt_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/GSEA/Dataset/h.all.v2025.1.Hs.symbols.gmt"
+
+out_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/Grant/RNASeq/ssGSEA/Hallmark_n10"
+table_dir <- file.path(out_dir, "tables")
+plot_dir <- file.path(out_dir, "plots")
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(table_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+
+# ============================================================
+# ER+ Bionano / grant subgroup: selected 10 samples only
+# ============================================================
+
+grant_samples_10 <- c(
+  "TP05-232",
+  "TP05-726",
+  "TP07-626",
+  "TP08-2202",
+  "TP11-1516",
+  "TP11-1780",
+  "TP12-880",
+  "TP13-820",
+  "TP14-385",
+  "TP15-M509"
+)
+
+# If TRUE, the script will stop when any of the 10 samples are absent
+# from the log2TPM matrix. If FALSE, it will run with available samples
+# and report the missing ones.
+stop_if_any_sample_missing <- FALSE
+
+# Minimum number of genes from a Hallmark gene set that must be present
+# in the TPM matrix.
+min_genes_present <- 10
+
+# Number of Hallmark pathways to show in dotplot.
+# Use 20 to match the style of the example figure.
+top_n_pathways_to_plot <- 20
+
+# Y-axis dendrogram is drawn directly from hierarchical clustering of pathways.
+# No cluster numbers or cluster labels are printed on the plot.
+
+# Expression cutoff for sample-level gene ratio (%).
+# For log2TPM / log2(TPM + 1), values > 0 correspond to genes with detectable TPM > 0.
+expressed_gene_log2TPM_cutoff <- 0
+
+# High-sample definition used for dot size.
+# "global_median" means a sample is counted as high for a pathway if its
+# ssGSEA score is above the median across all Hallmark pathway-sample scores.
+high_definition <- "global_median"
+
+# ============================================================
+# Helper functions
+# ============================================================
+
+read_gmt_as_list <- function(gmt_file) {
+  if (!file.exists(gmt_file)) {
+    stop("GMT file does not exist: ", gmt_file)
+  }
+
+  gmt_lines <- readLines(gmt_file, warn = FALSE)
+  gmt_lines <- gmt_lines[nchar(trimws(gmt_lines)) > 0]
+
+  gene_sets <- lapply(gmt_lines, function(x) {
+    parts <- strsplit(x, "\t")[[1]]
+    genes <- parts[-c(1, 2)]
+    genes <- unique(trimws(genes))
+    genes <- genes[!is.na(genes) & genes != ""]
+    genes
+  })
+
+  gene_set_names <- vapply(gmt_lines, function(x) strsplit(x, "\t")[[1]][1], character(1))
+  names(gene_sets) <- gene_set_names
+
+  gene_sets
+}
+
+clean_hallmark_name <- function(x) {
+  x <- gsub("^HALLMARK_", "", x)
+  x <- gsub("_", " ", x)
+  x
+}
+
+zscore_rows <- function(mat) {
+  z <- t(scale(t(mat)))
+  z[is.na(z)] <- 0
+  z[z > 2.5] <- 2.5
+  z[z < -2.5] <- -2.5
+  z
+}
+
+run_ssgsea_compatible <- function(expr_mat, gene_sets) {
+
+  # expr_mat: genes x samples numeric matrix, log2TPM values
+  # gene_sets: named list of gene symbols
+
+  if ("ssgseaParam" %in% getNamespaceExports("GSVA")) {
+
+    cat("Running ssGSEA using modern GSVA parameter interface...\n")
+
+    param <- GSVA::ssgseaParam(
+      exprData = expr_mat,
+      geneSets = gene_sets,
+      minSize = min_genes_present,
+      maxSize = Inf,
+      alpha = 0.25,
+      normalize = TRUE
+    )
+
+    score_mat <- GSVA::gsva(
+      param,
+      verbose = TRUE
+    )
+
+  } else {
+
+    cat("Running ssGSEA using classic GSVA interface...\n")
+
+    score_mat <- GSVA::gsva(
+      expr = expr_mat,
+      gset.idx.list = gene_sets,
+      method = "ssgsea",
+      kcdf = "Gaussian",
+      abs.ranking = FALSE,
+      min.sz = min_genes_present,
+      max.sz = Inf,
+      ssgsea.norm = TRUE,
+      verbose = TRUE
+    )
+  }
+
+  score_mat <- as.matrix(score_mat)
+  return(score_mat)
+}
+
+# ============================================================
+# Read RNA-seq log2TPM matrix
+# ============================================================
+
+cat("Reading TPM matrix:\n", tpm_file, "\n\n")
+
+tpm_dt <- fread(
+  tpm_file,
+  sep = "\t",
+  header = TRUE,
+  data.table = TRUE,
+  check.names = FALSE
+)
+
+if (!"Gene" %in% colnames(tpm_dt)) {
+  stop("Input TPM matrix must contain a column named 'Gene'.")
+}
+
+tpm_dt[, Gene := trimws(as.character(Gene))]
+
+sample_cols_all <- setdiff(colnames(tpm_dt), "Gene")
+
+for (cc in sample_cols_all) {
+  tpm_dt[, (cc) := suppressWarnings(as.numeric(get(cc)))]
+}
+
+# If duplicate gene symbols exist, keep mean expression per gene.
+tpm_dt <- tpm_dt[
+  !is.na(Gene) & Gene != "",
+  lapply(.SD, mean, na.rm = TRUE),
+  by = Gene,
+  .SDcols = sample_cols_all
+]
+
+for (cc in sample_cols_all) {
+  tpm_dt[!is.finite(get(cc)), (cc) := NA_real_]
+}
+
+# ============================================================
+# Identify RNA-seq available selected samples
+# ============================================================
+
+rna_available_samples <- grant_samples_10[
+  grant_samples_10 %in% colnames(tpm_dt)
+]
+
+rna_missing_samples <- setdiff(grant_samples_10, rna_available_samples)
+
+cat("========== RNA-seq availability in selected 10 samples ==========\n")
+cat("Requested samples:", length(grant_samples_10), "\n")
+cat("RNA-seq available:", length(rna_available_samples), "\n")
+cat("RNA-seq missing:", length(rna_missing_samples), "\n\n")
+
+cat("RNA-seq available samples:\n")
+print(rna_available_samples)
+
+cat("\nRNA-seq missing samples:\n")
+print(rna_missing_samples)
+
+if (stop_if_any_sample_missing && length(rna_missing_samples) > 0) {
+  stop("Some selected samples are missing from the log2TPM matrix. See printed missing samples.")
+}
+
+if (length(rna_available_samples) < 2) {
+  stop("Fewer than 2 selected samples are available in the log2TPM matrix.")
+}
+
+rna_availability <- data.table(
+  Sample = grant_samples_10,
+  RNAseq_available = grant_samples_10 %in% rna_available_samples
+)
+
+fwrite(
+  rna_availability,
+  file = file.path(table_dir, "Bionano_grant_n10_RNAseq_sample_availability.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  na = ""
+)
+
+# ============================================================
+# Build expression matrix for ssGSEA: genes x selected samples only
+# ============================================================
+
+expr_dt <- tpm_dt[
+  ,
+  c("Gene", rna_available_samples),
+  with = FALSE
+]
+
+expr_mat <- as.matrix(expr_dt[, ..rna_available_samples])
+rownames(expr_mat) <- expr_dt$Gene
+
+expr_mat[is.na(expr_mat)] <- 0
+expr_mat[!is.finite(expr_mat)] <- 0
+expr_mat <- expr_mat[!is.na(rownames(expr_mat)) & rownames(expr_mat) != "", , drop = FALSE]
+
+cat("\nExpression matrix used for ssGSEA:\n")
+print(dim(expr_mat))
+
+fwrite(
+  data.table(Gene = rownames(expr_mat), expr_mat),
+  file = file.path(table_dir, "Bionano_grant_n10_log2TPM_matrix_used_for_Hallmark_ssGSEA.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  na = ""
+)
+
+# ============================================================
+# Read Hallmark GMT gene sets
+# ============================================================
+
+cat("\nReading Hallmark GMT file:\n", hallmark_gmt_file, "\n\n")
+
+hallmark_gene_sets <- read_gmt_as_list(hallmark_gmt_file)
+
+cat("Number of Hallmark gene sets in GMT:", length(hallmark_gene_sets), "\n")
+
+hallmark_gene_sets_present <- lapply(
+  hallmark_gene_sets,
+  function(gs) intersect(gs, rownames(expr_mat))
+)
+
+hallmark_presence_dt <- rbindlist(
+  lapply(names(hallmark_gene_sets), function(nm) {
+    data.table(
+      Pathway = nm,
+      Pathway_clean = clean_hallmark_name(nm),
+      Original_gene_count = length(hallmark_gene_sets[[nm]]),
+      Present_gene_count = length(hallmark_gene_sets_present[[nm]]),
+      Missing_gene_count = length(setdiff(hallmark_gene_sets[[nm]], rownames(expr_mat))),
+      Present_genes = paste(hallmark_gene_sets_present[[nm]], collapse = ";"),
+      Missing_genes = paste(setdiff(hallmark_gene_sets[[nm]], rownames(expr_mat)), collapse = ";")
+    )
+  }),
+  fill = TRUE
+)
+
+fwrite(
+  hallmark_presence_dt,
+  file = file.path(table_dir, "Bionano_grant_n10_Hallmark_ssGSEA_gene_presence.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  na = ""
+)
+
+cat("\n========== Hallmark gene set overlap summary ==========\n")
+print(hallmark_presence_dt[, .(Pathway, Original_gene_count, Present_gene_count, Missing_gene_count)])
+
+hallmark_gene_sets_for_ssgsea <- hallmark_gene_sets_present[
+  lengths(hallmark_gene_sets_present) >= min_genes_present
+]
+
+if (length(hallmark_gene_sets_for_ssgsea) == 0) {
+  stop("No Hallmark gene sets passed min_genes_present. Lower min_genes_present or check gene symbols.")
+}
+
+cat("\nHallmark pathways used for ssGSEA:", length(hallmark_gene_sets_for_ssgsea), "\n")
+
+# ============================================================
+# Run ssGSEA
+# ============================================================
+
+ssgsea_score_mat <- run_ssgsea_compatible(
+  expr_mat = expr_mat,
+  gene_sets = hallmark_gene_sets_for_ssgsea
+)
+
+ssgsea_score_mat <- ssgsea_score_mat[, rna_available_samples, drop = FALSE]
+
+# Row Z-score is not used for the dotplot but is useful for a heatmap later.
+ssgsea_score_z <- zscore_rows(ssgsea_score_mat)
+
+fwrite(
+  data.table(Pathway = rownames(ssgsea_score_mat), ssgsea_score_mat),
+  file = file.path(table_dir, "Bionano_grant_n10_Hallmark_ssGSEA_raw_scores.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  na = ""
+)
+
+fwrite(
+  data.table(Pathway = rownames(ssgsea_score_z), ssgsea_score_z),
+  file = file.path(table_dir, "Bionano_grant_n10_Hallmark_ssGSEA_rowZ_scores.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  na = ""
+)
+
+cat("\nHallmark ssGSEA score matrix dimensions:\n")
+print(dim(ssgsea_score_mat))
+
+# ============================================================
+# Summarize Hallmark pathway activity for dotplot
+# ============================================================
+
+ssgsea_long_dt <- as.data.table(ssgsea_score_mat, keep.rownames = "Pathway") |>
+  pivot_longer(
+    cols = -Pathway,
+    names_to = "Sample",
+    values_to = "ssGSEA_score"
+  ) |>
+  as.data.table()
+
+ssgsea_long_dt[, Pathway_clean := clean_hallmark_name(Pathway)]
+
+if (high_definition == "global_median") {
+  high_cutoff <- median(ssgsea_long_dt$ssGSEA_score, na.rm = TRUE)
+  high_label <- paste0("High cutoff = global median ssGSEA score (", signif(high_cutoff, 3), ")")
+} else {
+  stop("Unsupported high_definition. Currently supported: global_median")
+}
+
+pathway_summary_dt <- ssgsea_long_dt[
+  ,
+  .(
+    Median_score = median(ssGSEA_score, na.rm = TRUE),
+    Mean_score = mean(ssGSEA_score, na.rm = TRUE),
+    Min_score = min(ssGSEA_score, na.rm = TRUE),
+    Max_score = max(ssGSEA_score, na.rm = TRUE),
+    Samples_high_n = sum(ssGSEA_score > high_cutoff, na.rm = TRUE),
+    Samples_tested_n = sum(!is.na(ssGSEA_score)),
+    Samples_high_percent = 100 * mean(ssGSEA_score > high_cutoff, na.rm = TRUE)
+  ),
+  by = .(Pathway, Pathway_clean)
+]
+
+setorder(pathway_summary_dt, -Median_score)
+
+fwrite(
+  pathway_summary_dt,
+  file = file.path(table_dir, "Bionano_grant_n10_Hallmark_ssGSEA_pathway_summary_for_dotplot.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  na = ""
+)
+
+plot_dt <- pathway_summary_dt[1:min(top_n_pathways_to_plot, .N)]
+plot_dt[, Pathway_clean := factor(Pathway_clean, levels = rev(Pathway_clean))]
+
+cat("\nTop pathways selected for dotplot:\n")
+print(plot_dt[, .(Pathway_clean, Median_score, Samples_high_percent)])
+
+# ============================================================
+# Hallmark ssGSEA dotplot
+# ============================================================
+
+p_dot <- ggplot(
+  plot_dt,
+  aes(
+    x = Median_score,
+    y = Pathway_clean,
+    size = Samples_high_percent,
+    color = Median_score
+  )
+) +
+  geom_point(alpha = 0.85) +
+  scale_size_area(
+    max_size = 11,
+    breaks = c(25, 50, 75, 100),
+    limits = c(0, 100),
+    name = "Samples high (%)"
+  ) +
+  scale_color_gradient(
+    low = "#17324D",
+    high = "#67B7F7",
+    name = "Median score"
+  ) +
+  labs(
+    title = paste0("Hallmark ssGSEA pathway activity across pILC samples"),
+    subtitle = paste0(
+      "Selected RNA-seq/Bionano grant samples: n = ", length(rna_available_samples),
+      " | Top ", nrow(plot_dt), " pathways by median ssGSEA score"
+    ),
+    x = "Median ssGSEA score",
+    y = "Hallmark pathway",
+    caption = high_label
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    plot.title = element_text(size = 18, face = "bold", hjust = 0),
+    plot.subtitle = element_text(size = 11, hjust = 0),
+    axis.title = element_text(size = 14),
+    axis.text.x = element_text(size = 11, color = "black"),
+    axis.text.y = element_text(size = 11, color = "grey25"),
+    panel.grid.major = element_line(color = "grey90", linewidth = 0.4),
+    panel.grid.minor = element_line(color = "grey94", linewidth = 0.25),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10),
+    plot.caption = element_text(size = 9, color = "grey30", hjust = 0)
+  )
+
+pdf_file <- file.path(
+  plot_dir,
+  "Bionano_grant_n10_Hallmark_ssGSEA_dotplot_top20_median_score.pdf"
+)
+
+png_file <- file.path(
+  plot_dir,
+  "Bionano_grant_n10_Hallmark_ssGSEA_dotplot_top20_median_score.png"
+)
+
+ggsave(
+  filename = pdf_file,
+  plot = p_dot,
+  width = 11.5,
+  height = 8.5,
+  units = "in"
+)
+
+ggsave(
+  filename = png_file,
+  plot = p_dot,
+  width = 11.5,
+  height = 8.5,
+  units = "in",
+  dpi = 300
+)
+
+cat("\nSaved Hallmark ssGSEA dotplot:\n")
+cat(pdf_file, "\n")
+cat(png_file, "\n")
+
+cat("\nSaved Hallmark ssGSEA tables:\n")
+cat(file.path(table_dir, "Bionano_grant_n10_Hallmark_ssGSEA_raw_scores.tsv"), "\n")
+cat(file.path(table_dir, "Bionano_grant_n10_Hallmark_ssGSEA_rowZ_scores.tsv"), "\n")
+cat(file.path(table_dir, "Bionano_grant_n10_Hallmark_ssGSEA_gene_presence.tsv"), "\n")
+cat(file.path(table_dir, "Bionano_grant_n10_Hallmark_ssGSEA_pathway_summary_for_dotplot.tsv"), "\n")
+
+
+# ============================================================
+# Sample-level Hallmark ssGSEA bubble plot
+# Similar to GSEA per-cell-type bubble plot style
+# ------------------------------------------------------------
+# Each dot = one sample-pathway pair
+# X-axis   = selected pILC sample
+# Y-axis   = Hallmark pathway ordered by hierarchical clustering
+# Color    = pathway-wise 0-1 scaled ssGSEA score
+# Size     = gene ratio (%)
+# ------------------------------------------------------------
+# Important:
+# In classical GSEA/GO plots, Gene Ratio often refers to enriched or leading-edge
+# genes. For ssGSEA, there is no direct leading-edge gene ratio from the score.
+# Here Gene Ratio (%) is defined as:
+#     expressed Hallmark genes in that sample / Hallmark genes present in matrix x 100
+# where expressed means log2TPM > expressed_gene_log2TPM_cutoff.
+# ============================================================
+
+# Use the same top pathways selected by median ssGSEA score in the summary plot.
+top_pathways_for_sample_plot <- as.character(plot_dt$Pathway)
+
+# ------------------------------------------------------------
+# Calculate sample-level gene ratio (%) for each pathway-sample pair
+# ------------------------------------------------------------
+
+gene_ratio_dt <- rbindlist(
+  lapply(names(hallmark_gene_sets_for_ssgsea), function(pw) {
+
+    genes_present <- intersect(hallmark_gene_sets_for_ssgsea[[pw]], rownames(expr_mat))
+
+    rbindlist(
+      lapply(rna_available_samples, function(ss) {
+
+        if (length(genes_present) == 0) {
+          return(data.table(
+            Pathway = pw,
+            Sample = ss,
+            Pathway_present_gene_count = 0L,
+            Expressed_gene_count = 0L,
+            Gene_ratio_percent = NA_real_
+          ))
+        }
+
+        vals <- expr_mat[genes_present, ss]
+        expressed_n <- sum(vals > expressed_gene_log2TPM_cutoff, na.rm = TRUE)
+
+        data.table(
+          Pathway = pw,
+          Sample = ss,
+          Pathway_present_gene_count = length(genes_present),
+          Expressed_gene_count = expressed_n,
+          Gene_ratio_percent = 100 * expressed_n / length(genes_present)
+        )
+      }),
+      fill = TRUE
+    )
+  }),
+  fill = TRUE
+)
+
+fwrite(
+  gene_ratio_dt,
+  file = file.path(table_dir, "Bionano_grant_n10_Hallmark_ssGSEA_sample_level_gene_ratio.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  na = ""
+)
+
+# ------------------------------------------------------------
+# Combine raw ssGSEA score with gene ratio (%)
+# ------------------------------------------------------------
+
+sample_bubble_dt <- merge(
+  ssgsea_long_dt,
+  gene_ratio_dt,
+  by = c("Pathway", "Sample"),
+  all.x = TRUE
+)
+
+sample_bubble_dt[, Pathway_clean := clean_hallmark_name(Pathway)]
+
+sample_bubble_plot_dt <- sample_bubble_dt[
+  Pathway %in% top_pathways_for_sample_plot
+]
+
+# ------------------------------------------------------------
+# Hierarchical clustering of pathways on Y-axis
+# Draw dendrogram only; no cluster labels / no Cluster 1/2/3 panels.
+# ------------------------------------------------------------
+
+top_pathway_score_mat <- ssgsea_score_mat[
+  top_pathways_for_sample_plot,
+  rna_available_samples,
+  drop = FALSE
+]
+
+top_pathway_score_mat[!is.finite(top_pathway_score_mat)] <- 0
+
+if (nrow(top_pathway_score_mat) >= 2) {
+
+  pathway_hclust <- hclust(
+    dist(top_pathway_score_mat, method = "euclidean"),
+    method = "complete"
+  )
+
+  clustered_pathway_order <- pathway_hclust$labels[pathway_hclust$order]
+
+} else {
+
+  pathway_hclust <- FALSE
+  clustered_pathway_order <- rownames(top_pathway_score_mat)
+}
+
+pathway_order_dt <- data.table(
+  Pathway = clustered_pathway_order,
+  Dendrogram_order = seq_along(clustered_pathway_order)
+)
+pathway_order_dt[, Pathway_clean := clean_hallmark_name(Pathway)]
+
+# Merge only the dendrogram order to avoid duplicate Pathway_clean.x / Pathway_clean.y columns.
+sample_bubble_plot_dt <- merge(
+  sample_bubble_plot_dt,
+  pathway_order_dt[, .(Pathway, Dendrogram_order)],
+  by = "Pathway",
+  all.x = TRUE
+)
+
+# Ensure one clean pathway-label column is present after merge.
+sample_bubble_plot_dt[, Pathway_clean := clean_hallmark_name(Pathway)]
+
+# Keep sample order exactly as requested/available.
+sample_bubble_plot_dt[, Sample := factor(Sample, levels = rna_available_samples)]
+
+fwrite(
+  sample_bubble_plot_dt,
+  file = file.path(table_dir, "Bionano_grant_n10_Hallmark_ssGSEA_sample_pathway_bubble_top20_rawScore_geneRatio_dendrogramY_plot_data.tsv"),
+  sep = "\t",
+  quote = FALSE,
+  na = ""
+)
+
+cat("\nSample-level bubble plot data preview:\n")
+print(
+  sample_bubble_plot_dt[
+    order(Dendrogram_order, Sample),
+    .(
+      Dendrogram_order,
+      Pathway_clean,
+      Sample,
+      ssGSEA_score,
+      Gene_ratio_percent,
+      Expressed_gene_count,
+      Pathway_present_gene_count
+    )
+  ][1:min(.N, 20)]
+)
+
+cat("\nPathway order from Y-axis dendrogram:\n")
+print(pathway_order_dt)
+
+# ------------------------------------------------------------
+# Convert data to matrices for ComplexHeatmap bubble plot
+# ------------------------------------------------------------
+
+score_mat_for_plot <- top_pathway_score_mat[
+  top_pathways_for_sample_plot,
+  rna_available_samples,
+  drop = FALSE
+]
+
+score_mat_for_plot[!is.finite(score_mat_for_plot)] <- NA_real_
+
+# Matrix of gene ratio (%) with the same row/column structure as ssGSEA score matrix.
+gene_ratio_wide <- dcast(
+  sample_bubble_plot_dt,
+  Pathway ~ Sample,
+  value.var = "Gene_ratio_percent"
+)
+
+gene_ratio_mat <- as.matrix(gene_ratio_wide[, ..rna_available_samples])
+rownames(gene_ratio_mat) <- gene_ratio_wide$Pathway
+
+gene_ratio_mat <- gene_ratio_mat[
+  rownames(score_mat_for_plot),
+  colnames(score_mat_for_plot),
+  drop = FALSE
+]
+
+gene_ratio_mat[!is.finite(gene_ratio_mat)] <- NA_real_
+
+# Row labels should be clean Hallmark names but the internal rownames remain full pathway IDs.
+row_labels <- clean_hallmark_name(rownames(score_mat_for_plot))
+names(row_labels) <- rownames(score_mat_for_plot)
+
+# Pathway-wise min-max scaling (0 to 1) for color only.
+# Raw ssGSEA scores are still preserved in the output tables.
+score_scaled_mat_for_plot <- t(apply(score_mat_for_plot, 1, function(x) {
+  x <- as.numeric(x)
+  finite_x <- x[is.finite(x)]
+
+  if (length(finite_x) == 0) {
+    return(rep(NA_real_, length(x)))
+  }
+
+  x_min <- min(finite_x, na.rm = TRUE)
+  x_max <- max(finite_x, na.rm = TRUE)
+
+  if (!is.finite(x_min) || !is.finite(x_max)) {
+    return(rep(NA_real_, length(x)))
+  }
+
+  if (x_max == x_min) {
+    return(rep(0.5, length(x)))
+  }
+
+  (x - x_min) / (x_max - x_min)
+}))
+
+rownames(score_scaled_mat_for_plot) <- rownames(score_mat_for_plot)
+colnames(score_scaled_mat_for_plot) <- colnames(score_mat_for_plot)
+
+scaled_vals <- as.numeric(score_scaled_mat_for_plot)
+scaled_vals <- scaled_vals[is.finite(scaled_vals)]
+
+if (length(scaled_vals) == 0) {
+  stop("No finite scaled ssGSEA scores available for plotting.")
+}
+
+score_col_fun <- circlize::colorRamp2(
+  c(0, 0.5, 1),
+  c("#D9D9D9", "#7A5195", "#E31A1C")
+)
+
+max_dot_radius_mm <- 3.4
+
+# Bubble-size legend for Gene Ratio (%).
+gene_ratio_legend <- ComplexHeatmap::Legend(
+  title = "Gene Ratio (%)",
+  labels = c("25", "50", "75", "100"),
+  type = "points",
+  pch = 16,
+  size = grid::unit(sqrt(c(25, 50, 75, 100) / 100) * max_dot_radius_mm * 2, "mm"),
+  legend_gp = grid::gpar(col = "black", fill = "black"),
+  title_gp = grid::gpar(fontsize = 10),
+  labels_gp = grid::gpar(fontsize = 9)
+)
+
+# Custom legend for scaled ssGSEA score so it appears together with the Gene Ratio legend.
+score_legend <- ComplexHeatmap::Legend(
+  title = "Scaled ssGSEA\nscore",
+  col_fun = score_col_fun,
+  at = c(0, 0.5, 1),
+  labels = c("0", "0.5", "1"),
+  title_gp = grid::gpar(fontsize = 10),
+  labels_gp = grid::gpar(fontsize = 9),
+  legend_height = grid::unit(28, "mm")
+)
+
+combined_legend <- ComplexHeatmap::packLegend(
+  gene_ratio_legend,
+  score_legend,
+  direction = "vertical",
+  gap = grid::unit(2, "mm")
+)
+# ------------------------------------------------------------
+# Plot: raw ssGSEA score + gene ratio (%) + Y-axis dendrogram
+# ------------------------------------------------------------
+
+ht <- ComplexHeatmap::Heatmap(
+  score_mat_for_plot,
+  name = "Scaled ssGSEA score",
+  col = score_col_fun,
+  cluster_rows = pathway_hclust,
+  row_dend_side = "left",
+  show_row_dend = TRUE,
+  row_dend_width = grid::unit(18, "mm"),
+  row_dend_reorder = FALSE,
+  cluster_columns = FALSE,
+  show_column_dend = FALSE,
+  show_column_names = FALSE,
+  width = grid::unit(ncol(score_mat_for_plot) * 5.5, "mm"),
+  row_labels = row_labels,
+  row_names_side = "right",
+  row_names_gp = grid::gpar(fontsize = 9.5, col = "black"),
+  column_names_rot = 45,
+  column_names_gp = grid::gpar(fontsize = 10.5, col = "black"),
+  column_title = paste0(
+    "Hallmark ssGSEA pathway activity per pILC sample\n",
+    "Selected RNA-seq/Bionano grant samples: n = ", length(rna_available_samples),
+    " | Top ", length(top_pathways_for_sample_plot),
+    " pathways by median ssGSEA score"
+  ),
+  column_title_gp = grid::gpar(fontsize = 14, fontface = "bold"),
+  rect_gp = grid::gpar(type = "none"),
+  heatmap_legend_param = list(
+    title = "Scaled ssGSEA score",
+    title_gp = grid::gpar(fontsize = 10),
+    labels_gp = grid::gpar(fontsize = 9)
+  ),
+  cell_fun = function(j, i, x, y, width, height, fill) {
+
+    # Light cell boundary, similar to the reference dotplot style.
+    grid::grid.rect(
+      x = x,
+      y = y,
+      width = width,
+      height = height,
+      gp = grid::gpar(fill = "white", col = "grey90", lwd = 0.5)
+    )
+
+    score_value <- score_mat_for_plot[i, j]
+    score_scaled_value <- score_scaled_mat_for_plot[i, j]
+    gene_ratio_value <- gene_ratio_mat[i, j]
+
+    if (is.finite(score_scaled_value) && is.finite(gene_ratio_value) && gene_ratio_value > 0) {
+
+      radius_mm <- sqrt(gene_ratio_value / 100) * max_dot_radius_mm
+
+      grid::grid.circle(
+        x = x,
+        y = y,
+        r = grid::unit(radius_mm, "mm"),
+        gp = grid::gpar(
+          fill = score_col_fun(score_scaled_value),
+          col = NA,
+          alpha = 0.95
+        )
+      )
+    }
+  }
+)
+
+sample_bubble_pdf_file <- file.path(
+  plot_dir,
+  "Bionano_grant_n10_Hallmark_ssGSEA_sample_pathway_bubble_top20_scaledColor_geneRatio_dendrogramY_noSampleNames_legendFIX.pdf"
+)
+
+sample_bubble_png_file <- file.path(
+  plot_dir,
+  "Bionano_grant_n10_Hallmark_ssGSEA_sample_pathway_bubble_top20_scaledColor_geneRatio_dendrogramY_noSampleNames_legendFIX.png"
+)
+
+caption_text <- paste0(
+  "Each dot represents one sample-pathway pair. Dot color = pathway-wise min-max scaled ssGSEA score (0 to 1). ",
+  "Dot size = Gene Ratio (%), defined as expressed pathway genes / pathway genes present in the expression matrix x 100; ",
+  "expressed = log2TPM > ", expressed_gene_log2TPM_cutoff, ". ",
+  "Rows are ordered by hierarchical clustering of raw ssGSEA score patterns. Sample names are hidden for a cleaner plot."
+)
+
+pdf(sample_bubble_pdf_file, width = 13.5, height = 9.0)
+grid::grid.newpage()
+ComplexHeatmap::draw(
+  ht,
+  heatmap_legend_side = "left",
+  annotation_legend_side = "left",
+  annotation_legend_list = list(gene_ratio_legend),
+  merge_legends = TRUE,
+  padding = grid::unit(c(8, 8, 18, 4), "mm")
+)
+grid::grid.text(
+  caption_text,
+  x = grid::unit(8, "mm"),
+  y = grid::unit(5, "mm"),
+  just = c("left", "bottom"),
+  gp = grid::gpar(fontsize = 7.5, col = "grey30")
+)
+dev.off()
+
+png(sample_bubble_png_file, width = 13.5, height = 9.0, units = "in", res = 300)
+grid::grid.newpage()
+ComplexHeatmap::draw(
+  ht,
+  heatmap_legend_side = "left",
+  annotation_legend_side = "left",
+  annotation_legend_list = list(gene_ratio_legend),
+  merge_legends = TRUE,
+  padding = grid::unit(c(8, 8, 18, 4), "mm")
+)
+grid::grid.text(
+  caption_text,
+  x = grid::unit(8, "mm"),
+  y = grid::unit(5, "mm"),
+  just = c("left", "bottom"),
+  gp = grid::gpar(fontsize = 7.5, col = "grey30")
+)
+dev.off()
+
+cat("\nSaved sample-level Hallmark ssGSEA bubble plot with pathway-wise scaled color, gene ratio, and Y-axis dendrogram:\n")
+cat(sample_bubble_pdf_file, "\n")
+cat(sample_bubble_png_file, "\n")
+
+cat("\nSaved sample-level bubble plot data table:\n")
+cat(file.path(table_dir, "Bionano_grant_n10_Hallmark_ssGSEA_sample_pathway_bubble_top20_rawScore_geneRatio_dendrogramY_plot_data.tsv"), "\n")
+cat(file.path(table_dir, "Bionano_grant_n10_Hallmark_ssGSEA_sample_level_gene_ratio.tsv"), "\n")
+
+```
