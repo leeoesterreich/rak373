@@ -1,0 +1,388 @@
+---
+title: "PFS-like survival from first cfDNA draw by first TFx among patients with TFx ≥ 3%"
+output: html_document
+date: "2026-07-01"
+---
+# ============================================================
+# PFS Analysis 1
+# First available cfDNA blood draw TFx vs time to next progression/death
+# ============================================================
+#
+# Endpoint:
+#   PFS-like interval from cfDNA blood draw to next documented progression or death.
+#
+# Primary analysis:
+#   One row per patient = first available cfDNA blood draw
+#
+# Predictor:
+#   TFx at first available blood draw ≥ 3%
+#
+# Outcome:
+#   PFS_time_from_draw = next progression/death/censor day - blood draw day
+#
+# Event:
+#   1 = progression or death after blood draw
+#   0 = censored at OS/follow-up day
+#
+# Important:
+#   This is a cfDNA-indexed PFS-like endpoint, not trial-defined RECIST PFS.
+# ============================================================
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(readr)
+library(dplyr)
+library(survival)
+library(survminer)
+library(ggplot2)
+
+# ----------------------------
+# Paths
+# ----------------------------
+pfs1_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/AURORA/Survival/PFS_Analysis1_first_available_draw"
+
+input_file <- file.path(
+  pfs1_dir,
+  "PFS1_first_available_draw_per_patient.csv"
+)
+
+out_png <- file.path(
+  pfs1_dir,
+  "PFS1_KM_first_draw_TFx_months_with_risktable.png"
+)
+
+out_pdf <- file.path(
+  pfs1_dir,
+  "PFS1_KM_first_draw_TFx_months_with_risktable.pdf"
+)
+
+summary_out <- file.path(
+  pfs1_dir,
+  "PFS1_KM_summary.csv"
+)
+
+cat("Input file:\n", input_file, "\n\n")
+
+# ----------------------------
+# Read data
+# ----------------------------
+df <- read_csv(input_file, show_col_types = FALSE)
+
+cat("Rows in input:", nrow(df), "\n")
+cat("Columns:\n")
+print(colnames(df))
+
+# ----------------------------
+# Convert days to months
+# Keep only patients with first_TFx >= 3%
+# Then recalculate median cutpoint within this filtered cohort
+# ----------------------------
+min_first_TFx_cutoff <- 3
+
+df <- df %>%
+  mutate(
+    first_TFx = as.numeric(first_TFx),
+    PFS_time_from_first_draw = as.numeric(PFS_time_from_first_draw),
+    PFS_time_from_first_draw_months = PFS_time_from_first_draw / days_per_month,
+    PFS_event_from_first_draw = as.numeric(PFS_event_from_first_draw)
+  ) %>%
+  filter(
+    !is.na(first_TFx),
+    first_TFx >= min_first_TFx_cutoff,
+    !is.na(PFS_time_from_first_draw_months),
+    !is.na(PFS_event_from_first_draw),
+    PFS_time_from_first_draw_months > 0
+  )
+
+cat("\nApplied first_TFx cutoff: >= ", min_first_TFx_cutoff, "%\n", sep = "")
+cat("Patients after first_TFx cutoff:", nrow(df), "\n")
+
+# Recalculate median TFx only among patients with first_TFx >= 3%
+median_tfx_cut <- median(df$first_TFx, na.rm = TRUE)
+
+cat("\nMedian first TFx cutpoint after applying >=3% filter:", 
+    round(median_tfx_cut, 4), "%\n")
+
+# ----------------------------
+# Low/High TFx groups
+# ----------------------------
+df <- df %>%
+  mutate(
+    first_TFx_group_clean = case_when(
+      first_TFx < median_tfx_cut ~ "Low first TFx",
+      first_TFx >= median_tfx_cut ~ "High first TFx",
+      TRUE ~ NA_character_
+    ),
+    first_TFx_group_clean = factor(
+      first_TFx_group_clean,
+      levels = c("Low first TFx", "High first TFx")
+    )
+  ) %>%
+  filter(!is.na(first_TFx_group_clean))
+
+cat("\n========== PFS1 plot cohort ==========\n")
+cat("Patients:", nrow(df), "\n")
+cat("Events:", sum(df$PFS_event_from_first_draw == 1, na.rm = TRUE), "\n")
+cat("Censored:", sum(df$PFS_event_from_first_draw == 0, na.rm = TRUE), "\n\n")
+
+cat("Group counts:\n")
+print(table(df$first_TFx_group_clean))
+
+cat("\nEvents by group:\n")
+print(table(df$first_TFx_group_clean, df$PFS_event_from_first_draw))
+
+# ----------------------------
+# Survival fit
+# ----------------------------
+fit <- survfit(
+  Surv(PFS_time_from_first_draw_months, PFS_event_from_first_draw) ~ first_TFx_group_clean,
+  data = df
+)
+# ----------------------------
+# Median PFS-like survival from KM fit
+# ----------------------------
+median_pfs_df <- survminer::surv_median(fit) %>%
+  mutate(
+    first_TFx_group_clean = gsub(
+      "^first_TFx_group_clean=",
+      "",
+      strata
+    ),
+    first_TFx_group_clean = factor(
+      first_TFx_group_clean,
+      levels = levels(df$first_TFx_group_clean)
+    )
+  ) %>%
+  select(
+    first_TFx_group_clean,
+    median_survival_months = median,
+    median_survival_lower_95CI = lower,
+    median_survival_upper_95CI = upper
+  )
+
+cat("\nMedian PFS-like survival by group from KM fit:\n")
+print(median_pfs_df)
+
+# ----------------------------
+# Log-rank p-value calculated from data
+# ----------------------------
+lr <- survdiff(
+  Surv(PFS_time_from_first_draw_months, PFS_event_from_first_draw) ~ first_TFx_group_clean,
+  data = df
+)
+
+p_val <- 1 - pchisq(lr$chisq, df = length(lr$n) - 1)
+
+format_p <- function(p) {
+  if (is.na(p)) {
+    return("p = NA")
+  } else if (p < 0.001) {
+    return("p < 0.001")
+  } else {
+    return(paste0("p = ", formatC(p, format = "f", digits = 3)))
+  }
+}
+
+p_label <- format_p(p_val)
+
+annot_text <- paste0(
+  "Log-rank ", p_label, "\n",
+  "Median TFx cutpoint = ", round(median_tfx_cut, 2), "%"
+)
+
+cat("\nLog-rank chi-square:", lr$chisq, "\n")
+cat("Log-rank p-value:", p_val, "\n")
+cat("Plot annotation:\n", annot_text, "\n\n")
+
+# ----------------------------
+# KM summary with median PFS-like survival months
+# ----------------------------
+km_summary <- df %>%
+  group_by(first_TFx_group_clean) %>%
+  summarise(
+    n_patients = n(),
+    n_events = sum(PFS_event_from_first_draw == 1, na.rm = TRUE),
+    n_censored = sum(PFS_event_from_first_draw == 0, na.rm = TRUE),
+    median_first_TFx = median(first_TFx, na.rm = TRUE),
+    min_first_TFx = min(first_TFx, na.rm = TRUE),
+    max_first_TFx = max(first_TFx, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    median_pfs_df,
+    by = "first_TFx_group_clean"
+  ) %>%
+  mutate(
+    overall_median_TFx_cutpoint = median_tfx_cut,
+    logrank_chi_square = lr$chisq,
+    logrank_p_value = p_val
+  )
+
+write_csv(km_summary, summary_out)
+
+cat("\nKM summary with median PFS-like survival saved:\n", summary_out, "\n")
+print(km_summary)
+
+# ----------------------------
+# Axis settings
+# ----------------------------
+x_max <- 72
+break_by <- 12
+
+annot_x <- x_max * 0.94
+annot_y <- 0.97
+
+# ----------------------------
+# Legend labels
+# ----------------------------
+low_n <- sum(df$first_TFx_group_clean == "Low first TFx")
+low_events <- sum(
+  df$first_TFx_group_clean == "Low first TFx" &
+    df$PFS_event_from_first_draw == 1
+)
+
+high_n <- sum(df$first_TFx_group_clean == "High first TFx")
+high_events <- sum(
+  df$first_TFx_group_clean == "High first TFx" &
+    df$PFS_event_from_first_draw == 1
+)
+
+legend_labs <- c(
+  paste0("Low first TFx (n=", low_n, ", events=", low_events, ")"),
+  paste0("High first TFx (n=", high_n, ", events=", high_events, ")")
+)
+
+# ----------------------------
+# Plot
+# ----------------------------
+p <- ggsurvplot(
+  fit,
+  data = df,
+  
+  # Main KM curve
+  conf.int = TRUE,
+  conf.int.alpha = 0.22,
+  censor = TRUE,
+  censor.shape = 3,
+  censor.size = 3.2,
+  size = 1.15,
+  
+  # Single bottom number-at-risk table
+  risk.table = TRUE,
+  risk.table.title = "Number at risk",
+  risk.table.height = 0.24,
+  risk.table.y.text = TRUE,
+  risk.table.y.text.col = TRUE,
+  tables.theme = theme_cleantable(base_size = 12),
+  
+  # Labels
+  title = "PFS-like survival from first cfDNA draw by first TFx",
+  xlab = "Time from first cfDNA blood draw to progression/death/censor (months)",
+  ylab = "Progression/death-free probability",
+  
+  # Axis
+  break.time.by = break_by,
+  xlim = c(0, x_max),
+  ylim = c(0, 1.05),
+  
+  # Legend
+  legend.title = "First-draw TFx group",
+  legend.labs = legend_labs,
+  legend = "top",
+  
+  # Colors
+  palette = c("#1E88E5", "#E74C3C"),
+  
+  # Manual p-value annotation added below
+  pval = FALSE,
+  
+  # Base theme
+  ggtheme = theme_classic(base_size = 15)
+)
+
+# ----------------------------
+# Clean main KM plot
+# ----------------------------
+p$plot <- p$plot +
+  annotate(
+    "label",
+    x = annot_x,
+    y = annot_y,
+    label = annot_text,
+    hjust = 1,
+    vjust = 1,
+    size = 4.4,
+    label.size = 0.25,
+    fill = "white",
+    alpha = 0.9
+  ) +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold",
+      size = 18,
+      margin = margin(t = 10, b = 18)
+    ),
+    legend.position = "top",
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 11),
+    legend.box.margin = margin(b = 8),
+    axis.title = element_text(size = 15),
+    axis.text = element_text(size = 12),
+    
+    # Locked style: no grid lines
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    
+    plot.margin = margin(t = 18, r = 15, b = 5, l = 15)
+  )
+
+# ----------------------------
+# Clean bottom number-at-risk table
+# Do not set axis.text.y because survminer uses colored y labels
+# ----------------------------
+p$table <- p$table +
+  theme(
+    plot.title = element_text(size = 14, hjust = 0, face = "bold"),
+    axis.title.x = element_text(size = 14),
+    axis.title.y = element_text(size = 13),
+    axis.text.x = element_text(size = 11),
+    
+    # Locked style: no grid lines
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    
+    plot.margin = margin(t = 4, r = 15, b = 8, l = 15)
+  )
+
+# ----------------------------
+# Save outputs
+# ----------------------------
+png(
+  filename = out_png,
+  width = 11,
+  height = 8.3,
+  units = "in",
+  res = 300
+)
+print(p)
+dev.off()
+
+pdf(
+  file = out_pdf,
+  width = 11,
+  height = 8.3
+)
+print(p)
+dev.off()
+
+cat("\nSaved publication-style PFS1 KM plot:\n")
+cat(out_png, "\n")
+cat(out_pdf, "\n")
+
+cat("\nSaved summary table:\n")
+cat(summary_out, "\n")
+```
+

@@ -1,0 +1,545 @@
+---
+title: "PFS-like survival from first cfDNA draw by first TFx among patients with TFx ≥ 3%_subtype"
+output: html_document
+date: "2026-07-01"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r}
+# ============================================================
+# PFS Analysis 1 subgroup KM plots
+# First available cfDNA blood draw TFx vs PFS-like survival
+# Subgroups:
+#   HR+ HER2-
+#   HR+ HER2+
+#   HR- HER2-
+#   HR- HER2+
+#
+# Locked KM style:
+# CI + censor marks + one number-at-risk table + no grid
+# ============================================================
+
+library(readr)
+library(dplyr)
+library(survival)
+library(survminer)
+library(ggplot2)
+library(stringr)
+
+# ----------------------------
+# Paths
+# ----------------------------
+pfs1_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/AURORA/Survival/PFS_Analysis1_first_available_draw"
+
+input_file <- file.path(
+  pfs1_dir,
+  "PFS1_first_available_draw_per_patient.csv"
+)
+
+out_dir <- file.path(
+  pfs1_dir,
+  "PFS1_receptor_subgroup_KM"
+)
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+summary_out <- file.path(
+  out_dir,
+  "PFS1_receptor_subgroup_KM_summary.csv"
+)
+
+cat("Input file:\n", input_file, "\n\n")
+cat("Output directory:\n", out_dir, "\n\n")
+
+# ----------------------------
+# Read data
+# ----------------------------
+df <- read_csv(input_file, show_col_types = FALSE)
+
+cat("Rows in input:", nrow(df), "\n")
+cat("Columns:\n")
+print(colnames(df))
+
+# ----------------------------
+# Required columns
+# ----------------------------
+required_cols <- c(
+  "patient_id_clean",
+  "first_TFx",
+  "PFS_time_from_first_draw",
+  "PFS_time_from_first_draw_months",
+  "PFS_event_from_first_draw",
+  "Subgroups"
+)
+
+missing_cols <- setdiff(required_cols, colnames(df))
+
+if (length(missing_cols) > 0) {
+  stop(
+    paste0(
+      "Missing required columns: ",
+      paste(missing_cols, collapse = ", "),
+      "\nPlease make sure these columns are present in PFS1_first_available_draw_per_patient.csv."
+    )
+  )
+}
+
+# ----------------------------
+# Helper functions
+# ----------------------------
+format_p <- function(p) {
+  if (is.na(p)) {
+    return("p = NA")
+  } else if (p < 0.001) {
+    return("p < 0.001")
+  } else {
+    return(paste0("p = ", formatC(p, format = "f", digits = 3)))
+  }
+}
+
+safe_name <- function(x) {
+  x %>%
+    str_replace_all("\\+", "pos") %>%
+    str_replace_all("-", "neg") %>%
+    str_replace_all("\\s+", "_") %>%
+    str_replace_all("[^A-Za-z0-9_]", "")
+}
+
+# ----------------------------
+# Clean and prepare data
+# ----------------------------
+
+df <- df %>%
+  mutate(
+    patient_id_clean = as.character(patient_id_clean),
+
+    first_TFx = as.numeric(first_TFx),
+    PFS_time_from_first_draw = as.numeric(PFS_time_from_first_draw),
+    PFS_time_from_first_draw_months = as.numeric(PFS_time_from_first_draw_months),
+    PFS_event_from_first_draw = as.numeric(PFS_event_from_first_draw),
+
+    receptor_subtype = str_squish(as.character(Subgroups)),
+
+    receptor_subtype = factor(
+      receptor_subtype,
+      levels = c("HR+ HER2-", "HR+ HER2+", "HR- HER2-", "HR- HER2+")
+    )
+  ) %>%
+  filter(
+    !is.na(patient_id_clean),
+    !is.na(first_TFx),
+    !is.na(PFS_time_from_first_draw_months),
+    !is.na(PFS_event_from_first_draw),
+    PFS_time_from_first_draw_months > 0,
+    !is.na(receptor_subtype)
+  )
+
+cat("\n========== Clean PFS1 receptor-subgroup cohort ==========\n")
+cat("Patients:", nrow(df), "\n")
+cat("Events:", sum(df$PFS_event_from_first_draw == 1, na.rm = TRUE), "\n")
+cat("Censored:", sum(df$PFS_event_from_first_draw == 0, na.rm = TRUE), "\n\n")
+
+cat("Subtype counts:\n")
+print(table(df$receptor_subtype, useNA = "ifany"))
+
+cat("\nSubtype events:\n")
+print(table(df$receptor_subtype, df$PFS_event_from_first_draw, useNA = "ifany"))
+
+# ----------------------------
+# Output patient-level subtype assignment
+# ----------------------------
+# ----------------------------
+# Output patient-level subtype assignment
+# ----------------------------
+subtype_assignment_out <- file.path(
+  out_dir,
+  "PFS1_patient_receptor_subtype_assignment.csv"
+)
+
+df %>%
+  select(
+    patient_id_clean,
+    first_TFx,
+    Subgroups,
+    receptor_subtype,
+    PFS_time_from_first_draw,
+    PFS_time_from_first_draw_months,
+    PFS_event_from_first_draw
+  ) %>%
+  write_csv(subtype_assignment_out)
+
+cat("\nSaved receptor subtype assignment:\n", subtype_assignment_out, "\n")
+
+# ----------------------------
+# Loop through subgroups
+# ----------------------------
+subtypes <- c("HR+ HER2-", "HR+ HER2+", "HR- HER2-", "HR- HER2+")
+
+summary_list <- list()
+
+for (subtype in subtypes) {
+  
+  cat("\n============================================================\n")
+  cat("Running subtype:", subtype, "\n")
+  cat("============================================================\n")
+  
+  sub_df <- df %>%
+    filter(receptor_subtype == subtype) %>%
+    droplevels()
+  
+  n_sub <- nrow(sub_df)
+  n_events <- sum(sub_df$PFS_event_from_first_draw == 1, na.rm = TRUE)
+  n_censored <- sum(sub_df$PFS_event_from_first_draw == 0, na.rm = TRUE)
+  
+  cat("Patients:", n_sub, "\n")
+  cat("Events:", n_events, "\n")
+  cat("Censored:", n_censored, "\n")
+  
+  if (n_sub < 6) {
+    cat("Skipping", subtype, ": too few patients.\n")
+    
+    summary_list[[subtype]] <- data.frame(
+      receptor_subtype = subtype,
+      status = "Skipped: too few patients",
+      n_patients = n_sub,
+      n_events = n_events,
+      n_censored = n_censored,
+      TFx_cutpoint = NA_real_,
+      low_n = NA_integer_,
+      low_events = NA_integer_,
+      high_n = NA_integer_,
+      high_events = NA_integer_,
+      logrank_p_value = NA_real_
+    )
+    
+    next
+  }
+  
+  # ----------------------------
+  # Subtype-specific median TFx cutpoint
+  # ----------------------------
+  subtype_tfx_cut <- median(sub_df$first_TFx, na.rm = TRUE)
+  
+  sub_df <- sub_df %>%
+    mutate(
+      first_TFx_group_subtype = ifelse(
+        first_TFx >= subtype_tfx_cut,
+        "High first TFx",
+        "Low first TFx"
+      ),
+      first_TFx_group_subtype = factor(
+        first_TFx_group_subtype,
+        levels = c("Low first TFx", "High first TFx")
+      )
+    )
+  
+  cat("Subtype-specific median TFx cutpoint:", round(subtype_tfx_cut, 4), "%\n")
+  cat("TFx group counts:\n")
+  print(table(sub_df$first_TFx_group_subtype))
+  
+  if (length(unique(sub_df$first_TFx_group_subtype)) < 2) {
+    cat("Skipping", subtype, ": only one TFx group present.\n")
+    
+    summary_list[[subtype]] <- data.frame(
+      receptor_subtype = subtype,
+      status = "Skipped: only one TFx group",
+      n_patients = n_sub,
+      n_events = n_events,
+      n_censored = n_censored,
+      TFx_cutpoint = subtype_tfx_cut,
+      low_n = sum(sub_df$first_TFx_group_subtype == "Low first TFx"),
+      low_events = sum(sub_df$first_TFx_group_subtype == "Low first TFx" &
+                         sub_df$PFS_event_from_first_draw == 1),
+      high_n = sum(sub_df$first_TFx_group_subtype == "High first TFx"),
+      high_events = sum(sub_df$first_TFx_group_subtype == "High first TFx" &
+                          sub_df$PFS_event_from_first_draw == 1),
+      logrank_p_value = NA_real_
+    )
+    
+    next
+  }
+  
+  # ----------------------------
+  # Survival fit
+  # ----------------------------
+  fit <- survfit(
+    Surv(PFS_time_from_first_draw_months, PFS_event_from_first_draw) ~ first_TFx_group_subtype,
+    data = sub_df
+  )
+  
+  # ----------------------------
+# Median PFS months by TFx group
+# ----------------------------
+median_tbl <- surv_median(fit) %>%
+  mutate(
+    group_clean = case_when(
+      str_detect(strata, "Low first TFx") ~ "Low first TFx",
+      str_detect(strata, "High first TFx") ~ "High first TFx",
+      TRUE ~ strata
+    )
+  )
+
+low_median_months <- median_tbl %>%
+  filter(group_clean == "Low first TFx") %>%
+  pull(median)
+
+low_median_lower_95CI <- median_tbl %>%
+  filter(group_clean == "Low first TFx") %>%
+  pull(lower)
+
+low_median_upper_95CI <- median_tbl %>%
+  filter(group_clean == "Low first TFx") %>%
+  pull(upper)
+
+high_median_months <- median_tbl %>%
+  filter(group_clean == "High first TFx") %>%
+  pull(median)
+
+high_median_lower_95CI <- median_tbl %>%
+  filter(group_clean == "High first TFx") %>%
+  pull(lower)
+
+high_median_upper_95CI <- median_tbl %>%
+  filter(group_clean == "High first TFx") %>%
+  pull(upper)
+
+# If median is not reached, keep as NA
+low_median_months <- ifelse(length(low_median_months) == 0, NA_real_, low_median_months)
+low_median_lower_95CI <- ifelse(length(low_median_lower_95CI) == 0, NA_real_, low_median_lower_95CI)
+low_median_upper_95CI <- ifelse(length(low_median_upper_95CI) == 0, NA_real_, low_median_upper_95CI)
+
+high_median_months <- ifelse(length(high_median_months) == 0, NA_real_, high_median_months)
+high_median_lower_95CI <- ifelse(length(high_median_lower_95CI) == 0, NA_real_, high_median_lower_95CI)
+high_median_upper_95CI <- ifelse(length(high_median_upper_95CI) == 0, NA_real_, high_median_upper_95CI)
+
+  # ----------------------------
+  # Log-rank p-value
+  # ----------------------------
+  lr <- survdiff(
+    Surv(PFS_time_from_first_draw_months, PFS_event_from_first_draw) ~ first_TFx_group_subtype,
+    data = sub_df
+  )
+  
+  p_val <- 1 - pchisq(lr$chisq, df = length(lr$n) - 1)
+  p_label <- format_p(p_val)
+  
+  annot_text <- paste0(
+    "Log-rank ", p_label, "\n",
+    "Median TFx cutpoint = ", round(subtype_tfx_cut, 2), "%"
+  )
+  
+  cat("Log-rank p-value:", p_val, "\n")
+  
+  # ----------------------------
+  # Legend labels
+  # ----------------------------
+  low_n <- sum(sub_df$first_TFx_group_subtype == "Low first TFx")
+  low_events <- sum(
+    sub_df$first_TFx_group_subtype == "Low first TFx" &
+      sub_df$PFS_event_from_first_draw == 1
+  )
+  
+  high_n <- sum(sub_df$first_TFx_group_subtype == "High first TFx")
+  high_events <- sum(
+    sub_df$first_TFx_group_subtype == "High first TFx" &
+      sub_df$PFS_event_from_first_draw == 1
+  )
+  
+  legend_labs <- c(
+    paste0("Low first TFx (n=", low_n, ", events=", low_events, ")"),
+    paste0("High first TFx (n=", high_n, ", events=", high_events, ")")
+  )
+  
+  # ----------------------------
+  # Axis settings
+  # ----------------------------
+  x_max <- 72
+  break_by <- 12
+  
+  annot_x <- x_max * 0.94
+  annot_y <- 0.97
+  
+  # ----------------------------
+  # Plot
+  # ----------------------------
+  p <- ggsurvplot(
+    fit,
+    data = sub_df,
+    
+    # Main KM curve
+    conf.int = TRUE,
+    conf.int.alpha = 0.22,
+    censor = TRUE,
+    censor.shape = 3,
+    censor.size = 3.2,
+    size = 1.15,
+    
+    # Single bottom number-at-risk table
+    risk.table = TRUE,
+    risk.table.title = "Number at risk",
+    risk.table.height = 0.24,
+    risk.table.y.text = TRUE,
+    risk.table.y.text.col = TRUE,
+    tables.theme = theme_cleantable(base_size = 12),
+    
+    # Labels
+    title = paste0("PFS-like survival from first cfDNA draw: ", subtype),
+    xlab = "Time from first cfDNA blood draw to progression/death/censor (months)",
+    ylab = "Progression/death-free probability",
+    
+    # Axis
+    break.time.by = break_by,
+    xlim = c(0, x_max),
+    ylim = c(0, 1.05),
+    
+    # Legend
+    legend.title = "First-draw TFx group",
+    legend.labs = legend_labs,
+    legend = "top",
+    
+    # Colors
+    palette = c("#1E88E5", "#E74C3C"),
+    
+    # Manual p-value annotation
+    pval = FALSE,
+    
+    # Base theme
+    ggtheme = theme_classic(base_size = 15)
+  )
+  
+  # ----------------------------
+  # Clean main KM plot
+  # ----------------------------
+  p$plot <- p$plot +
+    annotate(
+      "label",
+      x = annot_x,
+      y = annot_y,
+      label = annot_text,
+      hjust = 1,
+      vjust = 1,
+      size = 4.4,
+      label.size = 0.25,
+      fill = "white",
+      alpha = 0.9
+    ) +
+    theme(
+      plot.title = element_text(
+        hjust = 0.5,
+        face = "bold",
+        size = 17,
+        margin = margin(t = 10, b = 18)
+      ),
+      legend.position = "top",
+      legend.title = element_text(size = 12),
+      legend.text = element_text(size = 11),
+      legend.box.margin = margin(b = 8),
+      axis.title = element_text(size = 15),
+      axis.text = element_text(size = 12),
+      
+      # Locked style: no grid lines
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      
+      plot.margin = margin(t = 18, r = 15, b = 5, l = 15)
+    )
+  
+  # ----------------------------
+  # Clean bottom number-at-risk table
+  # ----------------------------
+  p$table <- p$table +
+    theme(
+      plot.title = element_text(size = 14, hjust = 0, face = "bold"),
+      axis.title.x = element_text(size = 14),
+      axis.title.y = element_text(size = 13),
+      axis.text.x = element_text(size = 11),
+      
+      # Locked style: no grid lines
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      
+      plot.margin = margin(t = 4, r = 15, b = 8, l = 15)
+    )
+  
+  # ----------------------------
+  # Save plot
+  # ----------------------------
+  subtype_file <- safe_name(subtype)
+  
+  out_png <- file.path(
+    out_dir,
+    paste0("PFS1_KM_first_TFx_", subtype_file, ".png")
+  )
+  
+  out_pdf <- file.path(
+    out_dir,
+    paste0("PFS1_KM_first_TFx_", subtype_file, ".pdf")
+  )
+  
+  png(
+    filename = out_png,
+    width = 11,
+    height = 8.3,
+    units = "in",
+    res = 300
+  )
+  print(p)
+  dev.off()
+  
+  pdf(
+    file = out_pdf,
+    width = 11,
+    height = 8.3
+  )
+  print(p)
+  dev.off()
+  
+  cat("Saved:\n")
+  cat(out_png, "\n")
+  cat(out_pdf, "\n")
+  
+  # ----------------------------
+  # ----------------------------
+  # Store summary
+  # ----------------------------
+  summary_list[[subtype]] <- data.frame(
+    receptor_subtype = subtype,
+    status = "Plotted",
+    n_patients = n_sub,
+    n_events = n_events,
+    n_censored = n_censored,
+    TFx_cutpoint = subtype_tfx_cut,
+
+    low_n = low_n,
+    low_events = low_events,
+    low_median_PFS_months = low_median_months,
+    low_median_PFS_lower_95CI = low_median_lower_95CI,
+    low_median_PFS_upper_95CI = low_median_upper_95CI,
+
+    high_n = high_n,
+    high_events = high_events,
+    high_median_PFS_months = high_median_months,
+    high_median_PFS_lower_95CI = high_median_lower_95CI,
+    high_median_PFS_upper_95CI = high_median_upper_95CI,
+
+    logrank_p_value = p_val
+  )
+}
+
+# ----------------------------
+# Save summary across subgroups
+# ----------------------------
+subgroup_summary <- bind_rows(summary_list)
+
+write_csv(subgroup_summary, summary_out)
+
+cat("\n============================================================\n")
+cat("Saved receptor subgroup KM summary:\n")
+cat(summary_out, "\n")
+cat("============================================================\n")
+
+print(subgroup_summary)
+```
+
