@@ -47,12 +47,13 @@ survival_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/AURORA/Survival"
 
 input_file <- file.path(
   survival_dir,
-  "AURORA_all_patients_median_TFx_OS_clean.csv"
+  "AURORA_all_patients_median_TFx_patientMedianGE3_OS_Event_clean.Earliest_Met_Diagnosis.csv"
 )
 
 out_dir <- file.path(
   survival_dir,
-  "KM_median_TFx"
+  "KM_median_TFx_by_subtype_patientMedianGE3",
+  "Earliest_Met_Diagnosis"
 )
 
 dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)

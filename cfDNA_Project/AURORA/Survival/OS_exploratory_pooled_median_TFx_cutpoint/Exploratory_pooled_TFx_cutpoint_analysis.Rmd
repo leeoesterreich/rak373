@@ -1,0 +1,874 @@
+---
+title: "Exploratory pooled TFx cutpoint analysis"
+output: html_document
+date: "2026-07-03"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+############################################################
+# AURORA OS analysis:
+# Exploratory pooled median TFx cutpoint analysis
+#
+# Input:
+#   AURORA_all_patients_median_TFx_OS_clean.csv
+#
+# Expected columns:
+#   patient_id
+#   Subtype
+#   median_TFx
+#   Overall_Survival_days
+#   Event
+#
+# Event:
+#   1 = death
+#   0 = censored
+#
+# Main outputs:
+#   1. surv_cutpoint-derived exploratory TFx cutoff
+#   2. maxstat corrected p-value
+#   3. bootstrap cutpoint stability
+#   4. KM plots for:
+#        - exploratory cutpoint
+#        - published 7% cutpoint
+#        - current 8.17% median cutpoint
+############################################################
+```
+
+
+```{r}
+############################################################
+# 0. Setup
+############################################################
+
+rm(list = ls())
+
+options(stringsAsFactors = FALSE)
+
+required_pkgs <- c(
+  "dplyr",
+  "readr",
+  "stringr",
+  "ggplot2",
+  "survival",
+  "survminer",
+  "maxstat",
+  "purrr",
+  "tibble"
+)
+
+missing_pkgs <- required_pkgs[!required_pkgs %in% rownames(installed.packages())]
+
+if (length(missing_pkgs) > 0) {
+  stop(
+    "Missing packages: ",
+    paste(missing_pkgs, collapse = ", "),
+    "\nInstall them using:\n",
+    "install.packages(c(",
+    paste(sprintf('\"%s\"', missing_pkgs), collapse = ", "),
+    "))"
+  )
+}
+
+library(dplyr)
+library(readr)
+library(stringr)
+library(ggplot2)
+library(survival)
+library(survminer)
+library(maxstat)
+library(purrr)
+library(tibble)
+
+
+############################################################
+# 1. User settings
+############################################################
+
+survival_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/AURORA/Survival"
+
+input_file <- file.path(
+  survival_dir,
+  "AURORA_all_patients_median_TFx_OS_clean.csv"
+)
+
+out_dir <- file.path(
+  survival_dir,
+  "OS_exploratory_pooled_median_TFx_cutpoint"
+)
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Your current analysis uses TFx >= 3%
+TFX_MIN_FILTER <- 3
+
+# Minimum proportion in each group during cutpoint search
+MINPROP <- 0.20
+
+# Bootstrap iterations
+N_BOOT <- 500
+
+# Comparison cutpoints
+PUBLISHED_TFX_CUTPOINT <- 7.00
+CURRENT_MEDIAN_CUTPOINT <- 8.17
+
+set.seed(123)
+
+
+############################################################
+# 2. Helper functions
+############################################################
+
+clean_event <- function(x) {
+  
+  if (is.numeric(x) || is.integer(x)) {
+    return(as.integer(x))
+  }
+  
+  x0 <- tolower(str_trim(as.character(x)))
+  
+  out <- case_when(
+    x0 %in% c("1", "event", "death", "dead", "yes", "true") ~ 1L,
+    x0 %in% c("0", "censored", "censor", "alive", "no", "false") ~ 0L,
+    TRUE ~ NA_integer_
+  )
+  
+  return(out)
+}
+
+
+clean_subtype <- function(x) {
+  
+  x <- as.character(x)
+  x <- str_trim(x)
+  x <- str_replace_all(x, "Her2", "HER2")
+  x <- str_replace_all(x, "HER-2", "HER2")
+  x <- str_replace_all(x, "HR\\+\\s*HER2\\-", "HR+ HER2-")
+  x <- str_replace_all(x, "HR\\+\\s*HER2\\+", "HR+ HER2+")
+  x <- str_replace_all(x, "HR\\-\\s*HER2\\-", "HR- HER2-")
+  x <- str_replace_all(x, "HR\\-\\s*HER2\\+", "HR- HER2+")
+  x <- str_squish(x)
+  
+  return(x)
+}
+
+
+format_p <- function(p) {
+  
+  if (is.na(p)) return("NA")
+  
+  if (p < 0.001) {
+    return(formatC(p, format = "e", digits = 2))
+  } else {
+    return(formatC(p, format = "f", digits = 4))
+  }
+}
+
+
+make_os_km_plot <- function(df, cutpoint, cutpoint_label, out_prefix) {
+  
+  df_plot <- df %>%
+    mutate(
+      TFx_group = ifelse(
+        median_TFx > cutpoint,
+        paste0("High TFx > ", round(cutpoint, 2), "%"),
+        paste0("Low TFx ≤ ", round(cutpoint, 2), "%")
+      ),
+      TFx_group = factor(
+        TFx_group,
+        levels = c(
+          paste0("Low TFx ≤ ", round(cutpoint, 2), "%"),
+          paste0("High TFx > ", round(cutpoint, 2), "%")
+        )
+      )
+    )
+  
+  group_summary <- df_plot %>%
+    group_by(TFx_group) %>%
+    summarise(
+      n_patients = n_distinct(patient_id),
+      n_deaths = sum(Event == 1, na.rm = TRUE),
+      n_censored = sum(Event == 0, na.rm = TRUE),
+      median_TFx = median(median_TFx, na.rm = TRUE),
+      median_OS_months_observed = median(OS_months, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  write_csv(
+    group_summary,
+    file.path(out_dir, paste0(out_prefix, "_group_summary.csv"))
+  )
+  
+  fit <- survfit(
+    Surv(OS_months, Event) ~ TFx_group,
+    data = df_plot
+  )
+  
+  logrank_obj <- survdiff(
+    Surv(OS_months, Event) ~ TFx_group,
+    data = df_plot
+  )
+  
+  logrank_p <- 1 - pchisq(logrank_obj$chisq, df = 1)
+  
+  cox_obj <- coxph(
+    Surv(OS_months, Event) ~ TFx_group,
+    data = df_plot
+  )
+  
+  cox_summary <- summary(cox_obj)
+  
+  cox_out <- cbind(
+    term = rownames(as.data.frame(cox_summary$coefficients)),
+    as.data.frame(cox_summary$coefficients),
+    as.data.frame(cox_summary$conf.int)
+  )
+  
+  write_csv(
+    cox_out,
+    file.path(out_dir, paste0(out_prefix, "_cox_HR.csv"))
+  )
+  
+  median_surv <- surv_median(fit)
+  
+  write_csv(
+    median_surv,
+    file.path(out_dir, paste0(out_prefix, "_median_OS.csv"))
+  )
+  
+  label_text <- paste0(
+    cutpoint_label,
+    "\nCutpoint = ", round(cutpoint, 2), "%",
+    "\nLog-rank p = ", format_p(logrank_p)
+  )
+  
+  x_max <- max(df_plot$OS_months, na.rm = TRUE)
+  x_label <- x_max * 0.60
+  
+  km <- ggsurvplot(
+    fit,
+    data = df_plot,
+    risk.table = TRUE,
+    conf.int = TRUE,
+    censor = TRUE,
+    pval = FALSE,
+    legend.title = "",
+    legend = "top",
+    xlab = "Overall survival from diagnosis/baseline date, months",
+    ylab = "Overall survival probability",
+    risk.table.title = "Number at risk",
+    risk.table.height = 0.25,
+    ggtheme = theme_classic(base_size = 13)
+  )
+  
+  km$plot <- km$plot +
+    annotate(
+      "label",
+      x = x_label,
+      y = 0.95,
+      label = label_text,
+      hjust = 0,
+      vjust = 1,
+      size = 4,
+      fill = "white",
+      label.size = 0.25
+    ) +
+    theme(
+      panel.grid = element_blank(),
+      legend.text = element_text(size = 11),
+      axis.title = element_text(size = 13),
+      axis.text = element_text(size = 11),
+      plot.title = element_text(size = 14, face = "bold")
+    ) +
+    ggtitle(paste0("Overall survival by median TFx: ", cutpoint_label))
+  
+  km$table <- km$table +
+    theme_classic(base_size = 11) +
+    theme(
+      panel.grid = element_blank(),
+      plot.title = element_text(size = 11)
+    )
+  
+  pdf_file <- file.path(out_dir, paste0(out_prefix, "_KM_plot.pdf"))
+  png_file <- file.path(out_dir, paste0(out_prefix, "_KM_plot.png"))
+  
+  pdf(pdf_file, width = 8.5, height = 7.5)
+  print(km)
+  dev.off()
+  
+  png(png_file, width = 2400, height = 2100, res = 300)
+  print(km)
+  dev.off()
+  
+  return(
+    list(
+      fit = fit,
+      logrank_p = logrank_p,
+      cox = cox_obj,
+      group_summary = group_summary,
+      median_surv = median_surv
+    )
+  )
+}
+
+
+############################################################
+# 3. Load OS file
+############################################################
+
+cat("\n============================================================\n")
+cat("Loading OS file\n")
+cat("============================================================\n")
+
+if (!file.exists(input_file)) {
+  stop("Input file not found:\n", input_file)
+}
+
+os_raw <- read_csv(input_file, show_col_types = FALSE)
+
+cat("Input file:\n")
+cat(input_file, "\n\n")
+
+cat("Raw dimensions:\n")
+print(dim(os_raw))
+
+cat("\nColumns:\n")
+print(names(os_raw))
+
+
+############################################################
+# 4. Check required columns
+############################################################
+
+required_cols <- c(
+  "patient_id",
+  "median_TFx",
+  "Overall_Survival_days",
+  "Event"
+)
+
+missing_cols <- setdiff(required_cols, names(os_raw))
+
+if (length(missing_cols) > 0) {
+  stop(
+    "Missing required columns: ",
+    paste(missing_cols, collapse = ", "),
+    "\nAvailable columns:\n",
+    paste(names(os_raw), collapse = ", ")
+  )
+}
+
+if (!"Subtype" %in% names(os_raw)) {
+  os_raw$Subtype <- NA_character_
+}
+
+
+############################################################
+# 5. Prepare analysis dataset
+############################################################
+
+cat("\n============================================================\n")
+cat("Preparing analysis dataset\n")
+cat("============================================================\n")
+
+os_df <- os_raw %>%
+  transmute(
+    patient_id = as.character(patient_id),
+    Subtype = clean_subtype(Subtype),
+    median_TFx = suppressWarnings(as.numeric(median_TFx)),
+    Overall_Survival_days = suppressWarnings(as.numeric(Overall_Survival_days)),
+    OS_months = Overall_Survival_days / 30.4375,
+    Event = clean_event(Event)
+  ) %>%
+  mutate(
+    patient_id = str_trim(patient_id)
+  )
+
+cat("\nBefore filtering:\n")
+cat("Rows:", nrow(os_df), "\n")
+cat("Unique patients:", n_distinct(os_df$patient_id), "\n")
+cat("Non-missing median_TFx:", sum(!is.na(os_df$median_TFx)), "\n")
+cat("Non-missing OS days:", sum(!is.na(os_df$Overall_Survival_days)), "\n")
+cat("Non-missing Event:", sum(!is.na(os_df$Event)), "\n")
+
+# Check duplicated patients
+dup_patients <- os_df %>%
+  count(patient_id) %>%
+  filter(n > 1)
+
+if (nrow(dup_patients) > 0) {
+  cat("\nWARNING: duplicated patient IDs found. Keeping first row per patient.\n")
+  print(head(dup_patients, 20))
+  
+  write_csv(
+    dup_patients,
+    file.path(out_dir, "00_duplicated_patient_ids.csv")
+  )
+  
+  os_df <- os_df %>%
+    arrange(patient_id) %>%
+    group_by(patient_id) %>%
+    slice(1) %>%
+    ungroup()
+}
+
+# Main filter
+os_df <- os_df %>%
+  filter(
+    !is.na(patient_id),
+    patient_id != "",
+    !is.na(median_TFx),
+    !is.na(OS_months),
+    !is.na(Event),
+    Event %in% c(0, 1),
+    OS_months >= 0,
+    median_TFx >= TFX_MIN_FILTER
+  )
+
+cat("\nAfter filtering:\n")
+cat("Patients:", nrow(os_df), "\n")
+cat("Unique patients:", n_distinct(os_df$patient_id), "\n")
+cat("Deaths:", sum(os_df$Event == 1, na.rm = TRUE), "\n")
+cat("Censored:", sum(os_df$Event == 0, na.rm = TRUE), "\n")
+cat("Median TFx:", median(os_df$median_TFx, na.rm = TRUE), "\n")
+cat("TFx range:", min(os_df$median_TFx, na.rm = TRUE), "-", max(os_df$median_TFx, na.rm = TRUE), "\n")
+cat("Median OS months:", median(os_df$OS_months, na.rm = TRUE), "\n")
+
+cat("\nSubtype counts:\n")
+print(table(os_df$Subtype, useNA = "ifany"))
+
+cat("\nSubtype deaths/events:\n")
+print(table(os_df$Subtype, os_df$Event, useNA = "ifany"))
+
+write_csv(
+  os_df,
+  file.path(out_dir, "01_OS_analysis_dataset_after_filtering.csv")
+)
+
+
+############################################################
+# 6. Overall QC summary
+############################################################
+
+qc_summary <- tibble(
+  input_file = input_file,
+  tfx_filter = paste0("median_TFx >= ", TFX_MIN_FILTER, "%"),
+  n_patients = nrow(os_df),
+  n_unique_patients = n_distinct(os_df$patient_id),
+  n_deaths = sum(os_df$Event == 1, na.rm = TRUE),
+  n_censored = sum(os_df$Event == 0, na.rm = TRUE),
+  median_TFx = median(os_df$median_TFx, na.rm = TRUE),
+  min_TFx = min(os_df$median_TFx, na.rm = TRUE),
+  max_TFx = max(os_df$median_TFx, na.rm = TRUE),
+  median_OS_months_observed = median(os_df$OS_months, na.rm = TRUE)
+)
+
+write_csv(
+  qc_summary,
+  file.path(out_dir, "02_OS_QC_summary.csv")
+)
+
+print(qc_summary)
+
+
+############################################################
+# 7. Exploratory pooled cutpoint using surv_cutpoint
+############################################################
+
+cat("\n============================================================\n")
+cat("Running exploratory pooled surv_cutpoint for OS\n")
+cat("============================================================\n")
+
+cut_obj <- surv_cutpoint(
+  data = os_df,
+  time = "OS_months",
+  event = "Event",
+  variables = "median_TFx",
+  minprop = MINPROP
+)
+
+cut_summary <- as.data.frame(summary(cut_obj))
+
+cat("\nSurv_cutpoint summary:\n")
+print(cut_summary)
+str(cut_summary)
+
+write_csv(
+  cut_summary,
+  file.path(out_dir, "03_OS_surv_cutpoint_summary.csv")
+)
+
+# Robust extraction
+if ("cutpoint" %in% colnames(cut_summary)) {
+  
+  if ("variable" %in% colnames(cut_summary)) {
+    exploratory_cutpoint <- cut_summary$cutpoint[cut_summary$variable == "median_TFx"]
+  } else {
+    exploratory_cutpoint <- cut_summary$cutpoint[1]
+  }
+  
+} else if ("median_TFx" %in% rownames(cut_summary)) {
+  
+  exploratory_cutpoint <- cut_summary["median_TFx", "cutpoint"]
+  
+} else {
+  
+  stop("Could not extract cutpoint from surv_cutpoint summary. Please inspect cut_summary.")
+}
+
+# Final safety check
+if (length(exploratory_cutpoint) == 0 || is.na(exploratory_cutpoint[1])) {
+  stop("Exploratory cutpoint is empty or NA. Check cut_summary output.")
+}
+
+exploratory_cutpoint <- as.numeric(exploratory_cutpoint[1])
+
+cat("\nExploratory pooled median TFx cutpoint for OS:",
+    exploratory_cutpoint, "%\n")
+
+############################################################
+# 8. Maxstat test with corrected p-value
+############################################################
+
+cat("\n============================================================\n")
+cat("Running maxstat test for OS\n")
+cat("============================================================\n")
+
+maxstat_obj <- maxstat.test(
+  Surv(OS_months, Event) ~ median_TFx,
+  data = os_df,
+  smethod = "LogRank",
+  pmethod = "HL",
+  minprop = MINPROP,
+  maxprop = 1 - MINPROP
+)
+
+cat("\nMaxstat result:\n")
+print(maxstat_obj)
+
+writeLines(
+  capture.output(print(maxstat_obj)),
+  file.path(out_dir, "04_OS_maxstat_test_output.txt")
+)
+
+maxstat_cutpoint <- suppressWarnings(as.numeric(maxstat_obj$estimate))
+maxstat_p <- suppressWarnings(as.numeric(maxstat_obj$p.value))
+
+maxstat_summary <- tibble(
+  method = "maxstat.test",
+  outcome = "Overall survival",
+  marker = "median_TFx",
+  smethod = "LogRank",
+  pmethod = "HL",
+  minprop = MINPROP,
+  maxprop = 1 - MINPROP,
+  maxstat_cutpoint = maxstat_cutpoint,
+  maxstat_corrected_p_value = maxstat_p
+)
+
+write_csv(
+  maxstat_summary,
+  file.path(out_dir, "04_OS_maxstat_test_summary.csv")
+)
+
+print(maxstat_summary)
+
+
+############################################################
+# 9. Bootstrap cutpoint stability
+############################################################
+
+cat("\n============================================================\n")
+cat("Bootstrap cutpoint stability for OS\n")
+cat("============================================================\n")
+
+patient_ids <- unique(os_df$patient_id)
+
+get_boot_cutpoint <- function(iteration_id) {
+  
+  sampled_ids <- sample(
+    patient_ids,
+    size = length(patient_ids),
+    replace = TRUE
+  )
+  
+  boot_df <- bind_rows(
+    lapply(sampled_ids, function(id) {
+      os_df %>% filter(patient_id == id)
+    })
+  )
+  
+  # Safety checks
+  if (nrow(boot_df) < 30) return(NA_real_)
+  if (sum(boot_df$Event == 1, na.rm = TRUE) < 10) return(NA_real_)
+  if (length(unique(boot_df$median_TFx)) < 5) return(NA_real_)
+  
+  out <- tryCatch({
+    
+    boot_cut_obj <- surv_cutpoint(
+      data = boot_df,
+      time = "OS_months",
+      event = "Event",
+      variables = "median_TFx",
+      minprop = MINPROP
+    )
+    
+    boot_summary <- as.data.frame(summary(boot_cut_obj))
+    
+    # If summary is empty or malformed, return NA
+    if (nrow(boot_summary) == 0) return(NA_real_)
+    if (!"cutpoint" %in% colnames(boot_summary)) return(NA_real_)
+    
+    # Extract cutpoint safely
+    if ("variable" %in% colnames(boot_summary)) {
+      cp <- boot_summary$cutpoint[boot_summary$variable == "median_TFx"]
+    } else {
+      cp <- boot_summary$cutpoint[1]
+    }
+    
+    # If no cutpoint found, return NA
+    if (length(cp) == 0) return(NA_real_)
+    if (is.na(cp[1])) return(NA_real_)
+    
+    return(as.numeric(cp[1]))
+    
+  }, error = function(e) {
+    return(NA_real_)
+  })
+  
+  # Final safety: always return length 1
+  if (length(out) == 0) return(NA_real_)
+  return(as.numeric(out[1]))
+}
+
+boot_cuts <- purrr::map_dbl(seq_len(N_BOOT), get_boot_cutpoint)
+
+boot_df <- tibble(
+  iteration = seq_len(N_BOOT),
+  boot_cutpoint = boot_cuts
+)
+
+write_csv(
+  boot_df,
+  file.path(out_dir, "05_OS_bootstrap_cutpoints_all_iterations.csv")
+)
+
+boot_clean <- boot_df %>%
+  filter(!is.na(boot_cutpoint))
+
+cat("\nBootstrap successful iterations:", nrow(boot_clean), "of", N_BOOT, "\n")
+
+if (nrow(boot_clean) == 0) {
+  stop("All bootstrap iterations failed. Check Event coding, OS_months, median_TFx distribution, and MINPROP.")
+}
+
+boot_summary <- tibble(
+  n_boot_requested = N_BOOT,
+  n_boot_successful = nrow(boot_clean),
+  n_boot_failed = N_BOOT - nrow(boot_clean),
+  bootstrap_mean = mean(boot_clean$boot_cutpoint, na.rm = TRUE),
+  bootstrap_median = median(boot_clean$boot_cutpoint, na.rm = TRUE),
+  bootstrap_sd = sd(boot_clean$boot_cutpoint, na.rm = TRUE),
+  bootstrap_min = min(boot_clean$boot_cutpoint, na.rm = TRUE),
+  bootstrap_q025 = as.numeric(quantile(boot_clean$boot_cutpoint, 0.025, na.rm = TRUE)),
+  bootstrap_q25 = as.numeric(quantile(boot_clean$boot_cutpoint, 0.25, na.rm = TRUE)),
+  bootstrap_q75 = as.numeric(quantile(boot_clean$boot_cutpoint, 0.75, na.rm = TRUE)),
+  bootstrap_q975 = as.numeric(quantile(boot_clean$boot_cutpoint, 0.975, na.rm = TRUE)),
+  bootstrap_max = max(boot_clean$boot_cutpoint, na.rm = TRUE)
+)
+
+write_csv(
+  boot_summary,
+  file.path(out_dir, "05_OS_bootstrap_cutpoint_summary.csv")
+)
+
+print(boot_summary)
+
+boot_plot <- ggplot(boot_clean, aes(x = boot_cutpoint)) +
+  geom_histogram(bins = 30, color = "black", fill = "grey80") +
+  geom_vline(xintercept = exploratory_cutpoint, linetype = "dashed", linewidth = 0.8) +
+  geom_vline(xintercept = PUBLISHED_TFX_CUTPOINT, linetype = "dotted", linewidth = 0.8) +
+  geom_vline(xintercept = CURRENT_MEDIAN_CUTPOINT, linetype = "dotdash", linewidth = 0.8) +
+  theme_classic(base_size = 13) +
+  labs(
+    title = "Bootstrap stability of exploratory OS TFx cutpoint",
+    subtitle = "Dashed = exploratory cutpoint; dotted = 7%; dotdash = 8.17%",
+    x = "Bootstrap-derived median TFx cutpoint (%)",
+    y = "Frequency"
+  )
+
+ggsave(
+  filename = file.path(out_dir, "05_OS_bootstrap_cutpoint_histogram.pdf"),
+  plot = boot_plot,
+  width = 7.5,
+  height = 5.5
+)
+
+ggsave(
+  filename = file.path(out_dir, "05_OS_bootstrap_cutpoint_histogram.png"),
+  plot = boot_plot,
+  width = 7.5,
+  height = 5.5,
+  dpi = 300
+)
+
+############################################################
+# 10. KM plots using different cutpoints
+############################################################
+
+cat("\n============================================================\n")
+cat("Creating OS KM plot using exploratory cutpoint\n")
+cat("============================================================\n")
+
+km_exploratory <- make_os_km_plot(
+  df = os_df,
+  cutpoint = exploratory_cutpoint,
+  cutpoint_label = "Exploratory pooled cutpoint",
+  out_prefix = "06_OS_KM_exploratory_pooled_cutpoint"
+)
+
+
+cat("\n============================================================\n")
+cat("Creating OS KM plot using 7% cutpoint\n")
+cat("============================================================\n")
+
+km_published <- make_os_km_plot(
+  df = os_df,
+  cutpoint = PUBLISHED_TFX_CUTPOINT,
+  cutpoint_label = "Published/literature-informed 7% cutpoint",
+  out_prefix = "07_OS_KM_published_7percent_cutpoint"
+)
+
+
+cat("\n============================================================\n")
+cat("Creating OS KM plot using 8.17% cutpoint\n")
+cat("============================================================\n")
+
+km_current <- make_os_km_plot(
+  df = os_df,
+  cutpoint = CURRENT_MEDIAN_CUTPOINT,
+  cutpoint_label = "Current cohort median 8.17% cutpoint",
+  out_prefix = "08_OS_KM_current_8p17percent_cutpoint"
+)
+
+
+############################################################
+# 11. Cutpoint comparison summary
+############################################################
+
+cutpoint_comparison <- tibble(
+  cutpoint_type = c(
+    "Exploratory pooled surv_cutpoint",
+    "Maxstat estimate",
+    "Published/literature-informed",
+    "Current cohort median"
+  ),
+  median_TFx_cutpoint = c(
+    exploratory_cutpoint,
+    maxstat_cutpoint,
+    PUBLISHED_TFX_CUTPOINT,
+    CURRENT_MEDIAN_CUTPOINT
+  ),
+  notes = c(
+    "Data-derived; exploratory; requires validation",
+    "Maximally selected rank statistic; corrected p-value reported",
+    "External/literature-informed threshold",
+    "Previously used cohort median split"
+  )
+)
+
+write_csv(
+  cutpoint_comparison,
+  file.path(out_dir, "09_OS_cutpoint_comparison_summary.csv")
+)
+
+print(cutpoint_comparison)
+
+
+############################################################
+# 12. Subtype summary using exploratory pooled cutpoint
+############################################################
+
+os_df_fixed <- os_df %>%
+  mutate(
+    TFx_group_exploratory = ifelse(
+      median_TFx > exploratory_cutpoint,
+      paste0("High TFx > ", round(exploratory_cutpoint, 2), "%"),
+      paste0("Low TFx ≤ ", round(exploratory_cutpoint, 2), "%")
+    )
+  )
+
+subtype_summary <- os_df_fixed %>%
+  group_by(Subtype, TFx_group_exploratory) %>%
+  summarise(
+    n_patients = n_distinct(patient_id),
+    n_deaths = sum(Event == 1, na.rm = TRUE),
+    n_censored = sum(Event == 0, na.rm = TRUE),
+    median_TFx = median(median_TFx, na.rm = TRUE),
+    median_OS_months_observed = median(OS_months, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write_csv(
+  subtype_summary,
+  file.path(out_dir, "10_OS_subtype_summary_using_exploratory_cutpoint.csv")
+)
+
+print(subtype_summary)
+
+
+############################################################
+# 13. Final reporting table
+############################################################
+
+final_reporting <- tibble(
+  analysis_name = "Exploratory pooled median TFx cutpoint analysis for OS",
+  input_file = input_file,
+  n_patients = nrow(os_df),
+  n_deaths = sum(os_df$Event == 1, na.rm = TRUE),
+  n_censored = sum(os_df$Event == 0, na.rm = TRUE),
+  tfx_filter = paste0("median_TFx >= ", TFX_MIN_FILTER, "%"),
+  minprop = MINPROP,
+  surv_cutpoint_median_TFx = exploratory_cutpoint,
+  maxstat_median_TFx = maxstat_cutpoint,
+  maxstat_corrected_p_value = maxstat_p,
+  bootstrap_median_cutpoint = boot_summary$bootstrap_median,
+  bootstrap_95CI_lower = boot_summary$bootstrap_q025,
+  bootstrap_95CI_upper = boot_summary$bootstrap_q975,
+  published_reference_cutpoint = PUBLISHED_TFX_CUTPOINT,
+  current_median_cutpoint = CURRENT_MEDIAN_CUTPOINT,
+  interpretation = "Exploratory/hypothesis-generating; not externally validated"
+)
+
+write_csv(
+  final_reporting,
+  file.path(out_dir, "11_OS_final_reporting_table.csv")
+)
+
+print(final_reporting)
+
+
+############################################################
+# 14. Save session info
+############################################################
+
+writeLines(
+  capture.output(sessionInfo()),
+  con = file.path(out_dir, "12_OS_sessionInfo.txt")
+)
+
+
+############################################################
+# Done
+############################################################
+
+cat("\n============================================================\n")
+cat("OS exploratory cutpoint analysis complete.\n")
+cat("Outputs saved to:\n")
+cat(out_dir, "\n")
+cat("============================================================\n")
+```
+

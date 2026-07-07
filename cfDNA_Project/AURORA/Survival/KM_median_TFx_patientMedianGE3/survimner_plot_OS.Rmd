@@ -1,0 +1,403 @@
+---
+title: "Overall survival by patient-level median TFx among patients with median TFx ≥ 3%"
+output: html_document
+date: "2026-07-01"
+---
+# ============================================================
+# Kaplan-Meier plot: Overall survival by patient-level median TFx
+# Input file already contains:
+# patient_id, median_TFx, Overall_Survival_days, Event
+# ============================================================
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(readr)
+library(dplyr)
+library(survival)
+library(survminer)
+library(ggplot2)
+
+# ----------------------------
+# Paths
+# ----------------------------
+survival_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/AURORA/Survival"
+
+input_file <- file.path(
+  survival_dir,
+  "AURORA_all_patients_median_TFx_patientMedianGE3_OS_Event_clean.Earliest_Met_Diagnosis.csv"
+)
+
+out_dir <- file.path(
+  survival_dir,
+  "KM_median_TFx_patientMedianGE3",
+  "Earliest_Met_Diagnosis"
+)
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+out_png <- file.path(
+  out_dir,
+  "OS_KM_by_patient_level_median_TFx_months_with_risktable.png"
+)
+
+out_pdf <- file.path(
+  out_dir,
+  "OS_KM_by_patient_level_median_TFx_months_with_risktable.pdf"
+)
+
+summary_out <- file.path(
+  out_dir,
+  "OS_KM_by_patient_level_median_TFx_summary.csv"
+)
+
+cat("Input file:\n", input_file, "\n\n")
+cat("Output directory:\n", out_dir, "\n\n")
+
+# ----------------------------
+# Read data
+# ----------------------------
+df <- read_csv(input_file, show_col_types = FALSE)
+
+cat("Rows in input:", nrow(df), "\n")
+cat("Columns:\n")
+print(colnames(df))
+
+# ----------------------------
+# Required columns
+# ----------------------------
+required_cols <- c(
+  "patient_id",
+  "median_TFx",
+  "Overall_Survival_days",
+  "Event"
+)
+
+missing_cols <- setdiff(required_cols, colnames(df))
+
+if (length(missing_cols) > 0) {
+  stop(
+    paste0(
+      "Missing required columns: ",
+      paste(missing_cols, collapse = ", ")
+    )
+  )
+}
+
+# ----------------------------
+# Clean and prepare data
+# Keep only patients with patient-level median_TFx >= 3%
+# ----------------------------
+days_per_month <- 365.25 / 12
+
+min_median_TFx_cutoff <- 3
+
+df <- df %>%
+  mutate(
+    patient_id = as.character(patient_id),
+    median_TFx = as.numeric(median_TFx),
+    Overall_Survival_days = as.numeric(Overall_Survival_days),
+    OS_months = Overall_Survival_days / days_per_month,
+    Event = as.numeric(Event)
+  ) %>%
+  filter(
+    !is.na(patient_id),
+    !is.na(median_TFx),
+    median_TFx >= min_median_TFx_cutoff,
+    !is.na(OS_months),
+    !is.na(Event),
+    OS_months > 0
+  )
+
+cat("\nApplied patient-level median_TFx cutoff: >= ", 
+    min_median_TFx_cutoff, "%\n", sep = "")
+cat("Patients after median_TFx cutoff:", nrow(df), "\n")
+# ----------------------------
+# Median TFx split
+# ----------------------------
+median_tfx_cut <- median(df$median_TFx, na.rm = TRUE)
+
+df <- df %>%
+  mutate(
+    median_TFx_group = ifelse(
+      median_TFx >= median_tfx_cut,
+      "High median TFx",
+      "Low median TFx"
+    ),
+    median_TFx_group = factor(
+      median_TFx_group,
+      levels = c("Low median TFx", "High median TFx")
+    )
+  )
+
+cat("Median patient-level TFx cutpoint:", round(median_tfx_cut, 4), "%\n\n")
+
+cat("Group counts:\n")
+print(table(df$median_TFx_group))
+
+cat("\nEvents by group:\n")
+print(table(df$median_TFx_group, df$Event))
+
+# ----------------------------
+# Survival fit
+# ----------------------------
+fit <- survfit(
+  Surv(OS_months, Event) ~ median_TFx_group,
+  data = df
+)
+# ----------------------------
+# Median OS from KM fit
+# ----------------------------
+median_os_df <- survminer::surv_median(fit) %>%
+  mutate(
+    median_TFx_group = gsub(
+      "^median_TFx_group=",
+      "",
+      strata
+    ),
+    median_TFx_group = factor(
+      median_TFx_group,
+      levels = levels(df$median_TFx_group)
+    )
+  ) %>%
+  select(
+    median_TFx_group,
+    median_survival_months = median,
+    median_survival_lower_95CI = lower,
+    median_survival_upper_95CI = upper
+  )
+
+cat("\nMedian OS by group from KM fit:\n")
+print(median_os_df)
+# ----------------------------
+# Log-rank p-value calculated from data
+# ----------------------------
+lr <- survdiff(
+  Surv(OS_months, Event) ~ median_TFx_group,
+  data = df
+)
+
+p_val <- 1 - pchisq(lr$chisq, df = length(lr$n) - 1)
+
+format_p <- function(p) {
+  if (is.na(p)) {
+    return("p = NA")
+  } else if (p < 0.001) {
+    return("p < 0.001")
+  } else {
+    return(paste0("p = ", formatC(p, format = "f", digits = 3)))
+  }
+}
+
+p_label <- format_p(p_val)
+
+annot_text <- paste0(
+  "Log-rank ", p_label, "\n",
+  "Median TFx cutpoint = ", round(median_tfx_cut, 2), "%"
+)
+
+cat("\nLog-rank chi-square:", lr$chisq, "\n")
+cat("Log-rank p-value:", p_val, "\n")
+cat("Plot annotation:\n", annot_text, "\n\n")
+
+# ----------------------------
+# KM summary table
+# ----------------------------
+km_summary <- df %>%
+  group_by(median_TFx_group) %>%
+  summarise(
+    n_patients = n(),
+    n_events_deaths = sum(Event == 1, na.rm = TRUE),
+    n_censored = sum(Event == 0, na.rm = TRUE),
+    median_TFx_within_group = median(median_TFx, na.rm = TRUE),
+    min_TFx_within_group = min(median_TFx, na.rm = TRUE),
+    max_TFx_within_group = max(median_TFx, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    median_os_df,
+    by = "median_TFx_group"
+  ) %>%
+  mutate(
+    overall_median_TFx_cutpoint = median_tfx_cut,
+    logrank_chi_square = lr$chisq,
+    logrank_p_value = p_val
+  )
+
+write_csv(km_summary, summary_out)
+
+cat("KM summary with median OS saved:\n", summary_out, "\n")
+print(km_summary)
+
+# ----------------------------
+# Dynamic x-axis
+# ----------------------------
+max_month <- max(df$OS_months, na.rm = TRUE)
+
+# Round up to nearest 60 months
+x_max <- ceiling(max_month / 60) * 60
+
+# Larger interval to avoid merged x-axis labels
+break_by <- 60
+
+# Annotation position
+annot_x <- x_max * 0.96
+annot_y <- 0.97
+
+cat("\nMax OS month:", max_month, "\n")
+cat("x-axis max:", x_max, "\n")
+cat("x-axis interval:", break_by, "months\n")
+
+# ----------------------------
+# Legend labels
+# ----------------------------
+low_n <- sum(df$median_TFx_group == "Low median TFx")
+low_events <- sum(
+  df$median_TFx_group == "Low median TFx" &
+    df$Event == 1
+)
+
+high_n <- sum(df$median_TFx_group == "High median TFx")
+high_events <- sum(
+  df$median_TFx_group == "High median TFx" &
+    df$Event == 1
+)
+
+legend_labs <- c(
+  paste0("Low median TFx (n=", low_n, ", deaths=", low_events, ")"),
+  paste0("High median TFx (n=", high_n, ", deaths=", high_events, ")")
+)
+
+# ----------------------------
+# Plot
+# ----------------------------
+p <- ggsurvplot(
+  fit,
+  data = df,
+  
+  # Main KM curve
+  conf.int = TRUE,
+  conf.int.alpha = 0.22,
+  censor = TRUE,
+  censor.shape = 3,
+  censor.size = 3.2,
+  size = 1.15,
+  
+  # Single bottom table only
+  risk.table = TRUE,
+  risk.table.title = "Number at risk",
+  risk.table.height = 0.24,
+  risk.table.y.text = TRUE,
+  risk.table.y.text.col = TRUE,
+  tables.theme = theme_cleantable(base_size = 12),
+  
+  # Labels
+  title = "Overall survival by patient-level median TFx",
+  xlab = "Time from primary diagnosis (months)",
+  ylab = "Overall survival probability",
+  
+  # Axis
+  break.time.by = break_by,
+  xlim = c(0, x_max),
+  ylim = c(0, 1.05),
+  
+  # Legend
+  legend.title = "Median TFx group",
+  legend.labs = legend_labs,
+  legend = "top",
+  
+  # Colors
+  palette = c("#1E88E5", "#E74C3C"),
+  
+  # Manual p-value annotation added below
+  pval = FALSE,
+  
+  # Style
+  ggtheme = theme_classic(base_size = 15)
+)
+
+# ----------------------------
+# Clean main KM plot
+# ----------------------------
+p$plot <- p$plot +
+  annotate(
+    "label",
+    x = annot_x,
+    y = annot_y,
+    label = annot_text,
+    hjust = 1,
+    vjust = 1,
+    size = 4.4,
+    label.size = 0.25,
+    fill = "white",
+    alpha = 0.9
+  ) +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold",
+      size = 18,
+      margin = margin(t = 10, b = 18)
+    ),
+    legend.position = "top",
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 11),
+    legend.box.margin = margin(b = 8),
+    axis.title = element_text(size = 15),
+    axis.text = element_text(size = 12),
+    
+    # No grid lines
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    
+    plot.margin = margin(t = 18, r = 15, b = 5, l = 15)
+  )
+
+# ----------------------------
+# Clean bottom number-at-risk table
+# Do not set axis.text.y because survminer uses colored y labels
+# ----------------------------
+p$table <- p$table +
+  theme(
+    plot.title = element_text(size = 14, hjust = 0, face = "bold"),
+    axis.title.x = element_text(size = 14),
+    axis.title.y = element_text(size = 13),
+    axis.text.x = element_text(size = 11),
+    
+    # No grid lines
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    
+    plot.margin = margin(t = 4, r = 15, b = 8, l = 15)
+  )
+
+# ----------------------------
+# Save outputs
+# ----------------------------
+png(
+  filename = out_png,
+  width = 12.5,
+  height = 8.3,
+  units = "in",
+  res = 300
+)
+print(p)
+dev.off()
+
+pdf(
+  file = out_pdf,
+  width = 12.5,
+  height = 8.3
+)
+print(p)
+dev.off()
+
+cat("\nSaved OS KM plot:\n")
+cat(out_png, "\n")
+cat(out_pdf, "\n")
+
+cat("\nSaved summary table:\n")
+cat(summary_out, "\n")
+```
+

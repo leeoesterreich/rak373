@@ -1,0 +1,588 @@
+---
+title: "Overall survival by patient-level median TFx within receptor subgroups"
+output: html_document
+date: "2026-07-01"
+---
+
+# ============================================================
+# Kaplan-Meier plots: Overall survival by patient-level median TFx
+# within receptor subgroups
+#
+# Input file should contain:
+#   patient_id
+#   median_TFx
+#   Overall_Survival_days
+#   Event
+#   Subgroups
+#
+# Subgroups:
+#   HR+ HER2-
+#   HR+ HER2+
+#   HR- HER2-
+#   HR- HER2+
+#
+# Analysis:
+#   For each subgroup:
+#     1. Keep patients with median_TFx >= 3%
+#     2. Split patients by subgroup-specific median TFx
+#     3. Plot OS KM curve: Low median TFx vs High median TFx
+#     4. Save median OS months in summary table
+# ============================================================
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(readr)
+library(dplyr)
+library(survival)
+library(survminer)
+library(ggplot2)
+library(stringr)
+
+# ----------------------------
+# Paths
+# ----------------------------
+survival_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/AURORA/Survival"
+
+input_file <- file.path(
+  survival_dir,
+  "AURORA_all_patients_median_TFx_patientMedianGE3_OS_Event_clean.First_Primary.csv"
+)
+
+out_dir <- file.path(
+  survival_dir,
+  "KM_median_TFx_by_subtype_patientMedianGE3",
+  "First_Primary"
+)
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+summary_out <- file.path(
+  out_dir,
+  "OS_KM_by_median_TFx_within_receptor_subgroups_summary.csv"
+)
+
+cat("Input file:\n", input_file, "\n\n")
+cat("Output directory:\n", out_dir, "\n\n")
+
+# ----------------------------
+# Read data
+# ----------------------------
+df <- read_csv(input_file, show_col_types = FALSE)
+
+cat("Rows in input:", nrow(df), "\n")
+cat("Columns:\n")
+print(colnames(df))
+
+# ----------------------------
+# Required columns
+# ----------------------------
+required_cols <- c(
+  "patient_id",
+  "Subtype",
+  "median_TFx",
+  "Overall_Survival_days",
+  "Event"
+)
+missing_cols <- setdiff(required_cols, colnames(df))
+
+if (length(missing_cols) > 0) {
+  stop(
+    paste0(
+      "Missing required columns: ",
+      paste(missing_cols, collapse = ", "),
+      "\nPlease make sure Subgroups is already present in AURORA_all_patients_median_TFx_OS_clean.csv."
+    )
+  )
+}
+
+# ----------------------------
+# Helper functions
+# ----------------------------
+format_p <- function(p) {
+  if (is.na(p)) {
+    return("p = NA")
+  } else if (p < 0.001) {
+    return("p < 0.001")
+  } else {
+    return(paste0("p = ", formatC(p, format = "f", digits = 3)))
+  }
+}
+
+safe_name <- function(x) {
+  x %>%
+    str_replace_all("\\+", "pos") %>%
+    str_replace_all("-", "neg") %>%
+    str_replace_all("\\s+", "_") %>%
+    str_replace_all("[^A-Za-z0-9_]", "")
+}
+
+get_median_value <- function(median_tbl, group_name, value_col) {
+  x <- median_tbl %>%
+    filter(group_clean == group_name) %>%
+    pull({{ value_col }})
+
+  if (length(x) == 0) {
+    return(NA_real_)
+  }
+
+  return(x[1])
+}
+
+# ----------------------------
+# Clean and prepare data
+# Keep only patients with available median_TFx >= 3%
+# ----------------------------
+days_per_month <- 365.25 / 12
+min_median_TFx_cutoff <- 3
+
+df <- df %>%
+  mutate(
+    patient_id = as.character(patient_id),
+    median_TFx = as.numeric(median_TFx),
+    Overall_Survival_days = as.numeric(Overall_Survival_days),
+    OS_months = Overall_Survival_days / days_per_month,
+    Event = as.numeric(Event),
+
+    # Use Subtype column from OS clean file
+    receptor_subtype = str_squish(as.character(Subtype)),
+
+    # Standardize HER2 capitalization
+    receptor_subtype = str_replace_all(receptor_subtype, "Her2", "HER2"),
+    receptor_subtype = str_replace_all(receptor_subtype, "her2", "HER2"),
+
+    receptor_subtype = factor(
+      receptor_subtype,
+      levels = c("HR+ HER2-", "HR+ HER2+", "HR- HER2-", "HR- HER2+")
+    )
+  ) %>%
+  filter(
+    !is.na(patient_id),
+    !is.na(median_TFx),
+    median_TFx >= min_median_TFx_cutoff,
+    !is.na(OS_months),
+    OS_months > 0,
+    !is.na(Event),
+    !is.na(receptor_subtype)
+  )
+
+cat("\nApplied patient-level median_TFx cutoff: >= ",
+    min_median_TFx_cutoff, "%\n", sep = "")
+
+cat("Patients after median_TFx cutoff and usable OS/Event:", nrow(df), "\n")
+
+cat("\nSubtype counts after filtering:\n")
+print(table(df$receptor_subtype, useNA = "ifany"))
+
+cat("\nSubtype deaths/events after filtering:\n")
+print(table(df$receptor_subtype, df$Event, useNA = "ifany"))
+
+# ----------------------------
+# Save cleaned patient-level OS subgroup input
+# ----------------------------
+cleaned_out <- file.path(
+  out_dir,
+  "OS_KM_by_median_TFx_within_receptor_subgroups_patient_input.csv"
+)
+
+df %>%
+  select(
+    patient_id,
+    median_TFx,
+    Overall_Survival_days,
+    OS_months,
+    Event,
+    Subtype,
+    receptor_subtype
+  ) %>%
+  write_csv(cleaned_out)
+
+cat("\nSaved cleaned OS subgroup input:\n", cleaned_out, "\n")
+
+# ----------------------------
+# Loop through receptor subgroups
+# ----------------------------
+subtypes <- c("HR+ HER2-", "HR+ HER2+", "HR- HER2-", "HR- HER2+")
+
+summary_list <- list()
+
+for (subtype in subtypes) {
+
+  cat("\n============================================================\n")
+  cat("Running subtype:", subtype, "\n")
+  cat("============================================================\n")
+
+  sub_df <- df %>%
+    filter(receptor_subtype == subtype) %>%
+    droplevels()
+
+  n_sub <- nrow(sub_df)
+  n_events <- sum(sub_df$Event == 1, na.rm = TRUE)
+  n_censored <- sum(sub_df$Event == 0, na.rm = TRUE)
+
+  cat("Patients:", n_sub, "\n")
+  cat("Deaths/events:", n_events, "\n")
+  cat("Censored:", n_censored, "\n")
+
+  if (n_sub < 6) {
+    cat("Skipping", subtype, ": too few patients.\n")
+
+    summary_list[[subtype]] <- data.frame(
+      receptor_subtype = subtype,
+      status = "Skipped: too few patients",
+      n_patients = n_sub,
+      n_events_deaths = n_events,
+      n_censored = n_censored,
+      TFx_cutpoint = NA_real_,
+
+      low_n = NA_integer_,
+      low_events_deaths = NA_integer_,
+      low_median_OS_months = NA_real_,
+      low_median_OS_lower_95CI = NA_real_,
+      low_median_OS_upper_95CI = NA_real_,
+
+      high_n = NA_integer_,
+      high_events_deaths = NA_integer_,
+      high_median_OS_months = NA_real_,
+      high_median_OS_lower_95CI = NA_real_,
+      high_median_OS_upper_95CI = NA_real_,
+
+      logrank_chi_square = NA_real_,
+      logrank_p_value = NA_real_
+    )
+
+    next
+  }
+
+  # ----------------------------
+  # Subgroup-specific median TFx cutpoint
+  # ----------------------------
+  subtype_tfx_cut <- median(sub_df$median_TFx, na.rm = TRUE)
+
+  sub_df <- sub_df %>%
+    mutate(
+      median_TFx_group_subtype = ifelse(
+        median_TFx >= subtype_tfx_cut,
+        "High median TFx",
+        "Low median TFx"
+      ),
+      median_TFx_group_subtype = factor(
+        median_TFx_group_subtype,
+        levels = c("Low median TFx", "High median TFx")
+      )
+    )
+
+  cat("Subtype-specific median TFx cutpoint:",
+      round(subtype_tfx_cut, 4), "%\n")
+
+  cat("TFx group counts:\n")
+  print(table(sub_df$median_TFx_group_subtype))
+
+  if (length(unique(sub_df$median_TFx_group_subtype)) < 2) {
+    cat("Skipping", subtype, ": only one TFx group present.\n")
+
+    summary_list[[subtype]] <- data.frame(
+      receptor_subtype = subtype,
+      status = "Skipped: only one TFx group",
+      n_patients = n_sub,
+      n_events_deaths = n_events,
+      n_censored = n_censored,
+      TFx_cutpoint = subtype_tfx_cut,
+
+      low_n = sum(sub_df$median_TFx_group_subtype == "Low median TFx"),
+      low_events_deaths = sum(
+        sub_df$median_TFx_group_subtype == "Low median TFx" &
+          sub_df$Event == 1
+      ),
+      low_median_OS_months = NA_real_,
+      low_median_OS_lower_95CI = NA_real_,
+      low_median_OS_upper_95CI = NA_real_,
+
+      high_n = sum(sub_df$median_TFx_group_subtype == "High median TFx"),
+      high_events_deaths = sum(
+        sub_df$median_TFx_group_subtype == "High median TFx" &
+          sub_df$Event == 1
+      ),
+      high_median_OS_months = NA_real_,
+      high_median_OS_lower_95CI = NA_real_,
+      high_median_OS_upper_95CI = NA_real_,
+
+      logrank_chi_square = NA_real_,
+      logrank_p_value = NA_real_
+    )
+
+    next
+  }
+
+  # ----------------------------
+  # Survival fit
+  # ----------------------------
+  fit <- survfit(
+    Surv(OS_months, Event) ~ median_TFx_group_subtype,
+    data = sub_df
+  )
+
+  # ----------------------------
+  # Median OS months by TFx group
+  # ----------------------------
+  median_tbl <- survminer::surv_median(fit) %>%
+    mutate(
+      group_clean = case_when(
+        str_detect(strata, "Low median TFx") ~ "Low median TFx",
+        str_detect(strata, "High median TFx") ~ "High median TFx",
+        TRUE ~ strata
+      )
+    )
+
+  low_median_months <- get_median_value(median_tbl, "Low median TFx", median)
+  low_median_lower_95CI <- get_median_value(median_tbl, "Low median TFx", lower)
+  low_median_upper_95CI <- get_median_value(median_tbl, "Low median TFx", upper)
+
+  high_median_months <- get_median_value(median_tbl, "High median TFx", median)
+  high_median_lower_95CI <- get_median_value(median_tbl, "High median TFx", lower)
+  high_median_upper_95CI <- get_median_value(median_tbl, "High median TFx", upper)
+
+  cat("\nMedian OS months by TFx group:\n")
+  print(median_tbl)
+
+  # ----------------------------
+  # Log-rank p-value
+  # ----------------------------
+  lr <- survdiff(
+    Surv(OS_months, Event) ~ median_TFx_group_subtype,
+    data = sub_df
+  )
+
+  p_val <- 1 - pchisq(lr$chisq, df = length(lr$n) - 1)
+  p_label <- format_p(p_val)
+
+  annot_text <- paste0(
+    "Log-rank ", p_label, "\n",
+    "Median TFx cutpoint = ", round(subtype_tfx_cut, 2), "%"
+  )
+
+  cat("\nLog-rank chi-square:", lr$chisq, "\n")
+  cat("Log-rank p-value:", p_val, "\n")
+
+  # ----------------------------
+  # Legend labels
+  # ----------------------------
+  low_n <- sum(sub_df$median_TFx_group_subtype == "Low median TFx")
+  low_events <- sum(
+    sub_df$median_TFx_group_subtype == "Low median TFx" &
+      sub_df$Event == 1
+  )
+
+  high_n <- sum(sub_df$median_TFx_group_subtype == "High median TFx")
+  high_events <- sum(
+    sub_df$median_TFx_group_subtype == "High median TFx" &
+      sub_df$Event == 1
+  )
+
+  legend_labs <- c(
+    paste0("Low median TFx (n=", low_n, ", deaths=", low_events, ")"),
+    paste0("High median TFx (n=", high_n, ", deaths=", high_events, ")")
+  )
+
+  # ----------------------------
+  # Dynamic x-axis for each subgroup
+  # ----------------------------
+  max_month <- max(sub_df$OS_months, na.rm = TRUE)
+
+  x_max <- ceiling(max_month / 60) * 60
+
+  if (x_max < 60) {
+    x_max <- 60
+  }
+
+  break_by <- 60
+
+  annot_x <- x_max * 0.96
+  annot_y <- 0.97
+
+  cat("\nMax OS month:", max_month, "\n")
+  cat("x-axis max:", x_max, "\n")
+  cat("x-axis interval:", break_by, "months\n")
+
+  # ----------------------------
+  # Plot
+  # ----------------------------
+  p <- ggsurvplot(
+    fit,
+    data = sub_df,
+
+    # Main KM curve
+    conf.int = TRUE,
+    conf.int.alpha = 0.22,
+    censor = TRUE,
+    censor.shape = 3,
+    censor.size = 3.2,
+    size = 1.15,
+
+    # Single bottom number-at-risk table
+    risk.table = TRUE,
+    risk.table.title = "Number at risk",
+    risk.table.height = 0.24,
+    risk.table.y.text = TRUE,
+    risk.table.y.text.col = TRUE,
+    tables.theme = theme_cleantable(base_size = 12),
+
+    # Labels
+    title = paste0("Overall survival by median TFx: ", subtype),
+    xlab = "Time from primary diagnosis (months)",
+    ylab = "Overall survival probability",
+
+    # Axis
+    break.time.by = break_by,
+    xlim = c(0, x_max),
+    ylim = c(0, 1.05),
+
+    # Legend
+    legend.title = "Median TFx group",
+    legend.labs = legend_labs,
+    legend = "top",
+
+    # Colors
+    palette = c("#1E88E5", "#E74C3C"),
+
+    # Manual p-value annotation
+    pval = FALSE,
+
+    # Locked style
+    ggtheme = theme_classic(base_size = 15)
+  )
+
+  # ----------------------------
+  # Clean main KM plot
+  # ----------------------------
+  p$plot <- p$plot +
+    annotate(
+      "label",
+      x = annot_x,
+      y = annot_y,
+      label = annot_text,
+      hjust = 1,
+      vjust = 1,
+      size = 4.4,
+      label.size = 0.25,
+      fill = "white",
+      alpha = 0.9
+    ) +
+    theme(
+      plot.title = element_text(
+        hjust = 0.5,
+        face = "bold",
+        size = 18,
+        margin = margin(t = 10, b = 18)
+      ),
+      legend.position = "top",
+      legend.title = element_text(size = 12),
+      legend.text = element_text(size = 11),
+      legend.box.margin = margin(b = 8),
+      axis.title = element_text(size = 15),
+      axis.text = element_text(size = 12),
+
+      # Locked style: no grid lines
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+
+      plot.margin = margin(t = 18, r = 15, b = 5, l = 15)
+    )
+
+  # ----------------------------
+  # Clean bottom number-at-risk table
+  # ----------------------------
+  p$table <- p$table +
+    theme(
+      plot.title = element_text(size = 14, hjust = 0, face = "bold"),
+      axis.title.x = element_text(size = 14),
+      axis.title.y = element_text(size = 13),
+      axis.text.x = element_text(size = 11),
+
+      # Locked style: no grid lines
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+
+      plot.margin = margin(t = 4, r = 15, b = 8, l = 15)
+    )
+
+  # ----------------------------
+  # Save plot
+  # ----------------------------
+  subtype_file <- safe_name(subtype)
+
+  out_png <- file.path(
+    out_dir,
+    paste0("OS_KM_median_TFx_", subtype_file, "_months_with_risktable.png")
+  )
+
+  out_pdf <- file.path(
+    out_dir,
+    paste0("OS_KM_median_TFx_", subtype_file, "_months_with_risktable.pdf")
+  )
+
+  png(
+    filename = out_png,
+    width = 12.5,
+    height = 8.3,
+    units = "in",
+    res = 300
+  )
+  print(p)
+  dev.off()
+
+  pdf(
+    file = out_pdf,
+    width = 12.5,
+    height = 8.3
+  )
+  print(p)
+  dev.off()
+
+  cat("\nSaved OS KM plot:\n")
+  cat(out_png, "\n")
+  cat(out_pdf, "\n")
+
+  # ----------------------------
+  # Store summary
+  # ----------------------------
+  summary_list[[subtype]] <- data.frame(
+    receptor_subtype = subtype,
+    status = "Plotted",
+    n_patients = n_sub,
+    n_events_deaths = n_events,
+    n_censored = n_censored,
+    TFx_cutpoint = subtype_tfx_cut,
+
+    low_n = low_n,
+    low_events_deaths = low_events,
+    low_median_OS_months = low_median_months,
+    low_median_OS_lower_95CI = low_median_lower_95CI,
+    low_median_OS_upper_95CI = low_median_upper_95CI,
+
+    high_n = high_n,
+    high_events_deaths = high_events,
+    high_median_OS_months = high_median_months,
+    high_median_OS_lower_95CI = high_median_lower_95CI,
+    high_median_OS_upper_95CI = high_median_upper_95CI,
+
+    logrank_chi_square = lr$chisq,
+    logrank_p_value = p_val
+  )
+}
+
+# ----------------------------
+# Save summary across subgroups
+# ----------------------------
+subgroup_summary <- bind_rows(summary_list)
+
+write_csv(subgroup_summary, summary_out)
+
+cat("\n============================================================\n")
+cat("Saved OS receptor subgroup KM summary:\n")
+cat(summary_out, "\n")
+cat("============================================================\n")
+
+print(subgroup_summary)
+```

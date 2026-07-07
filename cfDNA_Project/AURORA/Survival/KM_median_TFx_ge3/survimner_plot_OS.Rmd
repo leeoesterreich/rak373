@@ -1,10 +1,11 @@
 ---
-title: "Overall survival by patient-level median TFx among patients with median TFx ≥ 3%"
+title: "Overall survival by patient-level median TFx after excluding blood draws with TFx <3%"
 output: html_document
 date: "2026-07-01"
 ---
 # ============================================================
-# Kaplan-Meier plot: Overall survival by patient-level median TFx
+# Kaplan-Meier plot
+# Exclude blood draws with TFx <3% first and then calculate patient-level median TFx using only TFx ≥3% draws.
 # Input file already contains:
 # patient_id, median_TFx, Overall_Survival_days, Event
 # ============================================================
@@ -26,12 +27,13 @@ survival_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/AURORA/Survival"
 
 input_file <- file.path(
   survival_dir,
-  "AURORA_all_patients_median_TFx_OS_clean.csv"
+  "AURORA_all_patients_median_TFx_ge3_OS_Event_clean.First_Primary.csv"
 )
 
 out_dir <- file.path(
   survival_dir,
-  "KM_median_TFx"
+  "KM_median_TFx_ge3",
+  "First_Primary"
 )
 
 dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)

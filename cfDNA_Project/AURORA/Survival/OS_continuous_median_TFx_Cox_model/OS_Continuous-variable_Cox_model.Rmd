@@ -1,0 +1,798 @@
+---
+title: "OS Continuous-variable Cox model"
+output: html_document
+date: "2026-07-03"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+############################################################
+# AURORA OS analysis:
+# Continuous-variable Cox model for median TFx
+#
+# Input:
+#   AURORA_all_patients_median_TFx_OS_clean.csv
+#
+# Expected columns:
+#   patient_id
+#   Subtype
+#   median_TFx
+#   Overall_Survival_days
+#   Event
+#
+# Event:
+#   1 = death
+#   0 = censored
+############################################################
+```
+
+
+```{r}
+############################################################
+# 0. Setup
+############################################################
+
+rm(list = ls())
+
+options(stringsAsFactors = FALSE)
+
+required_pkgs <- c(
+  "dplyr",
+  "readr",
+  "stringr",
+  "survival",
+  "ggplot2",
+  "tibble",
+  "splines"
+)
+
+missing_pkgs <- required_pkgs[!required_pkgs %in% rownames(installed.packages())]
+
+if (length(missing_pkgs) > 0) {
+  stop(
+    "Missing packages: ",
+    paste(missing_pkgs, collapse = ", "),
+    "\nInstall using:\n",
+    "install.packages(c(",
+    paste(sprintf('\"%s\"', missing_pkgs), collapse = ", "),
+    "))"
+  )
+}
+
+library(dplyr)
+library(readr)
+library(stringr)
+library(survival)
+library(ggplot2)
+library(tibble)
+library(splines)
+
+
+############################################################
+# 1. User settings
+############################################################
+
+survival_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/AURORA/Survival"
+
+input_file <- file.path(
+  survival_dir,
+  "AURORA_all_patients_median_TFx_OS_clean.csv"
+)
+
+out_dir <- file.path(
+  survival_dir,
+  "OS_continuous_median_TFx_Cox_model"
+)
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Match your current OS analysis
+TFX_MIN_FILTER <- 3
+
+# Small constant only needed if you later include values near zero.
+# Here TFx >= 3, so log2(median_TFx) is safe.
+set.seed(123)
+
+
+############################################################
+# 2. Helper functions
+############################################################
+
+clean_event <- function(x) {
+  
+  if (is.numeric(x) || is.integer(x)) {
+    return(as.integer(x))
+  }
+  
+  x0 <- tolower(str_trim(as.character(x)))
+  
+  out <- case_when(
+    x0 %in% c("1", "event", "death", "dead", "yes", "true") ~ 1L,
+    x0 %in% c("0", "censored", "censor", "alive", "no", "false") ~ 0L,
+    TRUE ~ NA_integer_
+  )
+  
+  return(out)
+}
+
+
+clean_subtype <- function(x) {
+  
+  x <- as.character(x)
+  x <- str_trim(x)
+  x <- str_replace_all(x, "Her2", "HER2")
+  x <- str_replace_all(x, "HER-2", "HER2")
+  x <- str_replace_all(x, "HR\\+\\s*HER2\\-", "HR+ HER2-")
+  x <- str_replace_all(x, "HR\\+\\s*HER2\\+", "HR+ HER2+")
+  x <- str_replace_all(x, "HR\\-\\s*HER2\\-", "HR- HER2-")
+  x <- str_replace_all(x, "HR\\-\\s*HER2\\+", "HR- HER2+")
+  x <- str_squish(x)
+  
+  return(x)
+}
+
+
+format_p <- function(p) {
+  
+  if (is.na(p)) return(NA_character_)
+  
+  if (p < 0.001) {
+    return(formatC(p, format = "e", digits = 2))
+  } else {
+    return(formatC(p, format = "f", digits = 4))
+  }
+}
+
+
+tidy_cox <- function(model, model_name) {
+  
+  s <- summary(model)
+  
+  coef_df <- as.data.frame(s$coefficients)
+  ci_df <- as.data.frame(s$conf.int)
+  
+  out <- tibble(
+    model = model_name,
+    term = rownames(coef_df),
+    beta = coef_df[, "coef"],
+    HR = ci_df[, "exp(coef)"],
+    lower_95CI = ci_df[, "lower .95"],
+    upper_95CI = ci_df[, "upper .95"],
+    p_value = coef_df[, "Pr(>|z|)"],
+    p_value_formatted = sapply(coef_df[, "Pr(>|z|)"], format_p)
+  )
+  
+  rownames(out) <- NULL
+  
+  return(out)
+}
+
+
+save_ph_test <- function(model, model_name, out_dir) {
+  
+  ph <- cox.zph(model)
+  
+  ph_df <- as.data.frame(ph$table)
+  ph_df <- tibble::rownames_to_column(ph_df, var = "term")
+  ph_df$model <- model_name
+  
+  write_csv(
+    ph_df,
+    file.path(out_dir, paste0(model_name, "_cox_zph_PH_test.csv"))
+  )
+  
+  pdf(
+    file.path(out_dir, paste0(model_name, "_cox_zph_PH_plot.pdf")),
+    width = 8,
+    height = 6
+  )
+  print(plot(ph))
+  dev.off()
+  
+  return(ph_df)
+}
+
+
+############################################################
+# 3. Load OS file
+############################################################
+
+cat("\n============================================================\n")
+cat("Loading OS file\n")
+cat("============================================================\n")
+
+if (!file.exists(input_file)) {
+  stop("Input file not found:\n", input_file)
+}
+
+os_raw <- read_csv(input_file, show_col_types = FALSE)
+
+cat("Input file:\n")
+cat(input_file, "\n\n")
+
+cat("Raw dimensions:\n")
+print(dim(os_raw))
+
+cat("\nColumns:\n")
+print(names(os_raw))
+
+
+############################################################
+# 4. Check required columns
+############################################################
+
+required_cols <- c(
+  "patient_id",
+  "median_TFx",
+  "Overall_Survival_days",
+  "Event"
+)
+
+missing_cols <- setdiff(required_cols, names(os_raw))
+
+if (length(missing_cols) > 0) {
+  stop(
+    "Missing required columns: ",
+    paste(missing_cols, collapse = ", "),
+    "\nAvailable columns:\n",
+    paste(names(os_raw), collapse = ", ")
+  )
+}
+
+if (!"Subtype" %in% names(os_raw)) {
+  os_raw$Subtype <- NA_character_
+}
+
+
+############################################################
+# 5. Prepare analysis dataset
+############################################################
+
+cat("\n============================================================\n")
+cat("Preparing continuous-variable OS dataset\n")
+cat("============================================================\n")
+
+os_df <- os_raw %>%
+  transmute(
+    patient_id = as.character(patient_id),
+    Subtype = clean_subtype(Subtype),
+    median_TFx = suppressWarnings(as.numeric(median_TFx)),
+    Overall_Survival_days = suppressWarnings(as.numeric(Overall_Survival_days)),
+    OS_months = Overall_Survival_days / 30.4375,
+    Event = clean_event(Event)
+  ) %>%
+  mutate(
+    patient_id = str_trim(patient_id)
+  )
+
+cat("\nBefore filtering:\n")
+cat("Rows:", nrow(os_df), "\n")
+cat("Unique patients:", n_distinct(os_df$patient_id), "\n")
+cat("Non-missing median_TFx:", sum(!is.na(os_df$median_TFx)), "\n")
+cat("Non-missing OS days:", sum(!is.na(os_df$Overall_Survival_days)), "\n")
+cat("Non-missing Event:", sum(!is.na(os_df$Event)), "\n")
+
+# Remove duplicated patients if present
+dup_patients <- os_df %>%
+  count(patient_id) %>%
+  filter(n > 1)
+
+if (nrow(dup_patients) > 0) {
+  
+  cat("\nWARNING: duplicated patient IDs found. Keeping first row per patient.\n")
+  print(head(dup_patients, 20))
+  
+  write_csv(
+    dup_patients,
+    file.path(out_dir, "00_duplicated_patient_ids.csv")
+  )
+  
+  os_df <- os_df %>%
+    arrange(patient_id) %>%
+    group_by(patient_id) %>%
+    slice(1) %>%
+    ungroup()
+}
+
+# Main filter
+os_df <- os_df %>%
+  filter(
+    !is.na(patient_id),
+    patient_id != "",
+    !is.na(median_TFx),
+    !is.na(OS_months),
+    !is.na(Event),
+    Event %in% c(0, 1),
+    OS_months >= 0,
+    median_TFx >= TFX_MIN_FILTER
+  ) %>%
+  mutate(
+    TFx_per_1percent = median_TFx,
+    TFx_per_5percent = median_TFx / 5,
+    TFx_per_10percent = median_TFx / 10,
+    log2_TFx = log2(median_TFx)
+  )
+
+cat("\nAfter filtering:\n")
+cat("Patients:", nrow(os_df), "\n")
+cat("Unique patients:", n_distinct(os_df$patient_id), "\n")
+cat("Deaths:", sum(os_df$Event == 1, na.rm = TRUE), "\n")
+cat("Censored:", sum(os_df$Event == 0, na.rm = TRUE), "\n")
+cat("Median TFx:", median(os_df$median_TFx, na.rm = TRUE), "\n")
+cat("TFx range:", min(os_df$median_TFx, na.rm = TRUE), "-", max(os_df$median_TFx, na.rm = TRUE), "\n")
+cat("Median OS months:", median(os_df$OS_months, na.rm = TRUE), "\n")
+
+cat("\nSubtype counts:\n")
+print(table(os_df$Subtype, useNA = "ifany"))
+
+cat("\nSubtype deaths/events:\n")
+print(table(os_df$Subtype, os_df$Event, useNA = "ifany"))
+
+write_csv(
+  os_df,
+  file.path(out_dir, "01_OS_continuous_analysis_dataset.csv")
+)
+
+
+############################################################
+# 6. QC summary
+############################################################
+
+qc_summary <- tibble(
+  input_file = input_file,
+  tfx_filter = paste0("median_TFx >= ", TFX_MIN_FILTER, "%"),
+  n_patients = nrow(os_df),
+  n_unique_patients = n_distinct(os_df$patient_id),
+  n_deaths = sum(os_df$Event == 1, na.rm = TRUE),
+  n_censored = sum(os_df$Event == 0, na.rm = TRUE),
+  median_TFx = median(os_df$median_TFx, na.rm = TRUE),
+  min_TFx = min(os_df$median_TFx, na.rm = TRUE),
+  max_TFx = max(os_df$median_TFx, na.rm = TRUE),
+  median_OS_months_observed = median(os_df$OS_months, na.rm = TRUE)
+)
+
+write_csv(
+  qc_summary,
+  file.path(out_dir, "02_OS_continuous_QC_summary.csv")
+)
+
+print(qc_summary)
+
+
+############################################################
+# 7. Primary continuous Cox models
+############################################################
+
+cat("\n============================================================\n")
+cat("Running primary continuous Cox models\n")
+cat("============================================================\n")
+
+# Model A: HR per 1% increase in median TFx
+cox_per1 <- coxph(
+  Surv(OS_months, Event) ~ TFx_per_1percent,
+  data = os_df
+)
+
+# Model B: HR per 5% increase in median TFx
+# This is usually easier to report.
+cox_per5 <- coxph(
+  Surv(OS_months, Event) ~ TFx_per_5percent,
+  data = os_df
+)
+
+# Model C: HR per 10% increase in median TFx
+cox_per10 <- coxph(
+  Surv(OS_months, Event) ~ TFx_per_10percent,
+  data = os_df
+)
+
+# Model D: HR per doubling of median TFx
+# Because log2(TFx) increases by 1 when TFx doubles.
+cox_log2 <- coxph(
+  Surv(OS_months, Event) ~ log2_TFx,
+  data = os_df
+)
+
+continuous_results <- bind_rows(
+  tidy_cox(cox_per1, "Univariable Cox: per 1% increase in median TFx"),
+  tidy_cox(cox_per5, "Univariable Cox: per 5% increase in median TFx"),
+  tidy_cox(cox_per10, "Univariable Cox: per 10% increase in median TFx"),
+  tidy_cox(cox_log2, "Univariable Cox: per doubling of median TFx")
+)
+
+write_csv(
+  continuous_results,
+  file.path(out_dir, "03_OS_continuous_Cox_univariable_results.csv")
+)
+
+cat("\nContinuous Cox results:\n")
+print(continuous_results)
+
+
+############################################################
+# 8. Subtype-adjusted Cox models
+############################################################
+
+cat("\n============================================================\n")
+cat("Running subtype-adjusted Cox models\n")
+cat("============================================================\n")
+
+# Only run adjusted models if Subtype exists and has >1 level
+subtype_available <- !all(is.na(os_df$Subtype)) &&
+  length(unique(na.omit(os_df$Subtype))) > 1
+
+if (subtype_available) {
+  
+  os_df <- os_df %>%
+    mutate(
+      Subtype = factor(Subtype)
+    )
+  
+  # Set HR+ HER2- as reference if present
+  if ("HR+ HER2-" %in% levels(os_df$Subtype)) {
+    os_df$Subtype <- relevel(os_df$Subtype, ref = "HR+ HER2-")
+  }
+  
+  cox_adj_per5 <- coxph(
+    Surv(OS_months, Event) ~ TFx_per_5percent + Subtype,
+    data = os_df
+  )
+  
+  cox_adj_log2 <- coxph(
+    Surv(OS_months, Event) ~ log2_TFx + Subtype,
+    data = os_df
+  )
+  
+  adjusted_results <- bind_rows(
+    tidy_cox(cox_adj_per5, "Subtype-adjusted Cox: per 5% increase in median TFx"),
+    tidy_cox(cox_adj_log2, "Subtype-adjusted Cox: per doubling of median TFx")
+  )
+  
+  write_csv(
+    adjusted_results,
+    file.path(out_dir, "04_OS_continuous_Cox_subtype_adjusted_results.csv")
+  )
+  
+  cat("\nSubtype-adjusted Cox results:\n")
+  print(adjusted_results)
+  
+} else {
+  
+  cat("\nSubtype not available or has only one level. Skipping subtype-adjusted models.\n")
+  
+  adjusted_results <- tibble(
+    note = "Subtype-adjusted models not run because Subtype is missing or has only one level."
+  )
+  
+  write_csv(
+    adjusted_results,
+    file.path(out_dir, "04_OS_continuous_Cox_subtype_adjusted_results.csv")
+  )
+}
+
+
+############################################################
+# 9. Test proportional hazards assumption
+############################################################
+
+cat("\n============================================================\n")
+cat("Testing proportional hazards assumption\n")
+cat("============================================================\n")
+
+ph_per5 <- save_ph_test(
+  cox_per5,
+  "cox_per5_univariable",
+  out_dir
+)
+
+ph_log2 <- save_ph_test(
+  cox_log2,
+  "cox_log2_univariable",
+  out_dir
+)
+
+if (exists("cox_adj_per5")) {
+  ph_adj_per5 <- save_ph_test(
+    cox_adj_per5,
+    "cox_per5_subtype_adjusted",
+    out_dir
+  )
+}
+
+ph_all <- bind_rows(
+  ph_per5,
+  ph_log2,
+  if (exists("ph_adj_per5")) ph_adj_per5 else NULL
+)
+
+write_csv(
+  ph_all,
+  file.path(out_dir, "05_OS_continuous_Cox_PH_assumption_summary.csv")
+)
+
+print(ph_all)
+
+
+############################################################
+# 10. Nonlinearity check using spline Cox model
+############################################################
+
+cat("\n============================================================\n")
+cat("Running spline Cox model for nonlinearity check\n")
+cat("============================================================\n")
+
+# This checks whether the TFx-OS relationship is approximately linear
+# or whether there is a threshold-like relationship.
+cox_spline <- coxph(
+  Surv(OS_months, Event) ~ ns(median_TFx, df = 3),
+  data = os_df
+)
+
+spline_anova <- anova(cox_spline)
+
+write_csv(
+  as.data.frame(spline_anova) %>%
+    tibble::rownames_to_column("term"),
+  file.path(out_dir, "06_OS_spline_Cox_model_anova.csv")
+)
+
+writeLines(
+  capture.output(summary(cox_spline)),
+  file.path(out_dir, "06_OS_spline_Cox_model_summary.txt")
+)
+
+cat("\nSpline Cox model summary:\n")
+print(summary(cox_spline))
+
+
+############################################################
+# 11. Spline plot: predicted relative hazard across TFx
+############################################################
+
+cat("\n============================================================\n")
+cat("Creating spline relative hazard plot\n")
+cat("============================================================\n")
+
+# Use 1st to 99th percentile for stable plotting
+tfx_grid <- seq(
+  quantile(os_df$median_TFx, 0.01, na.rm = TRUE),
+  quantile(os_df$median_TFx, 0.99, na.rm = TRUE),
+  length.out = 200
+)
+
+newdat <- data.frame(
+  median_TFx = tfx_grid
+)
+
+pred <- predict(
+  cox_spline,
+  newdata = newdat,
+  type = "lp",
+  se.fit = TRUE
+)
+
+# Center relative hazard at the cohort median TFx
+ref_dat <- data.frame(
+  median_TFx = median(os_df$median_TFx, na.rm = TRUE)
+)
+
+ref_lp <- predict(
+  cox_spline,
+  newdata = ref_dat,
+  type = "lp"
+)
+
+spline_plot_df <- tibble(
+  median_TFx = tfx_grid,
+  log_relative_hazard = as.numeric(pred$fit - ref_lp),
+  se = as.numeric(pred$se.fit),
+  relative_hazard = exp(log_relative_hazard),
+  lower_95CI = exp(log_relative_hazard - 1.96 * se),
+  upper_95CI = exp(log_relative_hazard + 1.96 * se)
+)
+
+write_csv(
+  spline_plot_df,
+  file.path(out_dir, "07_OS_spline_predicted_relative_hazard.csv")
+)
+
+spline_plot <- ggplot(
+  spline_plot_df,
+  aes(x = median_TFx, y = relative_hazard)
+) +
+  geom_ribbon(
+    aes(ymin = lower_95CI, ymax = upper_95CI),
+    alpha = 0.25
+  ) +
+  geom_line(linewidth = 1) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  theme_classic(base_size = 13) +
+  labs(
+    title = "Continuous association between median TFx and overall survival",
+    subtitle = "Spline Cox model; relative hazard centered at cohort median TFx",
+    x = "Patient-level median TFx (%)",
+    y = "Relative hazard of death"
+  )
+
+ggsave(
+  filename = file.path(out_dir, "07_OS_spline_relative_hazard_plot.pdf"),
+  plot = spline_plot,
+  width = 7.5,
+  height = 5.5
+)
+
+ggsave(
+  filename = file.path(out_dir, "07_OS_spline_relative_hazard_plot.png"),
+  plot = spline_plot,
+  width = 7.5,
+  height = 5.5,
+  dpi = 300
+)
+
+
+############################################################
+# 12. Forest-style plot for continuous Cox models
+############################################################
+
+cat("\n============================================================\n")
+cat("Creating continuous Cox forest plot\n")
+cat("============================================================\n")
+
+forest_df <- continuous_results %>%
+  filter(term %in% c(
+    "TFx_per_1percent",
+    "TFx_per_5percent",
+    "TFx_per_10percent",
+    "log2_TFx"
+  )) %>%
+  mutate(
+    label = case_when(
+      term == "TFx_per_1percent" ~ "Per 1% increase in median TFx",
+      term == "TFx_per_5percent" ~ "Per 5% increase in median TFx",
+      term == "TFx_per_10percent" ~ "Per 10% increase in median TFx",
+      term == "log2_TFx" ~ "Per doubling of median TFx",
+      TRUE ~ term
+    ),
+    label = factor(label, levels = rev(label))
+  )
+
+forest_plot <- ggplot(
+  forest_df,
+  aes(x = HR, y = label)
+) +
+  geom_vline(xintercept = 1, linetype = "dashed") +
+  geom_errorbarh(
+    aes(xmin = lower_95CI, xmax = upper_95CI),
+    height = 0.2
+  ) +
+  geom_point(size = 3) +
+  scale_x_log10() +
+  theme_classic(base_size = 13) +
+  labs(
+    title = "Continuous median TFx association with overall survival",
+    x = "Hazard ratio for death, log scale",
+    y = ""
+  )
+
+ggsave(
+  filename = file.path(out_dir, "08_OS_continuous_Cox_forest_plot.pdf"),
+  plot = forest_plot,
+  width = 8,
+  height = 4.5
+)
+
+ggsave(
+  filename = file.path(out_dir, "08_OS_continuous_Cox_forest_plot.png"),
+  plot = forest_plot,
+  width = 8,
+  height = 4.5,
+  dpi = 300
+)
+
+
+############################################################
+# 13. Final reporting table
+############################################################
+
+cat("\n============================================================\n")
+cat("Creating final reporting table\n")
+cat("============================================================\n")
+
+# Pull the most useful reporting rows
+primary_per5 <- continuous_results %>%
+  filter(model == "Univariable Cox: per 5% increase in median TFx")
+
+primary_log2 <- continuous_results %>%
+  filter(model == "Univariable Cox: per doubling of median TFx")
+
+if (subtype_available) {
+  adjusted_per5 <- adjusted_results %>%
+    filter(
+      model == "Subtype-adjusted Cox: per 5% increase in median TFx",
+      term == "TFx_per_5percent"
+    )
+} else {
+  adjusted_per5 <- tibble()
+}
+
+final_reporting <- tibble(
+  analysis_name = "Continuous-variable Cox model for median TFx and OS",
+  input_file = input_file,
+  n_patients = nrow(os_df),
+  n_deaths = sum(os_df$Event == 1, na.rm = TRUE),
+  n_censored = sum(os_df$Event == 0, na.rm = TRUE),
+  tfx_filter = paste0("median_TFx >= ", TFX_MIN_FILTER, "%"),
+  primary_model = "Cox proportional hazards model using median_TFx as continuous variable",
+  primary_interpretation_unit = "Per 5% increase in median TFx",
+  univariable_per5_HR = primary_per5$HR,
+  univariable_per5_lower_95CI = primary_per5$lower_95CI,
+  univariable_per5_upper_95CI = primary_per5$upper_95CI,
+  univariable_per5_p_value = primary_per5$p_value,
+  univariable_log2_HR_per_doubling = primary_log2$HR,
+  univariable_log2_lower_95CI = primary_log2$lower_95CI,
+  univariable_log2_upper_95CI = primary_log2$upper_95CI,
+  univariable_log2_p_value = primary_log2$p_value,
+  subtype_adjusted_per5_HR = if (nrow(adjusted_per5) > 0) adjusted_per5$HR else NA_real_,
+  subtype_adjusted_per5_lower_95CI = if (nrow(adjusted_per5) > 0) adjusted_per5$lower_95CI else NA_real_,
+  subtype_adjusted_per5_upper_95CI = if (nrow(adjusted_per5) > 0) adjusted_per5$upper_95CI else NA_real_,
+  subtype_adjusted_per5_p_value = if (nrow(adjusted_per5) > 0) adjusted_per5$p_value else NA_real_
+)
+
+write_csv(
+  final_reporting,
+  file.path(out_dir, "09_OS_continuous_Cox_final_reporting_table.csv")
+)
+
+print(final_reporting)
+
+
+############################################################
+# 14. Suggested sentence for PPT/manuscript
+############################################################
+
+sentence <- paste0(
+  "In a continuous-variable Cox model, each 5% increase in patient-level median TFx ",
+  "was associated with a hazard ratio for death of ",
+  round(primary_per5$HR, 2),
+  " (95% CI, ",
+  round(primary_per5$lower_95CI, 2),
+  "–",
+  round(primary_per5$upper_95CI, 2),
+  "; p = ",
+  format_p(primary_per5$p_value),
+  ")."
+)
+
+writeLines(
+  sentence,
+  file.path(out_dir, "10_OS_continuous_Cox_suggested_sentence.txt")
+)
+
+cat("\nSuggested sentence:\n")
+cat(sentence, "\n")
+
+
+############################################################
+# 15. Save session info
+############################################################
+
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(out_dir, "11_OS_continuous_Cox_sessionInfo.txt")
+)
+
+
+############################################################
+# Done
+############################################################
+
+cat("\n============================================================\n")
+cat("Continuous-variable OS Cox analysis complete.\n")
+cat("Outputs saved to:\n")
+cat(out_dir, "\n")
+cat("============================================================\n")
+```
+
