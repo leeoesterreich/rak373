@@ -1,0 +1,293 @@
+---
+title: "OncodriveFML_Input"
+output: html_document
+date: "2026-07-15"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r}
+# ============================================================
+# Prepare standalone OncodriveFML input from pILC WES MAF
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(data.table)
+})
+
+# ------------------------------------------------------------
+# Paths
+# ------------------------------------------------------------
+
+base_dir <- paste0(
+  "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/",
+  "PCGR/Compare_TumorOnly_vs_WithPON"
+)
+
+maf_file <- file.path(
+  base_dir,
+  "maftools/Tier_1_common/Combined_MAF/",
+  "Tier_1_common_all_samples.combined.maf"
+)
+
+fml_dir <- file.path(base_dir, "OncodriveFML")
+input_dir <- file.path(fml_dir, "input")
+results_dir <- file.path(fml_dir, "results")
+logs_dir <- file.path(fml_dir, "logs")
+config_dir <- file.path(fml_dir, "config")
+
+dir.create(input_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(logs_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(config_dir, recursive = TRUE, showWarnings = FALSE)
+
+stopifnot(file.exists(maf_file))
+
+message("Input MAF: ", maf_file)
+message("OncodriveFML directory: ", fml_dir)
+
+# ------------------------------------------------------------
+# Read MAF
+# ------------------------------------------------------------
+
+maf <- fread(
+  maf_file,
+  sep = "\t",
+  header = TRUE,
+  skip = "Hugo_Symbol",
+  data.table = TRUE,
+  showProgress = TRUE
+)
+
+message("Total MAF rows: ", nrow(maf))
+
+# ------------------------------------------------------------
+# Check required columns
+# ------------------------------------------------------------
+
+required_cols <- c(
+  "Tumor_Sample_Barcode",
+  "Chromosome",
+  "Start_Position",
+  "Reference_Allele",
+  "Tumor_Seq_Allele2",
+  "Variant_Classification"
+)
+
+missing_cols <- setdiff(required_cols, names(maf))
+
+if (length(missing_cols) > 0) {
+  stop(
+    "Missing required MAF columns: ",
+    paste(missing_cols, collapse = ", ")
+  )
+}
+
+# ------------------------------------------------------------
+# Keep coding variants
+# ------------------------------------------------------------
+# OncodriveFML will independently determine functional impact
+# using its score database. Silent variants may therefore be
+# retained because they contribute to the observed mutation set.
+
+coding_classes <- c(
+  "Silent",
+  "Missense_Mutation",
+  "Nonsense_Mutation",
+  "Nonstop_Mutation",
+  "Splice_Site",
+  "Splice_Region",
+  "Translation_Start_Site",
+  "Frame_Shift_Del",
+  "Frame_Shift_Ins",
+  "In_Frame_Del",
+  "In_Frame_Ins"
+)
+
+maf_coding <- maf[
+  Variant_Classification %in% coding_classes
+]
+
+message(
+  "Rows after coding classification filter: ",
+  nrow(maf_coding)
+)
+
+# ------------------------------------------------------------
+# Prepare OncodriveFML five-column input
+# ------------------------------------------------------------
+
+fml_input <- maf_coding[
+  ,
+  .(
+    CHROMOSOME = as.character(Chromosome),
+    POSITION   = as.integer(Start_Position),
+    REF        = toupper(as.character(Reference_Allele)),
+    ALT        = toupper(as.character(Tumor_Seq_Allele2)),
+    SAMPLE     = as.character(Tumor_Sample_Barcode)
+  )
+]
+
+# Remove chr prefix
+fml_input[
+  ,
+  CHROMOSOME := gsub(
+    "^chr",
+    "",
+    CHROMOSOME,
+    ignore.case = TRUE
+  )
+]
+
+# Standard chromosomes only
+fml_input <- fml_input[
+  CHROMOSOME %in% c(as.character(1:22), "X", "Y")
+]
+
+# Remove incomplete records
+fml_input <- fml_input[
+  !is.na(CHROMOSOME) &
+  !is.na(POSITION) &
+  !is.na(REF) &
+  !is.na(ALT) &
+  !is.na(SAMPLE) &
+  CHROMOSOME != "" &
+  POSITION > 0 &
+  REF != "" &
+  ALT != "" &
+  SAMPLE != "" &
+  REF != "." &
+  ALT != "."
+]
+
+# Remove REF == ALT
+fml_input <- fml_input[REF != ALT]
+
+# ------------------------------------------------------------
+# Convert MAF indel representation
+# ------------------------------------------------------------
+# OncodriveFML represents:
+# insertion: REF = "-", ALT = inserted sequence
+# deletion:  REF = deleted sequence, ALT = "-"
+
+fml_input[
+  REF %in% c("", "."),
+  REF := "-"
+]
+
+fml_input[
+  ALT %in% c("", "."),
+  ALT := "-"
+]
+
+# Remove unsupported symbolic alleles
+valid_allele <- function(x) {
+  grepl("^([ACGT]+|-)$", x)
+}
+
+fml_input <- fml_input[
+  valid_allele(REF) & valid_allele(ALT)
+]
+
+# Remove duplicated mutation records
+fml_input <- unique(fml_input)
+
+message("Final OncodriveFML input rows: ", nrow(fml_input))
+message("Number of samples: ", uniqueN(fml_input$SAMPLE))
+
+# ------------------------------------------------------------
+# Save input
+# ------------------------------------------------------------
+
+fml_input_file <- file.path(
+  input_dir,
+  "pILC_WES_oncodrivefml_input.tsv"
+)
+
+fwrite(
+  fml_input,
+  fml_input_file,
+  sep = "\t",
+  quote = FALSE,
+  na = "NA"
+)
+
+# Also create compressed input
+system2(
+  command = "gzip",
+  args = c(
+    "-kf",
+    shQuote(fml_input_file)
+  )
+)
+
+message("Saved OncodriveFML input:")
+message(fml_input_file)
+message(paste0(fml_input_file, ".gz"))
+
+# ------------------------------------------------------------
+# QC: mutation burden per sample
+# ------------------------------------------------------------
+
+qc_sample_burden <- fml_input[
+  ,
+  .N,
+  by = SAMPLE
+][order(-N)]
+
+setnames(qc_sample_burden, "N", "Mutation_count")
+
+fwrite(
+  qc_sample_burden,
+  file.path(
+    results_dir,
+    "QC_mutation_count_per_sample_used_for_OncodriveFML.tsv"
+  ),
+  sep = "\t"
+)
+
+# ------------------------------------------------------------
+# QC: mutation type
+# ------------------------------------------------------------
+
+fml_input[
+  ,
+  Mutation_type := fifelse(
+    nchar(REF) == 1 & nchar(ALT) == 1 &
+      REF != "-" & ALT != "-",
+    "SNV",
+    fifelse(
+      REF == "-",
+      "Insertion",
+      fifelse(
+        ALT == "-",
+        "Deletion",
+        "MNV_or_complex"
+      )
+    )
+  )
+]
+
+qc_mutation_type <- fml_input[
+  ,
+  .N,
+  by = Mutation_type
+][order(-N)]
+
+setnames(qc_mutation_type, "N", "Mutation_count")
+
+fwrite(
+  qc_mutation_type,
+  file.path(
+    results_dir,
+    "QC_variant_type_counts_used_for_OncodriveFML.tsv"
+  ),
+  sep = "\t"
+)
+
+print(qc_mutation_type)
+
+message("OncodriveFML input preparation completed.")
+```
+
