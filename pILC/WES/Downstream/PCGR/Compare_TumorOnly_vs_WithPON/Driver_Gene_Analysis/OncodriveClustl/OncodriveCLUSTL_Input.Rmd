@@ -1,0 +1,486 @@
+---
+title: "OncodriveCLUSTL Input Preparation"
+output: html_document
+date: "2026-07-16"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# ============================================================
+# Prepare standalone OncodriveCLUSTL input for pILC WES
+#
+# Inputs:
+#   1. Tier-1 common combined MAF
+#   2. Existing GRCh38 coding-region file used for OncodriveFML
+#
+# Outputs:
+#   1. SNV-only mutation TSV required by OncodriveCLUSTL
+#   2. Dedicated OncodriveCLUSTL coding-region TSV
+#   3. QC tables and an input-preparation manifest
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(data.table)
+})
+
+# ------------------------------------------------------------
+# Paths
+# ------------------------------------------------------------
+
+base_dir <- paste0(
+  "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/",
+  "PCGR/Compare_TumorOnly_vs_WithPON"
+)
+
+maf_file <- file.path(
+  base_dir,
+  "maftools/Tier_1_common/Combined_MAF/",
+  "Tier_1_common_all_samples.combined.maf"
+)
+
+# Reuse the validated GRCh38 CDS coordinates prepared for FML,
+# but write a separate CLUSTL-compatible copy with only the
+# required columns and a dedicated QC step.
+fml_regions_file <- paste0(
+  "/ix1/alee/LO_LAB/Personal/Rahul/tools/OncodriveFML/",
+  "resources/GRCh38/regions/cds.regions.gz"
+)
+
+clustl_dir <- file.path(base_dir, "OncodriveCLUSTL")
+input_dir <- file.path(clustl_dir, "input")
+reference_dir <- file.path(clustl_dir, "reference")
+results_dir <- file.path(clustl_dir, "results")
+logs_dir <- file.path(clustl_dir, "logs")
+
+for (d in c(input_dir, reference_dir, results_dir, logs_dir)) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+
+stopifnot(file.exists(maf_file))
+stopifnot(file.exists(fml_regions_file))
+
+message("Input MAF: ", maf_file)
+message("Source coding regions: ", fml_regions_file)
+message("OncodriveCLUSTL directory: ", clustl_dir)
+
+# ------------------------------------------------------------
+# Read MAF
+# ------------------------------------------------------------
+
+maf <- fread(
+  maf_file,
+  sep = "\t",
+  header = TRUE,
+  skip = "Hugo_Symbol",
+  data.table = TRUE,
+  showProgress = TRUE
+)
+
+message("Total MAF rows: ", nrow(maf))
+
+required_maf_cols <- c(
+  "Tumor_Sample_Barcode",
+  "Chromosome",
+  "Start_Position",
+  "Reference_Allele",
+  "Tumor_Seq_Allele2",
+  "Variant_Classification"
+)
+
+missing_maf_cols <- setdiff(required_maf_cols, names(maf))
+
+if (length(missing_maf_cols) > 0) {
+  stop(
+    "Missing required MAF columns: ",
+    paste(missing_maf_cols, collapse = ", ")
+  )
+}
+
+# ------------------------------------------------------------
+# Keep coding SNV classes
+# ------------------------------------------------------------
+#
+# OncodriveCLUSTL tests nucleotide-position clustering and accepts
+# substitutions only. Silent SNVs are retained because they are valid
+# observed substitutions and can contribute to clustering/background.
+# Indels, MNVs, and complex variants are excluded explicitly.
+# ------------------------------------------------------------
+
+coding_snv_classes <- c(
+  "Silent",
+  "Missense_Mutation",
+  "Nonsense_Mutation",
+  "Nonstop_Mutation",
+  "Splice_Site",
+  "Splice_Region",
+  "Translation_Start_Site"
+)
+
+maf_coding <- maf[
+  Variant_Classification %in% coding_snv_classes
+]
+
+message(
+  "Rows after coding-classification filter: ",
+  nrow(maf_coding)
+)
+
+clustl_input <- maf_coding[
+  ,
+  .(
+    CHROMOSOME = as.character(Chromosome),
+    POSITION   = as.integer(Start_Position),
+    REF        = toupper(as.character(Reference_Allele)),
+    ALT        = toupper(as.character(Tumor_Seq_Allele2)),
+    SAMPLE     = as.character(Tumor_Sample_Barcode)
+  )
+]
+
+clustl_input[
+  ,
+  CHROMOSOME := gsub(
+    "^chr",
+    "",
+    CHROMOSOME,
+    ignore.case = TRUE
+  )
+]
+
+standard_chromosomes <- c(as.character(1:22), "X", "Y")
+
+clustl_input <- clustl_input[
+  CHROMOSOME %in% standard_chromosomes &
+  !is.na(POSITION) &
+  POSITION > 0 &
+  !is.na(REF) &
+  !is.na(ALT) &
+  !is.na(SAMPLE) &
+  SAMPLE != ""
+]
+
+# Strict SNV definition: one A/C/G/T reference base and one
+# different A/C/G/T alternate base.
+clustl_input <- clustl_input[
+  grepl("^[ACGT]$", REF) &
+  grepl("^[ACGT]$", ALT) &
+  REF != ALT
+]
+
+# Remove duplicate records while retaining the same mutation when
+# it occurs in different samples.
+clustl_input <- unique(clustl_input)
+
+setorder(
+  clustl_input,
+  CHROMOSOME,
+  POSITION,
+  REF,
+  ALT,
+  SAMPLE
+)
+
+if (nrow(clustl_input) == 0) {
+  stop("No valid coding SNVs remained after filtering.")
+}
+
+message("Final OncodriveCLUSTL SNV rows: ", nrow(clustl_input))
+message("Number of samples: ", uniqueN(clustl_input$SAMPLE))
+
+# ------------------------------------------------------------
+# Save the SNV-only mutation input
+# ------------------------------------------------------------
+
+clustl_input_file <- file.path(
+  input_dir,
+  "pILC_WES_oncodriveclustl_SNV.tsv"
+)
+
+fwrite(
+  clustl_input,
+  clustl_input_file,
+  sep = "\t",
+  quote = FALSE,
+  na = "NA"
+)
+
+system2(
+  command = "gzip",
+  args = c("-kf", shQuote(clustl_input_file))
+)
+
+# ------------------------------------------------------------
+# Prepare the CLUSTL coding-region file
+# ------------------------------------------------------------
+#
+# OncodriveCLUSTL requires at least:
+#   CHROMOSOME, START, END, ELEMENT, SYMBOL
+# STRAND is optional but retained here.
+#
+# The coordinates are copied without coordinate conversion from
+# the existing validated GRCh38 CDS file. Multiple exon rows for
+# one SYMBOL + ELEMENT are retained and later analyzed with the
+# --concatenate option.
+# ------------------------------------------------------------
+
+regions_raw <- fread(
+  fml_regions_file,
+  sep = "\t",
+  header = TRUE,
+  data.table = TRUE,
+  showProgress = TRUE
+)
+
+required_region_cols <- c(
+  "CHROMOSOME",
+  "START",
+  "END",
+  "ELEMENT",
+  "SYMBOL"
+)
+
+missing_region_cols <- setdiff(required_region_cols, names(regions_raw))
+
+if (length(missing_region_cols) > 0) {
+  stop(
+    "Missing required coding-region columns: ",
+    paste(missing_region_cols, collapse = ", ")
+  )
+}
+
+if (!"STRAND" %in% names(regions_raw)) {
+  regions_raw[, STRAND := "+"]
+}
+
+clustl_regions <- regions_raw[
+  ,
+  .(
+    CHROMOSOME = as.character(CHROMOSOME),
+    START      = as.integer(START),
+    END        = as.integer(END),
+    ELEMENT    = as.character(ELEMENT),
+    SYMBOL     = as.character(SYMBOL),
+    STRAND     = as.character(STRAND)
+  )
+]
+
+clustl_regions[
+  ,
+  CHROMOSOME := gsub(
+    "^chr",
+    "",
+    CHROMOSOME,
+    ignore.case = TRUE
+  )
+]
+
+clustl_regions <- clustl_regions[
+  CHROMOSOME %in% standard_chromosomes &
+  !is.na(START) &
+  !is.na(END) &
+  START > 0 &
+  END > START &
+  !is.na(ELEMENT) &
+  ELEMENT != "" &
+  !is.na(SYMBOL) &
+  SYMBOL != "" &
+  STRAND %in% c("+", "-")
+]
+
+clustl_regions <- unique(clustl_regions)
+
+setorder(
+  clustl_regions,
+  CHROMOSOME,
+  SYMBOL,
+  ELEMENT,
+  START,
+  END
+)
+
+if (nrow(clustl_regions) == 0) {
+  stop("No valid GRCh38 coding regions remained after filtering.")
+}
+
+# ------------------------------------------------------------
+# Region consistency checks
+# ------------------------------------------------------------
+
+region_identity_qc <- clustl_regions[
+  ,
+  .(
+    N_chromosomes = uniqueN(CHROMOSOME),
+    N_strands = uniqueN(STRAND),
+    N_segments = .N
+  ),
+  by = .(SYMBOL, ELEMENT)
+]
+
+bad_identity <- region_identity_qc[
+  N_chromosomes != 1 | N_strands != 1
+]
+
+if (nrow(bad_identity) > 0) {
+  fwrite(
+    bad_identity,
+    file.path(results_dir, "QC_invalid_region_identity.tsv"),
+    sep = "\t"
+  )
+
+  stop(
+    "At least one SYMBOL + ELEMENT maps to multiple chromosomes or strands. ",
+    "See QC_invalid_region_identity.tsv"
+  )
+}
+
+# OncodriveCLUSTL requires segments belonging to the same genomic
+# element not to overlap. Adjacent segments are allowed.
+clustl_regions[
+  ,
+  PREVIOUS_MAX_END := shift(cummax(END)),
+  by = .(CHROMOSOME, SYMBOL, ELEMENT)
+]
+
+region_overlaps <- clustl_regions[
+  !is.na(PREVIOUS_MAX_END) & START <= PREVIOUS_MAX_END
+]
+
+if (nrow(region_overlaps) > 0) {
+  fwrite(
+    region_overlaps,
+    file.path(results_dir, "QC_overlapping_regions_within_element.tsv"),
+    sep = "\t"
+  )
+
+  stop(
+    "Overlapping coding segments were detected within at least one ",
+    "SYMBOL + ELEMENT. See QC_overlapping_regions_within_element.tsv"
+  )
+}
+
+clustl_regions[, PREVIOUS_MAX_END := NULL]
+
+clustl_regions_file <- file.path(
+  reference_dir,
+  "cds_hg38_oncodriveclustl.tsv"
+)
+
+fwrite(
+  clustl_regions,
+  clustl_regions_file,
+  sep = "\t",
+  quote = FALSE,
+  na = "NA"
+)
+
+system2(
+  command = "gzip",
+  args = c("-kf", shQuote(clustl_regions_file))
+)
+
+# ------------------------------------------------------------
+# QC tables
+# ------------------------------------------------------------
+
+qc_sample_burden <- clustl_input[
+  ,
+  .(SNV_count = .N),
+  by = SAMPLE
+][order(-SNV_count)]
+
+fwrite(
+  qc_sample_burden,
+  file.path(
+    results_dir,
+    "QC_SNV_count_per_sample_used_for_OncodriveCLUSTL.tsv"
+  ),
+  sep = "\t"
+)
+
+qc_variant_class <- maf_coding[
+  grepl("^[ACGT]$", toupper(as.character(Reference_Allele))) &
+  grepl("^[ACGT]$", toupper(as.character(Tumor_Seq_Allele2))) &
+  toupper(as.character(Reference_Allele)) !=
+    toupper(as.character(Tumor_Seq_Allele2)),
+  .(SNV_count = .N),
+  by = Variant_Classification
+][order(-SNV_count)]
+
+fwrite(
+  qc_variant_class,
+  file.path(
+    results_dir,
+    "QC_variant_class_counts_used_for_OncodriveCLUSTL.tsv"
+  ),
+  sep = "\t"
+)
+
+qc_regions <- clustl_regions[
+  ,
+  .(
+    Segment_count = .N,
+    Total_CDS_bp = sum(END - START + 1L)
+  ),
+  by = .(SYMBOL, ELEMENT)
+][order(-Segment_count)]
+
+fwrite(
+  qc_regions,
+  file.path(
+    results_dir,
+    "QC_coding_regions_used_for_OncodriveCLUSTL.tsv"
+  ),
+  sep = "\t"
+)
+
+# ------------------------------------------------------------
+# Manifest
+# ------------------------------------------------------------
+
+manifest_file <- file.path(
+  results_dir,
+  "OncodriveCLUSTL_input_preparation_manifest.txt"
+)
+
+writeLines(
+  c(
+    paste0("Preparation date: ", Sys.time()),
+    paste0("Input MAF: ", maf_file),
+    paste0("Source coding regions: ", fml_regions_file),
+    paste0("Mutation output: ", clustl_input_file, ".gz"),
+    paste0("Region output: ", clustl_regions_file, ".gz"),
+    paste0("Final coding SNVs: ", nrow(clustl_input)),
+    paste0("Samples: ", uniqueN(clustl_input$SAMPLE)),
+    paste0("Coding-region rows: ", nrow(clustl_regions)),
+    paste0(
+      "Unique SYMBOL + ELEMENT combinations: ",
+      uniqueN(clustl_regions[, paste(SYMBOL, ELEMENT, sep = "//")])
+    ),
+    "Genome build: GRCh38/hg38",
+    "Mutation types: SNVs only",
+    "Coordinate transformation: none",
+    "Planned CLUSTL mode: region_restricted + concatenate",
+    "Planned signature calculation: region_normalized"
+  ),
+  con = manifest_file
+)
+
+# ------------------------------------------------------------
+# Final validation
+# ------------------------------------------------------------
+
+stopifnot(file.exists(paste0(clustl_input_file, ".gz")))
+stopifnot(file.exists(paste0(clustl_regions_file, ".gz")))
+
+system2("gzip", c("-t", shQuote(paste0(clustl_input_file, ".gz"))))
+system2("gzip", c("-t", shQuote(paste0(clustl_regions_file, ".gz"))))
+
+message("OncodriveCLUSTL input preparation completed.")
+message("Mutation input: ", paste0(clustl_input_file, ".gz"))
+message("Region input: ", paste0(clustl_regions_file, ".gz"))
+
+print(qc_sample_burden)
+print(qc_variant_class)
+```
