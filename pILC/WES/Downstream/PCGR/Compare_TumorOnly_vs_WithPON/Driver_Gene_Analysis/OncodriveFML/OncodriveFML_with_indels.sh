@@ -298,6 +298,60 @@ fi
 
 printf '  %s\n' "${OUTPUT_FILES[@]}"
 
+# ------------------------------------------------------------
+# Filter significant genes: Q_VALUE < 0.05
+# ------------------------------------------------------------
+
+FML_RESULTS="$(
+    find "$RUN_OUTPUT" \
+        -maxdepth 2 \
+        -type f \
+        -name '*-oncodrivefml.tsv' \
+        -size +0c \
+        | head -n 1
+)"
+
+if [[ -z "$FML_RESULTS" ]]; then
+    echo "ERROR: OncodriveFML result TSV was not found."
+    exit 1
+fi
+
+SIGNIFICANT_GENES="${RUN_OUTPUT}/significant_genes_Q_VALUE_lt_0.05.tsv"
+
+awk -F'\t' '
+    BEGIN { OFS = "\t" }
+
+    NR == 1 {
+        for (i = 1; i <= NF; i++) {
+            if ($i == "Q_VALUE") {
+                q_col = i
+                break
+            }
+        }
+
+        if (!q_col) {
+            print "ERROR: Q_VALUE column not found." > "/dev/stderr"
+            exit 1
+        }
+
+        print
+        next
+    }
+
+    $q_col != "" &&
+    $q_col != "NA" &&
+    ($q_col + 0) < 0.05 {
+        print
+    }
+' "$FML_RESULTS" > "$SIGNIFICANT_GENES"
+
+SIGNIFICANT_GENE_COUNT="$(
+    awk 'END {print NR > 0 ? NR - 1 : 0}' "$SIGNIFICANT_GENES"
+)"
+
+echo "Significant genes (Q_VALUE < 0.05): $SIGNIFICANT_GENE_COUNT"
+echo "Filtered result: $SIGNIFICANT_GENES"
+
 ln -sfn "$RUN_OUTPUT" "${RESULTS_DIR}/latest_with_indels"
 
 echo

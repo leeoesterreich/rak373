@@ -229,8 +229,51 @@ for FILE in \
     fi
 done
 
+# ------------------------------------------------------------
+# Check native outputs
+# ------------------------------------------------------------
+
+for FILE in \
+    "${RUN_OUTPUT}/elements_results.txt" \
+    "${RUN_OUTPUT}/clusters_results.tsv" \
+    "${RUN_OUTPUT}/results.log"; do
+
+    if [[ ! -s "$FILE" ]]; then
+        echo "ERROR: Expected output is missing or empty:"
+        echo "  $FILE"
+        exit 1
+    fi
+done
+
+# ------------------------------------------------------------
+# Filter significant genes: Q_EMPIRICAL < 0.05
+# ------------------------------------------------------------
+
+ELEMENTS_RESULTS="${RUN_OUTPUT}/elements_results.txt"
+SIGNIFICANT_GENES="${RUN_OUTPUT}/significant_genes_Q_EMPIRICAL_lt_0.05.tsv"
+
+awk -F'\t' '
+    BEGIN {
+        OFS = "\t"
+    }
+
+    NR == 1 || ($13 != "" && $13 + 0 < 0.05)
+' "$ELEMENTS_RESULTS" > "$SIGNIFICANT_GENES"
+
+if [[ ! -s "$SIGNIFICANT_GENES" ]]; then
+    echo "ERROR: Significant-gene output is missing or empty:"
+    echo "  $SIGNIFICANT_GENES"
+    exit 1
+fi
+
+SIGNIFICANT_GENE_COUNT="$(
+    awk 'END {print NR - 1}' "$SIGNIFICANT_GENES"
+)"
+
 echo "============================================================"
 echo "OncodriveCLUSTL completed successfully."
 echo "Finished: $(date)"
 echo "Results: $RUN_OUTPUT"
+echo "Significant genes (Q_EMPIRICAL < 0.05): $SIGNIFICANT_GENE_COUNT"
+echo "Filtered result: $SIGNIFICANT_GENES"
 echo "============================================================"
