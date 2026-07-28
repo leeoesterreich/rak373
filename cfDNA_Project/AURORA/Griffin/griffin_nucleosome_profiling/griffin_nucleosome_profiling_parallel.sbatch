@@ -35,20 +35,23 @@ python --version
 snakemake --version
 
 snakemake \
-    --snakefile "${SNAKEFILE}" \
-    --configfile "${SAMPLES_CONFIG}" \
-    --configfile "${SITES_CONFIG}" \
-    --configfile "${MAIN_CONFIG}" \
-    --cluster-config "${CLUSTER_CONFIG}" \
-    --latency-wait 60 \
-    --keep-going \
-    --rerun-incomplete \
-    --jobs 40 \
-    --cluster \
-    "sbatch \
-        --mem={cluster.mem} \
-        --time={cluster.time} \
-        --cpus-per-task={cluster.ncpus} \
-        --ntasks={cluster.ntasks} \
-        --output={cluster.output} \
-        --job-name={cluster.JobName}"
+  --snakefile "${PROJECT_DIR}/griffin_nucleosome_profiling.snakefile" \
+  --directory "${PROJECT_DIR}" \
+  --configfile "${PROJECT_DIR}/config/samples.GC.yaml" \
+  --configfile "${PROJECT_DIR}/config/sites.yaml" \
+  --configfile "${PROJECT_DIR}/config/config.yaml" \
+  --cluster-config "${PROJECT_DIR}/config/cluster_slurm.yaml" \
+  --latency-wait 120 \
+  --keep-going \
+  --rerun-incomplete \
+  --jobs 10 \
+  --cluster \
+  "sbatch \
+    --partition={cluster.partition} \
+    --mem={cluster.mem} \
+    --time={cluster.time} \
+    --cpus-per-task={cluster.ncpus} \
+    --ntasks={cluster.ntasks} \
+    --output={cluster.output} \
+    --error={cluster.error} \
+    --job-name={cluster.JobName}"
