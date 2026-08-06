@@ -1,0 +1,1127 @@
+---
+title: "MEFISTO_Input"
+output: html_document
+date: "2026-08-06"
+---
+# ==============================================================================
+# Prepare AURORA longitudinal cfDNA inputs for MOFA2/MEFISTO
+# ==============================================================================
+# Inputs:
+#   1. Longitudinal gene-by-sample CNV state matrix
+#   2. Griffin_30TF_GC_corrected_summary_by_module.xlsx
+#   3. Metasheet_Analysis.with_Histology_Receptor_status.Earliest_Met_Diagnosis.xlsx
+#   4. AUP_ClinicalData_20260609.xlsx
+#
+# Primary output:
+#   MEFISTO_long_residualized_primary.tsv
+#       TFx/technical-adjusted Griffin features + tumor/fragmentation features +
+#       gene-level CNV states for the 29 biological TFs profiled by Griffin.
+#
+# Sensitivity outputs:
+#   MEFISTO_long_raw_Griffin_sensitivity.tsv
+#   MEFISTO_long_technical_adjusted_sensitivity.tsv
+#
+# CNV design:
+#   CNV states are encoded as HOMD=-2, HETD=-1, NEUT=0, GAIN=1, AMP=2,
+#   HLAMP=3. The CNV view is restricted a priori to the 29 biological TF genes
+#   used for Griffin nucleosome profiling. CTCF is excluded because it is used
+#   as a technical-control factor. Individual TF genes are retained as directly
+#   interpretable MEFISTO features; no genome-wide entropy ranking or CNV-pattern
+#   collapsing is performed. Genes with inadequate coverage or zero variation
+#   in the discovery cohort are reported and excluded from model input.
+# ==============================================================================
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r}
+suppressPackageStartupMessages({
+  library(data.table)
+  library(readxl)
+  library(lme4)
+})
+```
+
+
+```{r}
+# ------------------------------- Paths ----------------------------------------
+# Exact AURORA paths supplied by the user. Edit only if files move.
+CNV_FILE <- "/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/AURORA/CNVKit/All_case_CNV_extraction/All_representative_patients_longitudinal_gene_CNV_state_matrix.tsv"
+CLINICAL_FILE <- "/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/AURORA/Clinical_data/AUP_ClinicalData_20260609.xlsx"
+META_FILE <- "/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/AURORA/Clinical_data/Metasheet_Analysis.with_Histology_Receptor_status.Earliest_Met_Diagnosis.xlsx"
+GRIFFIN_FILE <- "/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/AURORA/Griffin/griffin_nucleosome_profiling/Griffin_30TF_GC_corrected_summary_by_module.xlsx"
+OUTDIR <- "/ix1/alee/LO_LAB/Personal/Rahul/cfDNA_project/AURORA/MEFISTO/Input"
+
+# Optional command-line override:
+# Rscript AURORA_prepare_MEFISTO_inputs_with_longitudinal_CNV.R \
+#   CNV.tsv GRIFFIN.xlsx META.xlsx CLINICAL.xlsx OUTDIR
+args <- commandArgs(trailingOnly = TRUE)
+if (length(args) >= 5L) {
+  CNV_FILE <- args[[1L]]
+  GRIFFIN_FILE <- args[[2L]]
+  META_FILE <- args[[3L]]
+  CLINICAL_FILE <- args[[4L]]
+  OUTDIR <- args[[5L]]
+}
+
+for (f in c(CNV_FILE, GRIFFIN_FILE, META_FILE, CLINICAL_FILE)) {
+  if (!file.exists(f)) stop("Input file not found: ", f)
+}
+dir.create(OUTDIR, recursive = TRUE, showWarnings = FALSE)
+
+# ----------------------------- Configuration ----------------------------------
+BIOLOGICAL_VIEWS <- c(
+  "Interferon",
+  "HLA_Regulation",
+  "Breast_Lineage",
+  "Bone_TGF_BMP",
+  "Osteoclast_Inflammation",
+  "General_Tumor"
+)
+TECHNICAL_VIEW <- "Technical_Control"
+
+# Mean_coverage is used as a technical covariate, not as a biological feature.
+TUMOR_FRAGMENTATION_FEATURES <- c(
+  "Tumor_Fraction",
+  "Ploidy",
+  "Subclone Fraction",
+  "Frac. Genome Subclonal",
+  "Frac. CNA Subclonal",
+  "Frac_Subnucleosomal_90_150",
+  "Frac_Mononucleosomal_151_250",
+  "Frac_Dinucleosomal_251_450",
+  "Frac_Trinucleosomal_451_650"
+)
+
+MIN_DRAWS_PER_PATIENT <- 3L
+MIN_COMPLETE_SAMPLES_FOR_RESIDUALIZATION <- 30L
+MIN_COMPLETE_PATIENTS_FOR_RESIDUALIZATION <- 10L
+
+# Griffin TFBS genes used as the biologically targeted CNV feature set.
+# CTCF is retained in Griffin residualization as a technical covariate, but its
+# CNV state is intentionally excluded from the biological MEFISTO CNV view.
+GRIFFIN_BIOLOGICAL_TFBS_GENES <- c(
+  "IRF1", "STAT1", "STAT2", "CREB1", "NFYA", "NFYC", "RFX1", "RFX5",
+  "ESR1", "FOXA1", "GATA3", "PGR", "GRHL2", "STAT3", "NFKB1", "TFAP2C",
+  "XBP1", "FOXM1", "FOXO3", "RUNX2", "SMAD1", "SMAD3", "SMAD4", "JUN",
+  "NFATC1", "SPI1", "RELA", "MYC", "TP53"
+)
+GRIFFIN_TECHNICAL_TFBS_GENES <- c("CTCF")
+GRIFFIN_TFBS_GENES <- c(
+  GRIFFIN_BIOLOGICAL_TFBS_GENES,
+  GRIFFIN_TECHNICAL_TFBS_GENES
+)
+CNV_TARGET_GENES <- GRIFFIN_BIOLOGICAL_TFBS_GENES
+
+if (anyDuplicated(GRIFFIN_TFBS_GENES) ||
+    length(intersect(GRIFFIN_BIOLOGICAL_TFBS_GENES,
+                     GRIFFIN_TECHNICAL_TFBS_GENES)) > 0L) {
+  stop("Biological and technical Griffin TFBS gene lists must be unique and non-overlapping.")
+}
+if (length(CNV_TARGET_GENES) != 29L) {
+  warning(
+    "The current CNV target list contains ", length(CNV_TARGET_GENES),
+    " genes rather than the original 29. This is allowed for future expansion."
+  )
+}
+
+# Targeted CNV QC. Do not apply the previous genome-wide altered-patient or
+# entropy ranking filters. A target gene is retained when it is sufficiently
+# observed, altered in at least one patient, and variable across blood draws.
+CNV_MIN_NONMISSING_FRACTION <- 0.80
+CNV_MIN_ALTERED_PATIENTS <- 1L
+
+CNV_STATE_MAP <- c(
+  HOMD = -2,
+  HETD = -1,
+  LOSS = -1,
+  DEL = -1,
+  NEUT = 0,
+  NEUTRAL = 0,
+  GAIN = 1,
+  AMP = 2,
+  HLAMP = 3
+)
+
+# ------------------------------- Helpers --------------------------------------
+normalize_sample <- function(x) {
+  x <- trimws(as.character(x))
+  x[is.na(x) | x %chin% c("", "NA", "NaN")] <- NA_character_
+  sub("^AUP-", "", x)
+}
+
+normalize_er <- function(x) {
+  z <- tolower(trimws(as.character(x)))
+  out <- rep("Unknown", length(z))
+  out[z %chin% c("positive", "pos", "+", "er+", "1")] <- "Positive"
+  out[z %chin% c("negative", "neg", "-", "er-", "0")] <- "Negative"
+  out
+}
+
+numeric_safe <- function(x) suppressWarnings(as.numeric(x))
+
+z_safe <- function(x) {
+  s <- sd(x, na.rm = TRUE)
+  if (!is.finite(s) || s == 0) return(rep(NA_real_, length(x)))
+  as.numeric((x - mean(x, na.rm = TRUE)) / s)
+}
+
+# Read a Griffin sheet with two header rows. Row 2 contains full feature names.
+read_griffin_sheet <- function(path, sheet) {
+  raw <- as.data.table(read_excel(path, sheet = sheet, col_names = FALSE))
+  if (nrow(raw) < 3L || ncol(raw) < 2L) stop("Unexpected Griffin sheet: ", sheet)
+
+  headers <- as.character(unlist(raw[2L, ], use.names = FALSE))
+  headers[1L] <- "sample"
+  if (anyNA(headers[-1L]) || any(headers[-1L] == "")) {
+    stop("Missing feature name in row 2 of Griffin sheet: ", sheet)
+  }
+  if (anyDuplicated(headers)) stop("Duplicated columns in Griffin sheet: ", sheet)
+
+  dt <- copy(raw[-c(1L, 2L)])
+  setnames(dt, headers)
+  dt[, sample := normalize_sample(sample)]
+  dt <- dt[!is.na(sample)]
+
+  feature_cols <- setdiff(names(dt), "sample")
+  dt[, (feature_cols) := lapply(.SD, numeric_safe), .SDcols = feature_cols]
+  if (anyDuplicated(dt$sample)) stop("Duplicated samples in Griffin sheet: ", sheet)
+  dt
+}
+
+# Read the longitudinal CNV matrix. The expected orientation is genes in rows
+# and blood-draw samples in columns. Non-sample annotation columns are ignored
+# later by matching column names to the molecular sample IDs.
+read_cnv_matrix <- function(path) {
+  x <- fread(path, check.names = FALSE, data.table = TRUE)
+  if (nrow(x) == 0L || ncol(x) < 2L) stop("CNV matrix is empty or malformed: ", path)
+
+  gene_candidates <- c("gene", "Gene", "GENE", "HUGO_SYMBOL", "Hugo_Symbol", "symbol")
+  gene_col <- intersect(gene_candidates, names(x))
+  gene_col <- if (length(gene_col)) gene_col[1L] else names(x)[1L]
+  setnames(x, gene_col, "gene")
+  x[, gene := trimws(as.character(gene))]
+
+  original_cols <- setdiff(names(x), "gene")
+  normalized_cols <- normalize_sample(original_cols)
+  valid <- !is.na(normalized_cols)
+  if (anyDuplicated(normalized_cols[valid])) {
+    dup <- unique(normalized_cols[valid][duplicated(normalized_cols[valid])])
+    stop("Duplicated CNV sample columns after normalization: ", paste(dup, collapse = ", "))
+  }
+  setnames(x, original_cols[valid], normalized_cols[valid])
+  x
+}
+
+prepare_cnv_tfbs_genes <- function(cnv, discovery, outdir) {
+  sample_cols <- intersect(discovery$sample, names(cnv))
+  missing_cnv <- setdiff(discovery$sample, sample_cols)
+
+  fwrite(
+    data.table(
+      sample = discovery$sample,
+      group = discovery$patient_id,
+      CNV_available = discovery$sample %chin% sample_cols
+    ),
+    file.path(outdir, "CNV_sample_matching_QC.tsv"),
+    sep = "\t"
+  )
+
+  if (length(missing_cnv)) {
+    fwrite(
+      data.table(sample = missing_cnv),
+      file.path(outdir, "WARNING_discovery_samples_missing_CNV.tsv"),
+      sep = "\t"
+    )
+  }
+
+  if (length(sample_cols) < 10L) {
+    stop("Too few discovery samples match the CNV matrix: ", length(sample_cols))
+  }
+
+  # Match target genes case-insensitively while retaining approved symbols.
+  cnv_work <- copy(cnv)
+  cnv_work[, gene := toupper(trimws(as.character(gene)))]
+  cnv_work <- cnv_work[
+    !(is.na(gene) | gene %chin% c("", "-", ".", "NA")),
+    c("gene", sample_cols),
+    with = FALSE
+  ]
+
+  target_rows <- cnv_work[gene %chin% CNV_TARGET_GENES]
+  target_presence <- data.table(
+    gene = CNV_TARGET_GENES,
+    requested_order = seq_along(CNV_TARGET_GENES)
+  )
+  target_counts <- target_rows[, .(n_rows_in_CNV_matrix = .N), by = gene]
+  target_presence <- merge(target_presence, target_counts, by = "gene", all.x = TRUE)
+  target_presence[is.na(n_rows_in_CNV_matrix), n_rows_in_CNV_matrix := 0L]
+  target_presence[, present_in_CNV_matrix := n_rows_in_CNV_matrix > 0L]
+  setorder(target_presence, requested_order)
+
+  missing_target_genes <- target_presence[present_in_CNV_matrix == FALSE, gene]
+  if (length(missing_target_genes)) {
+    fwrite(
+      data.table(gene = missing_target_genes),
+      file.path(outdir, "WARNING_requested_TFBS_genes_missing_CNV.tsv"),
+      sep = "\t"
+    )
+  }
+
+  if (nrow(target_rows) == 0L) {
+    stop("None of the requested Griffin biological TF genes were found in the CNV matrix.")
+  }
+
+  state_text <- as.matrix(target_rows[, ..sample_cols])
+  state_text[] <- trimws(toupper(state_text))
+  state_text[state_text %in% c("", "NA", "NAN", ".")] <- NA_character_
+
+  observed_states <- sort(unique(as.vector(state_text)))
+  observed_states <- observed_states[!is.na(observed_states) & observed_states != ""]
+
+  numeric_direct <- suppressWarnings(as.numeric(state_text))
+  numeric_fraction <- mean(!is.na(numeric_direct))
+  if (is.finite(numeric_fraction) && numeric_fraction > 0.95) {
+    state_mat_rows <- matrix(
+      numeric_direct,
+      nrow = nrow(state_text),
+      ncol = ncol(state_text)
+    )
+  } else {
+    unknown_states <- setdiff(observed_states, names(CNV_STATE_MAP))
+    if (length(unknown_states)) {
+      fwrite(
+        data.table(unrecognized_state = unknown_states),
+        file.path(outdir, "WARNING_unrecognized_CNV_states.tsv"),
+        sep = "\t"
+      )
+      stop(
+        "Unrecognized CNV state labels were found. Review ",
+        "WARNING_unrecognized_CNV_states.tsv before continuing."
+      )
+    }
+
+    mapped <- unname(CNV_STATE_MAP[state_text])
+    state_mat_rows <- matrix(
+      as.numeric(mapped),
+      nrow = nrow(state_text),
+      ncol = ncol(state_text)
+    )
+  }
+
+  rownames(state_mat_rows) <- target_rows$gene
+  colnames(state_mat_rows) <- sample_cols
+
+  # Duplicate target-gene rows are allowed only when they do not conflict.
+  # Non-conflicting duplicates are collapsed to one row using the available call.
+  gene_indices <- split(seq_len(nrow(state_mat_rows)), target_rows$gene)
+  duplicate_qc <- rbindlist(lapply(names(gene_indices), function(g) {
+    idx <- gene_indices[[g]]
+    conflicts <- if (length(idx) == 1L) {
+      0L
+    } else {
+      sum(vapply(seq_along(sample_cols), function(j) {
+        length(unique(na.omit(state_mat_rows[idx, j]))) > 1L
+      }, logical(1)))
+    }
+    data.table(
+      gene = g,
+      n_rows_in_CNV_matrix = length(idx),
+      n_conflicting_samples = conflicts
+    )
+  }))
+
+  fwrite(
+    duplicate_qc,
+    file.path(outdir, "CNV_TFBS_duplicate_row_QC.tsv"),
+    sep = "\t"
+  )
+
+  conflicting_genes <- duplicate_qc[n_conflicting_samples > 0L, gene]
+  if (length(conflicting_genes)) {
+    stop(
+      "Conflicting duplicate CNV rows were found for target genes: ",
+      paste(conflicting_genes, collapse = ", "),
+      ". Review CNV_TFBS_duplicate_row_QC.tsv."
+    )
+  }
+
+  collapse_one_gene <- function(idx) {
+    if (length(idx) == 1L) return(state_mat_rows[idx, ])
+    vapply(seq_along(sample_cols), function(j) {
+      values <- unique(na.omit(state_mat_rows[idx, j]))
+      if (length(values)) values[1L] else NA_real_
+    }, numeric(1))
+  }
+
+  state_mat <- do.call(
+    rbind,
+    lapply(CNV_TARGET_GENES[CNV_TARGET_GENES %chin% names(gene_indices)], function(g) {
+      collapse_one_gene(gene_indices[[g]])
+    })
+  )
+  rownames(state_mat) <- CNV_TARGET_GENES[CNV_TARGET_GENES %chin% names(gene_indices)]
+  colnames(state_mat) <- sample_cols
+
+  state_frequency <- as.data.table(table(
+    state = as.vector(state_mat),
+    useNA = "ifany"
+  ))
+  setnames(state_frequency, "N", "count")
+  fwrite(
+    state_frequency,
+    file.path(outdir, "CNV_TFBS_state_frequency.tsv"),
+    sep = "\t"
+  )
+
+  nonmissing_fraction <- rowMeans(!is.na(state_mat))
+  altered_sample_fraction <- rowMeans(state_mat != 0, na.rm = TRUE)
+  state_variance <- apply(state_mat, 1L, var, na.rm = TRUE)
+
+  sample_to_patient <- discovery$patient_id[match(sample_cols, discovery$sample)]
+  patient_indices <- split(seq_along(sample_cols), sample_to_patient)
+  altered_by_patient <- do.call(cbind, lapply(patient_indices, function(idx) {
+    rowSums(state_mat[, idx, drop = FALSE] != 0, na.rm = TRUE) > 0
+  }))
+  if (is.null(dim(altered_by_patient))) {
+    altered_by_patient <- matrix(
+      altered_by_patient,
+      nrow = nrow(state_mat),
+      dimnames = list(rownames(state_mat), names(patient_indices))
+    )
+  }
+
+  altered_patient_count <- rowSums(altered_by_patient)
+  altered_patient_fraction <- altered_patient_count / length(patient_indices)
+
+  selected_gene_qc <- data.table(
+    gene = rownames(state_mat),
+    feature = paste0("CNV_", rownames(state_mat)),
+    nonmissing_fraction = nonmissing_fraction,
+    altered_sample_fraction = altered_sample_fraction,
+    altered_patient_count = altered_patient_count,
+    altered_patient_fraction = altered_patient_fraction,
+    variance = state_variance
+  )
+
+  selected_gene_qc[, keep :=
+    nonmissing_fraction >= CNV_MIN_NONMISSING_FRACTION &
+    altered_patient_count >= CNV_MIN_ALTERED_PATIENTS &
+    is.finite(variance) & variance > 0
+  ]
+
+  selected_gene_qc[, exclusion_reason := fifelse(
+    keep,
+    "",
+    fifelse(
+      nonmissing_fraction < CNV_MIN_NONMISSING_FRACTION,
+      "nonmissing_fraction_below_threshold",
+      fifelse(
+        altered_patient_count < CNV_MIN_ALTERED_PATIENTS,
+        "not_altered_in_any_discovery_patient",
+        "zero_or_nonfinite_variance"
+      )
+    )
+  )]
+
+  gene_qc <- merge(
+    target_presence,
+    selected_gene_qc,
+    by = "gene",
+    all.x = TRUE
+  )
+  gene_qc[is.na(keep), `:=`(
+    feature = paste0("CNV_", gene),
+    keep = FALSE,
+    exclusion_reason = "absent_from_CNV_matrix"
+  )]
+  setorder(gene_qc, requested_order)
+
+  fwrite(
+    gene_qc,
+    file.path(outdir, "CNV_TFBS_gene_QC.tsv"),
+    sep = "\t"
+  )
+
+  excluded <- gene_qc[keep == FALSE]
+  if (nrow(excluded)) {
+    fwrite(
+      excluded,
+      file.path(outdir, "CNV_TFBS_genes_excluded_after_QC.tsv"),
+      sep = "\t"
+    )
+  }
+
+  keep_genes <- selected_gene_qc[keep == TRUE, gene]
+  if (!length(keep_genes)) {
+    stop(
+      "None of the requested TFBS CNV genes passed targeted QC. ",
+      "Review CNV_TFBS_gene_QC.tsv."
+    )
+  }
+
+  selected_mat <- state_mat[keep_genes, , drop = FALSE]
+  rownames(selected_mat) <- paste0("CNV_", keep_genes)
+
+  selected_mapping <- selected_gene_qc[
+    keep == TRUE,
+    .(
+      gene,
+      feature,
+      nonmissing_fraction,
+      altered_sample_fraction,
+      altered_patient_count,
+      altered_patient_fraction,
+      variance
+    )
+  ]
+  selected_mapping[, requested_order := match(gene, CNV_TARGET_GENES)]
+  setorder(selected_mapping, requested_order)
+  selected_mapping[, requested_order := NULL]
+
+  fwrite(
+    selected_mapping,
+    file.path(outdir, "CNV_selected_TFBS_gene_mapping.tsv"),
+    sep = "\t"
+  )
+
+  selected_wide <- as.data.table(selected_mat, keep.rownames = "feature")
+  fwrite(
+    selected_wide,
+    file.path(outdir, "CNV_selected_TFBS_gene_matrix.tsv"),
+    sep = "\t"
+  )
+
+  cnv_long <- as.data.table(as.table(selected_mat))
+  setnames(cnv_long, c("feature", "sample", "value"))
+  cnv_long[, `:=`(
+    feature = as.character(feature),
+    sample = as.character(sample),
+    value = as.numeric(value)
+  )]
+  cnv_long <- cnv_long[is.finite(value)]
+  cnv_long[, group := discovery$patient_id[match(sample, discovery$sample)]]
+  cnv_long[, view := "CNV_TFBS_Genes"]
+  setcolorder(cnv_long, c("sample", "group", "view", "feature", "value"))
+  setorder(cnv_long, group, sample, feature)
+
+  fwrite(
+    cnv_long,
+    file.path(outdir, "MEFISTO_long_CNV_TFBS_genes.tsv"),
+    sep = "\t"
+  )
+
+  list(
+    long = cnv_long,
+    available_samples = sample_cols,
+    missing_samples = missing_cnv,
+    n_requested_genes = length(CNV_TARGET_GENES),
+    n_found_genes = sum(target_presence$present_in_CNV_matrix),
+    n_selected_genes = length(keep_genes),
+    selected_genes = keep_genes
+  )
+}
+
+# Residualize one Griffin feature. We remove only fixed technical effects.
+# Patient random intercept is retained in the adjusted value, preserving stable
+# patient-level biological differences.
+residualize_one <- function(data, feature, include_tfx = TRUE) {
+  metric <- sub("^[^_]+_", "", feature)
+  ctcf_feature <- paste0("CTCF_", metric)
+
+  required <- c(feature, "Mean_coverage", ctcf_feature, "patient_id")
+  if (include_tfx) required <- c(required, "Tumor_Fraction")
+  missing_required <- setdiff(required, names(data))
+  if (length(missing_required)) {
+    return(list(
+      adjusted = rep(NA_real_, nrow(data)),
+      diagnostic = data.table(
+        feature = feature,
+        CTCF_feature = ctcf_feature,
+        include_TFx = include_tfx,
+        n_complete = 0L,
+        n_patients = 0L,
+        method = "missing_columns",
+        singular = NA,
+        message = paste(missing_required, collapse = ";")
+      )
+    ))
+  }
+
+  tmp <- data.table(
+    row_id = seq_len(nrow(data)),
+    y = numeric_safe(data[[feature]]),
+    tfx = numeric_safe(data[["Tumor_Fraction"]]),
+    depth = numeric_safe(data[["Mean_coverage"]]),
+    ctcf = numeric_safe(data[[ctcf_feature]]),
+    patient = factor(data[["patient_id"]])
+  )
+
+  needed <- c("y", "depth", "ctcf", "patient")
+  if (include_tfx) needed <- c(needed, "tfx")
+  keep <- complete.cases(tmp[, ..needed])
+  work <- tmp[keep]
+
+  adjusted <- rep(NA_real_, nrow(data))
+  n_complete <- nrow(work)
+  n_patients <- uniqueN(work$patient)
+
+  if (n_complete < MIN_COMPLETE_SAMPLES_FOR_RESIDUALIZATION ||
+      n_patients < MIN_COMPLETE_PATIENTS_FOR_RESIDUALIZATION) {
+    return(list(
+      adjusted = adjusted,
+      diagnostic = data.table(
+        feature = feature,
+        CTCF_feature = ctcf_feature,
+        include_TFx = include_tfx,
+        n_complete = n_complete,
+        n_patients = n_patients,
+        method = "insufficient_data",
+        singular = NA,
+        message = ""
+      )
+    ))
+  }
+
+  work[, depth_z := z_safe(depth)]
+  work[, ctcf_z := z_safe(ctcf)]
+  if (include_tfx) work[, tfx_z := z_safe(tfx)]
+
+  predictor_cols <- c("depth_z", "ctcf_z")
+  if (include_tfx) predictor_cols <- c("tfx_z", predictor_cols)
+
+  if (any(!complete.cases(work[, ..predictor_cols]))) {
+    return(list(
+      adjusted = adjusted,
+      diagnostic = data.table(
+        feature = feature,
+        CTCF_feature = ctcf_feature,
+        include_TFx = include_tfx,
+        n_complete = n_complete,
+        n_patients = n_patients,
+        method = "zero_variance_covariate",
+        singular = NA,
+        message = ""
+      )
+    ))
+  }
+
+  fixed_rhs <- paste(predictor_cols, collapse = " + ")
+  mixed_formula <- as.formula(paste("y ~", fixed_rhs, "+ (1 | patient)"))
+
+  fit <- suppressWarnings(tryCatch(
+    lme4::lmer(
+      mixed_formula,
+      data = work,
+      REML = TRUE,
+      control = lme4::lmerControl(
+        optimizer = "bobyqa",
+        check.conv.singular = "ignore"
+      )
+    ),
+    error = function(e) e
+  ))
+
+  method <- "lmer"
+  singular <- NA
+  message_text <- ""
+
+  if (inherits(fit, "error")) {
+    # Safe fallback if a particular feature cannot support a mixed model.
+    lm_formula <- as.formula(paste("y ~", fixed_rhs))
+    fit_lm <- tryCatch(stats::lm(lm_formula, data = work), error = function(e) e)
+    if (inherits(fit_lm, "error")) {
+      return(list(
+        adjusted = adjusted,
+        diagnostic = data.table(
+          feature = feature,
+          CTCF_feature = ctcf_feature,
+          include_TFx = include_tfx,
+          n_complete = n_complete,
+          n_patients = n_patients,
+          method = "failed",
+          singular = NA,
+          message = paste(conditionMessage(fit), conditionMessage(fit_lm), sep = " | ")
+        )
+      ))
+    }
+    fixed_fitted <- stats::predict(fit_lm, newdata = work)
+    method <- "lm_fallback"
+    message_text <- conditionMessage(fit)
+  } else {
+    fixed_fitted <- stats::predict(
+      fit,
+      newdata = work,
+      re.form = NA,
+      allow.new.levels = TRUE
+    )
+    singular <- lme4::isSingular(fit, tol = 1e-4)
+    if (isTRUE(singular)) method <- "lmer_singular"
+  }
+
+  # Remove only fixed effects. Random patient deviations remain in the signal.
+  adjusted[work$row_id] <- work$y - as.numeric(fixed_fitted)
+
+  list(
+    adjusted = adjusted,
+    diagnostic = data.table(
+      feature = feature,
+      CTCF_feature = ctcf_feature,
+      include_TFx = include_tfx,
+      n_complete = n_complete,
+      n_patients = n_patients,
+      method = method,
+      singular = singular,
+      message = message_text
+    )
+  )
+}
+
+make_mefisto_long <- function(data, feature_map, griffin_mode, cnv_long = NULL) {
+  id_cols <- c("sample", "patient_id")
+
+  tumor <- melt(
+    data,
+    id.vars = id_cols,
+    measure.vars = intersect(TUMOR_FRAGMENTATION_FEATURES, names(data)),
+    variable.name = "feature",
+    value.name = "value",
+    variable.factor = FALSE,
+    na.rm = TRUE
+  )
+  tumor[, view := "Tumor_Fragmentation"]
+
+  if (griffin_mode == "raw") {
+    measure_cols <- feature_map$feature
+    griffin <- melt(
+      data,
+      id.vars = id_cols,
+      measure.vars = measure_cols,
+      variable.name = "feature",
+      value.name = "value",
+      variable.factor = FALSE,
+      na.rm = TRUE
+    )
+  } else {
+    suffix <- if (griffin_mode == "primary_tfx_adjusted") {
+      "__adj_TFx_depth_CTCF"
+    } else if (griffin_mode == "technical_adjusted") {
+      "__adj_depth_CTCF"
+    } else {
+      stop("Unknown Griffin mode: ", griffin_mode)
+    }
+
+    measure_cols <- paste0(feature_map$feature, suffix)
+    present <- measure_cols %chin% names(data)
+    measure_cols <- measure_cols[present]
+
+    griffin <- melt(
+      data,
+      id.vars = id_cols,
+      measure.vars = measure_cols,
+      variable.name = "adjusted_feature",
+      value.name = "value",
+      variable.factor = FALSE,
+      na.rm = TRUE
+    )
+    griffin[, feature := sub(paste0(suffix, "$"), "", adjusted_feature)]
+    griffin[, adjusted_feature := NULL]
+  }
+
+  griffin <- merge(griffin, feature_map, by = "feature", all.x = TRUE)
+  if (anyNA(griffin$view)) stop("Could not assign a Griffin view to some features.")
+
+  components <- list(
+    tumor[, .(sample, group = patient_id, view, feature, value)],
+    griffin[, .(sample, group = patient_id, view, feature, value)]
+  )
+  if (!is.null(cnv_long) && nrow(cnv_long)) {
+    components[[length(components) + 1L]] <- cnv_long[, .(sample, group, view, feature, value)]
+  }
+  out <- rbindlist(components, use.names = TRUE, fill = TRUE)
+
+  out[, `:=`(
+    sample = as.character(sample),
+    group = as.character(group),
+    view = as.character(view),
+    feature = as.character(feature),
+    value = numeric_safe(value)
+  )]
+
+  setorder(out, group, sample, view, feature)
+  if (anyDuplicated(out[, .(sample, group, view, feature)])) {
+    stop("Duplicated sample-group-view-feature rows in ", griffin_mode, " output.")
+  }
+  out
+}
+
+# ------------------------------ Load Griffin ----------------------------------
+message("Reading Griffin workbook...")
+all_sheets <- excel_sheets(GRIFFIN_FILE)
+missing_views <- setdiff(c(BIOLOGICAL_VIEWS, TECHNICAL_VIEW), all_sheets)
+if (length(missing_views)) stop("Missing Griffin sheets: ", paste(missing_views, collapse = ", "))
+
+griffin_list <- lapply(c(BIOLOGICAL_VIEWS, TECHNICAL_VIEW), function(v) {
+  x <- read_griffin_sheet(GRIFFIN_FILE, v)
+  setkey(x, sample)
+  x
+})
+names(griffin_list) <- c(BIOLOGICAL_VIEWS, TECHNICAL_VIEW)
+
+sample_sets <- lapply(griffin_list, function(x) x$sample)
+reference_samples <- sample_sets[[1L]]
+for (nm in names(sample_sets)[-1L]) {
+  if (!setequal(reference_samples, sample_sets[[nm]])) {
+    stop("Griffin sample set differs in sheet: ", nm)
+  }
+}
+
+griffin <- Reduce(function(x, y) merge(x, y, by = "sample", all = FALSE), griffin_list)
+if (anyDuplicated(griffin$sample)) stop("Duplicated Griffin sample IDs after merge.")
+
+feature_map <- rbindlist(lapply(BIOLOGICAL_VIEWS, function(v) {
+  data.table(feature = setdiff(names(griffin_list[[v]]), "sample"), view = v)
+}))
+if (anyDuplicated(feature_map$feature)) stop("A Griffin feature occurs in multiple biological views.")
+
+# ------------------------------- Load CNV --------------------------------------
+message("Reading longitudinal CNV state matrix...")
+cnv <- read_cnv_matrix(CNV_FILE)
+cnv_candidate_samples <- setdiff(names(cnv), "gene")
+
+# ------------------------- Load metasheet and clinical -------------------------
+message("Reading molecular metasheet...")
+meta <- as.data.table(read_excel(META_FILE, sheet = 1L))
+if (!"Collaborator_sample_id" %chin% names(meta)) stop("Collaborator_sample_id is absent from metasheet.")
+if (!"Patient_id" %chin% names(meta)) stop("Patient_id is absent from metasheet.")
+
+meta[, sample := normalize_sample(Collaborator_sample_id)]
+meta[, patient_id := as.character(Patient_id)]
+if (anyDuplicated(meta$sample)) stop("Duplicated sample IDs in molecular metasheet.")
+
+numeric_meta <- intersect(
+  c("Mean_coverage", TUMOR_FRAGMENTATION_FEATURES),
+  names(meta)
+)
+meta[, (numeric_meta) := lapply(.SD, numeric_safe), .SDcols = numeric_meta]
+
+message("Reading clinical event table...")
+clinical <- as.data.table(read_excel(CLINICAL_FILE, sheet = 1L))
+required_clinical <- c(
+  "patient_id", "Category", "Days_From_Primary_Diagnosis", "Barcode",
+  "ER_Status", "Tissue_Site", "EndTrt_Days_From_Primary_Diagnosis",
+  "Regimen", "Met_Therapy_Line"
+)
+missing_clinical <- setdiff(required_clinical, names(clinical))
+if (length(missing_clinical)) stop("Missing clinical columns: ", paste(missing_clinical, collapse = ", "))
+
+clinical[, patient_id := as.character(patient_id)]
+clinical[, day := numeric_safe(Days_From_Primary_Diagnosis)]
+clinical[, end_day := numeric_safe(EndTrt_Days_From_Primary_Diagnosis)]
+clinical[, sample := normalize_sample(Barcode)]
+clinical[, ER_norm := normalize_er(ER_Status)]
+
+# --------------------------- Derive patient ER --------------------------------
+message("Deriving primary and earliest known metastatic ER status...")
+patient_er <- clinical[, {
+  d <- .SD[order(day)]
+  primary <- d[Category == "First_Primary" & ER_norm %chin% c("Positive", "Negative")]
+  met_all <- d[Category == "Met_Diagnosis"]
+  met_known <- met_all[ER_norm %chin% c("Positive", "Negative")][order(day)]
+
+  primary_er <- if (nrow(primary)) primary$ER_norm[1L] else "Unknown"
+  primary_er_day <- if (nrow(primary)) primary$day[1L] else NA_real_
+  first_met_day <- if (nrow(met_all) && any(is.finite(met_all$day))) min(met_all$day, na.rm = TRUE) else NA_real_
+  earliest_met_er <- if (nrow(met_known)) met_known$ER_norm[1L] else "Unknown"
+  earliest_met_er_day <- if (nrow(met_known)) met_known$day[1L] else NA_real_
+  earliest_met_tissue <- if (nrow(met_known)) as.character(met_known$Tissue_Site[1L]) else NA_character_
+
+  sequence_text <- if (nrow(met_known)) {
+    paste(
+      paste0(
+        met_known$day, ":", met_known$ER_norm, ":",
+        fifelse(is.na(met_known$Tissue_Site), "", as.character(met_known$Tissue_Site))
+      ),
+      collapse = "; "
+    )
+  } else ""
+
+  list(
+    primary_er = primary_er,
+    primary_er_day = primary_er_day,
+    first_met_day = first_met_day,
+    earliest_met_er = earliest_met_er,
+    earliest_met_er_day = earliest_met_er_day,
+    earliest_met_tissue = earliest_met_tissue,
+    n_met_records = nrow(met_all),
+    n_known_met_er_records = nrow(met_known),
+    met_er_changed = uniqueN(met_known$ER_norm) > 1L,
+    met_er_sequence = sequence_text
+  )
+}, by = patient_id]
+
+fwrite(patient_er, file.path(OUTDIR, "Patient_ER_derivation.tsv"), sep = "\t")
+
+# --------------------------- Match blood draws --------------------------------
+blood <- clinical[
+  Category == "Blood_Draw" & !is.na(sample),
+  .(sample, patient_id, draw_day = day)
+]
+if (anyDuplicated(blood$sample)) {
+  duplicate_blood <- blood[duplicated(sample) | duplicated(sample, fromLast = TRUE)]
+  fwrite(duplicate_blood, file.path(OUTDIR, "ERROR_duplicate_Blood_Draw_barcodes.tsv"), sep = "\t")
+  stop("Duplicate clinical Blood_Draw barcodes detected; see ERROR file.")
+}
+
+# Sample overlap QC before the merge.
+known_sample_ids <- unique(c(meta$sample, griffin$sample, blood$sample))
+cnv_sample_ids <- intersect(cnv_candidate_samples, known_sample_ids)
+qc_sample_sets <- rbindlist(list(
+  data.table(source = "Metasheet", sample = meta$sample),
+  data.table(source = "Griffin", sample = griffin$sample),
+  data.table(source = "Clinical_Blood_Draw", sample = blood$sample),
+  data.table(source = "CNV", sample = cnv_sample_ids)
+))
+qc_sample_sets[, present := TRUE]
+qc_wide <- dcast(qc_sample_sets, sample ~ source, value.var = "present", fill = FALSE)
+fwrite(qc_wide, file.path(OUTDIR, "Sample_matching_QC.tsv"), sep = "\t")
+
+integrated <- merge(meta, griffin, by = "sample", all = FALSE)
+integrated <- merge(integrated, blood, by = c("sample", "patient_id"), all.x = TRUE)
+integrated <- merge(integrated, patient_er, by = "patient_id", all.x = TRUE)
+
+if (anyDuplicated(integrated$sample)) stop("Duplicated molecular sample IDs after integration.")
+unmatched_draws <- integrated[is.na(draw_day), .(sample, patient_id)]
+if (nrow(unmatched_draws)) {
+  fwrite(unmatched_draws, file.path(OUTDIR, "ERROR_samples_without_Blood_Draw.tsv"), sep = "\t")
+  stop("Some molecular samples lack a matching Blood_Draw record; see ERROR file.")
+}
+
+setorder(integrated, patient_id, draw_day, sample)
+integrated[, draw_order := seq_len(.N), by = patient_id]
+integrated[, days_from_first_draw := draw_day - min(draw_day, na.rm = TRUE), by = patient_id]
+integrated[, days_from_first_met := draw_day - first_met_day]
+integrated[, days_from_earliest_known_met_er := draw_day - earliest_met_er_day]
+
+# Draw-specific ER, treatment, and progression annotations.
+message("Adding draw-specific clinical annotations...")
+clinical_by_patient <- split(clinical[order(patient_id, day)], by = "patient_id", keep.by = TRUE)
+
+draw_annotations <- rbindlist(lapply(seq_len(nrow(integrated)), function(i) {
+  pid <- integrated$patient_id[i]
+  draw_day <- integrated$draw_day[i]
+  d <- clinical_by_patient[[pid]]
+
+  met_known <- d[Category == "Met_Diagnosis" & ER_norm %chin% c("Positive", "Negative")][order(day)]
+  prior <- met_known[day <= draw_day]
+  closest_index <- if (nrow(met_known)) which.min(abs(met_known$day - draw_day)) else integer(0)
+
+  therapy_map <- c(
+    Met_Hormonal_Therapy = "Hormonal",
+    Met_Chemotherapy = "Chemotherapy",
+    Met_Targeted_Therapy = "Targeted"
+  )
+  active <- d[
+    Category %chin% names(therapy_map) &
+      is.finite(day) & day <= draw_day &
+      (is.na(end_day) | draw_day <= end_day)
+  ]
+  active_types <- if (nrow(active)) {
+    paste(sort(unique(unname(therapy_map[active$Category]))), collapse = ";")
+  } else "None documented"
+  active_regimens <- if (nrow(active) && any(!is.na(active$Regimen))) {
+    paste(sort(unique(as.character(na.omit(active$Regimen)))), collapse = "; ")
+  } else ""
+
+  progression_days <- sort(d[Category == "Progression_onTx" & is.finite(day), day])
+  future <- progression_days[progression_days > draw_day]
+  past <- progression_days[progression_days <= draw_day]
+
+  data.table(
+    sample = integrated$sample[i],
+    latest_prior_met_er = if (nrow(prior)) prior$ER_norm[nrow(prior)] else "Unknown",
+    latest_prior_met_er_day = if (nrow(prior)) prior$day[nrow(prior)] else NA_real_,
+    closest_met_er = if (length(closest_index)) met_known$ER_norm[closest_index] else "Unknown",
+    closest_met_er_day = if (length(closest_index)) met_known$day[closest_index] else NA_real_,
+    active_treatment_types = active_types,
+    active_regimens = active_regimens,
+    days_to_next_progression = if (length(future)) future[1L] - draw_day else NA_real_,
+    days_since_last_progression = if (length(past)) draw_day - tail(past, 1L) else NA_real_
+  )
+}))
+
+integrated <- merge(integrated, draw_annotations, by = "sample", all.x = TRUE)
+setorder(integrated, patient_id, draw_day, sample)
+
+# ----------------------- Residualize Griffin features --------------------------
+message("Residualizing Griffin features...")
+resid_diagnostics <- list()
+
+for (feature in feature_map$feature) {
+  primary_result <- residualize_one(integrated, feature, include_tfx = TRUE)
+  integrated[, (paste0(feature, "__adj_TFx_depth_CTCF")) := primary_result$adjusted]
+  resid_diagnostics[[length(resid_diagnostics) + 1L]] <- primary_result$diagnostic
+
+  technical_result <- residualize_one(integrated, feature, include_tfx = FALSE)
+  integrated[, (paste0(feature, "__adj_depth_CTCF")) := technical_result$adjusted]
+  resid_diagnostics[[length(resid_diagnostics) + 1L]] <- technical_result$diagnostic
+}
+
+resid_diagnostics <- rbindlist(resid_diagnostics, use.names = TRUE, fill = TRUE)
+fwrite(resid_diagnostics, file.path(OUTDIR, "Griffin_residualization_diagnostics.tsv"), sep = "\t")
+
+# ----------------------- Select longitudinal discovery set --------------------
+draw_counts <- integrated[, .N, by = patient_id]
+setnames(draw_counts, "N", "n_draws")
+fwrite(draw_counts[order(-n_draws, patient_id)], file.path(OUTDIR, "Patient_draw_counts.tsv"), sep = "\t")
+
+eligible_patients <- draw_counts[n_draws >= MIN_DRAWS_PER_PATIENT, patient_id]
+discovery <- integrated[patient_id %chin% eligible_patients]
+
+# MEFISTO requires a non-missing temporal covariate. Keep time-from-first-draw
+# for every eligible sample; report any missing time-from-metastatic-diagnosis.
+discovery[, time_years_from_first_draw := days_from_first_draw / 365.25]
+discovery[, time_years_from_first_met := days_from_first_met / 365.25]
+discovery[, time_years_from_earliest_known_met_er := days_from_earliest_known_met_er / 365.25]
+
+missing_met_time <- discovery[!is.finite(time_years_from_first_met), .(sample, patient_id)]
+if (nrow(missing_met_time)) {
+  fwrite(missing_met_time, file.path(OUTDIR, "Samples_missing_time_from_first_met.tsv"), sep = "\t")
+}
+
+# ---------------------- Prepare longitudinal CNV view -------------------------
+message("Preparing targeted CNV view for the 29 non-CTCF Griffin TF genes...")
+cnv_result <- prepare_cnv_tfbs_genes(cnv, discovery, OUTDIR)
+cnv_long <- cnv_result$long
+discovery[, cnv_available := sample %chin% cnv_result$available_samples]
+
+# ----------------------------- Metadata output --------------------------------
+metadata_cols <- c(
+  "sample", "patient_id", "draw_order", "draw_day",
+  "first_met_day", "days_from_first_draw", "days_from_first_met",
+  "time_years_from_first_draw", "time_years_from_first_met",
+  "time_years_from_earliest_known_met_er",
+  "primary_er", "primary_er_day",
+  "earliest_met_er", "earliest_met_er_day", "earliest_met_tissue",
+  "latest_prior_met_er", "latest_prior_met_er_day",
+  "closest_met_er", "closest_met_er_day",
+  "met_er_changed", "met_er_sequence",
+  "active_treatment_types", "active_regimens",
+  "days_to_next_progression", "days_since_last_progression",
+  "Mean_coverage", "Tumor_Fraction", "Ploidy",
+  "CTCF_mean_coverage", "CTCF_central_coverage", "CTCF_amplitude",
+  "cnv_available"
+)
+metadata_cols <- intersect(metadata_cols, names(discovery))
+metadata <- discovery[, ..metadata_cols]
+setnames(metadata, "patient_id", "group")
+setorder(metadata, group, draw_day, sample)
+
+fwrite(metadata, file.path(OUTDIR, "MEFISTO_sample_metadata.tsv"), sep = "\t")
+
+# ------------------------------ Long inputs -----------------------------------
+message("Creating MEFISTO long-format matrices...")
+primary_long <- make_mefisto_long(discovery, feature_map, "primary_tfx_adjusted", cnv_long)
+raw_long <- make_mefisto_long(discovery, feature_map, "raw", cnv_long)
+technical_long <- make_mefisto_long(discovery, feature_map, "technical_adjusted", cnv_long)
+
+fwrite(
+  primary_long,
+  file.path(OUTDIR, "MEFISTO_long_residualized_primary.tsv"),
+  sep = "\t"
+)
+fwrite(
+  raw_long,
+  file.path(OUTDIR, "MEFISTO_long_raw_Griffin_sensitivity.tsv"),
+  sep = "\t"
+)
+fwrite(
+  technical_long,
+  file.path(OUTDIR, "MEFISTO_long_technical_adjusted_sensitivity.tsv"),
+  sep = "\t"
+)
+
+# Save an audit table with clinical timing and unadjusted biological features.
+audit_cols <- unique(c(
+  metadata_cols,
+  TUMOR_FRAGMENTATION_FEATURES,
+  feature_map$feature,
+  paste0(feature_map$feature, "__adj_TFx_depth_CTCF"),
+  paste0(feature_map$feature, "__adj_depth_CTCF")
+))
+audit_cols <- intersect(audit_cols, names(discovery))
+fwrite(
+  discovery[, ..audit_cols],
+  file.path(OUTDIR, "Integrated_longitudinal_MEFISTO_audit_table.tsv"),
+  sep = "\t"
+)
+
+# ------------------------------- Final QC -------------------------------------
+view_feature_counts <- unique(primary_long[, .(view, feature)])[, .N, by = view]
+setnames(view_feature_counts, "N", "n_features")
+fwrite(view_feature_counts, file.path(OUTDIR, "MEFISTO_view_feature_counts.tsv"), sep = "\t")
+
+qc_summary <- data.table(
+  metric = c(
+    "Metasheet samples",
+    "Griffin samples",
+    "Clinical blood-draw samples",
+    "CNV samples matching known AURORA samples",
+    "Integrated molecular samples",
+    "Integrated patients",
+    paste0("Patients with >=", MIN_DRAWS_PER_PATIENT, " draws"),
+    paste0("Samples from patients with >=", MIN_DRAWS_PER_PATIENT, " draws"),
+    "Samples missing time from first metastatic diagnosis",
+    "Discovery samples with CNV",
+    "Requested non-CTCF Griffin TF genes for CNV",
+    "Requested TF genes found in CNV matrix",
+    "Requested TF genes retained after targeted QC",
+    "Primary long rows",
+    "Raw sensitivity long rows",
+    "Technical-adjusted sensitivity long rows"
+  ),
+  value = c(
+    uniqueN(meta$sample),
+    uniqueN(griffin$sample),
+    uniqueN(blood$sample),
+    uniqueN(cnv_sample_ids),
+    uniqueN(integrated$sample),
+    uniqueN(integrated$patient_id),
+    uniqueN(discovery$patient_id),
+    uniqueN(discovery$sample),
+    nrow(missing_met_time),
+    length(cnv_result$available_samples),
+    cnv_result$n_requested_genes,
+    cnv_result$n_found_genes,
+    cnv_result$n_selected_genes,
+    nrow(primary_long),
+    nrow(raw_long),
+    nrow(technical_long)
+  )
+)
+fwrite(qc_summary, file.path(OUTDIR, "Input_preparation_QC_summary.tsv"), sep = "\t")
+
+# Confirm every metadata sample appears in each long file.
+for (nm in c("primary_long", "raw_long", "technical_long")) {
+  x <- get(nm)
+  missing_samples <- setdiff(metadata$sample, unique(x$sample))
+  if (length(missing_samples)) {
+    fwrite(
+      data.table(sample = missing_samples),
+      file.path(OUTDIR, paste0("WARNING_samples_absent_from_", nm, ".tsv")),
+      sep = "\t"
+    )
+  }
+}
+
+sink(file.path(OUTDIR, "input_preparation_sessionInfo.txt"))
+print(sessionInfo())
+sink()
+
+message("\nInput preparation completed successfully.")
+message("Output directory: ", normalizePath(OUTDIR, mustWork = FALSE))
+message("Primary MEFISTO input: MEFISTO_long_residualized_primary.tsv")
+message("CNV mapping: CNV_selected_TFBS_gene_mapping.tsv")
+message("Metadata: MEFISTO_sample_metadata.tsv")
+message("Review Input_preparation_QC_summary.tsv before model training.")
+```
+
