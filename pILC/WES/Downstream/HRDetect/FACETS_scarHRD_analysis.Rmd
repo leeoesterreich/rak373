@@ -1,0 +1,219 @@
+---
+title: "WES-Based HRD Analysis Using FACETS and scarHRD"
+author: "Rahul Kumar"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+---
+
+## Objective
+
+Calculate WES-derived genomic scar measures-including HRD-LOH, telomeric allelic imbalance, large-scale state transitions and HRD-sum from FACETS allele-specific copy-number results.
+
+##  Collapsed thousands of gene-level rows into unique FACETS segments.
+# Kept autosomes 1-22.
+# Removed segments with missing total copy number.
+# Removed segments with missing minor-allele copy number.
+# Removed invalid segments.
+
+## Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+    library(copynumber)
+    library(sequenza)
+    library(scarHRD)
+})
+
+options(stringsAsFactors = FALSE)
+
+knitr::opts_chunk$set(
+    echo = TRUE,
+    message = TRUE,
+    warning = TRUE
+)
+```
+
+```{r}
+
+# Input and output directories
+facets_dir <- paste0(
+    "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/",
+    "Downstream/FACETS/Result"
+)
+
+output_dir <- paste0(
+    "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/",
+    "Downstream/HRDetect"
+)
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+output_file <- file.path(
+    output_dir,
+    "pILC_16samples_HRDresults.csv"
+)
+
+# Find FACETS files
+facets_files <- list.files(
+    facets_dir,
+    pattern = "\\.gene_level\\.txt$",
+    recursive = TRUE,
+    full.names = TRUE
+)
+
+cat("FACETS files found:", length(facets_files), "\n")
+
+if (length(facets_files) == 0) {
+    stop("No FACETS gene-level files found.")
+}
+
+all_results <- list()
+
+for (facets_file in facets_files) {
+
+    sample_id <- sub(
+        "\\.gene_level\\.txt$",
+        "",
+        basename(facets_file)
+    )
+
+    cat("Processing:", sample_id, "\n")
+
+    # Read FACETS gene-level file
+    gene <- read.delim(
+        facets_file,
+        stringsAsFactors = FALSE,
+        check.names = FALSE
+    )
+
+    # Collapse repeated genes to unique FACETS segments
+    segments <- unique(
+        gene[, c(
+            "chrom",
+            "seg",
+            "seg_start",
+            "seg_end",
+            "tcn",
+            "lcn"
+        )]
+    )
+
+    # Keep valid autosomal allele-specific segments
+    segments <- segments[
+        segments$chrom %in% 1:22 &
+        !is.na(segments$seg_start) &
+        !is.na(segments$seg_end) &
+        !is.na(segments$tcn) &
+        !is.na(segments$lcn) &
+        segments$tcn >= 0 &
+        segments$lcn >= 0 &
+        segments$lcn <= segments$tcn,
+    ]
+
+    if (nrow(segments) == 0) {
+        stop(sample_id, ": no valid FACETS segments.")
+    }
+
+    segments$segment_length <-
+        segments$seg_end - segments$seg_start + 1
+
+    # Estimate sample ploidy
+    ploidy_estimate <- weighted.mean(
+        segments$tcn,
+        segments$segment_length
+    )
+
+    # Prepare eight-column scarHRD input
+    minor_cn <- segments$lcn
+    major_cn <- segments$tcn - segments$lcn
+
+    scar_input <- data.frame(
+        SampleID = sample_id,
+        Chromosome = paste0("chr", segments$chrom),
+        Start_position = segments$seg_start,
+        End_position = segments$seg_end,
+        total_cn = segments$tcn,
+        A_cn = pmin(minor_cn, major_cn),
+        B_cn = pmax(minor_cn, major_cn),
+        ploidy = ploidy_estimate
+    )
+
+    # Sort segments
+    scar_input <- scar_input[
+        order(
+            as.integer(sub("chr", "", scar_input$Chromosome)),
+            scar_input$Start_position
+        ),
+    ]
+
+    # Temporary input file required by scarHRD
+    temp_input <- tempfile(
+        pattern = paste0(sample_id, "_"),
+        fileext = ".tsv"
+    )
+
+    write.table(
+        scar_input,
+        temp_input,
+        sep = "\t",
+        quote = FALSE,
+        row.names = FALSE
+    )
+
+    # Calculate HRD scores
+    score <- scarHRD::scar_score(
+        seg = temp_input,
+        reference = "grch38",
+        seqz = FALSE,
+        ploidy = ploidy_estimate
+    )
+
+    unlink(temp_input)
+
+    score_df <- as.data.frame(
+        score,
+        check.names = FALSE
+    )
+
+    score_df$sample <- sample_id
+    score_df$estimated_ploidy <- ploidy_estimate
+    score_df$segments_used <- nrow(scar_input)
+
+    score_df <- score_df[
+        , c(
+            "sample",
+            "HRD",
+            "Telomeric AI",
+            "LST",
+            "HRD-sum",
+            "estimated_ploidy",
+            "segments_used"
+        )
+    ]
+
+    all_results[[sample_id]] <- score_df
+}
+
+# Combine all samples
+combined_results <- do.call(
+    rbind,
+    all_results
+)
+
+rownames(combined_results) <- NULL
+
+# Save one combined CSV
+write.csv(
+    combined_results,
+    output_file,
+    row.names = FALSE,
+    quote = FALSE
+)
+
+cat("\nAnalysis completed.\n")
+cat("Samples analyzed:", nrow(combined_results), "\n")
+cat("Output saved:", output_file, "\n")
+cat("File exists:", file.exists(output_file), "\n")
+
+combined_results
+```
+
