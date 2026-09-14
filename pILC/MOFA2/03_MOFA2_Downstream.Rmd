@@ -1,0 +1,3530 @@
+---
+title: "03_MOFA2_Downstream"
+output: html_document
+date: "2026-05-13"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+USER_LIB <- "/ihome/alee/rak373/R/x86_64-pc-linux-gnu-library/4.6"
+.libPaths(c(USER_LIB, .libPaths()))
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+  library(MOFA2)
+})
+set.seed(42)
+```
+
+```{r paths}
+OUT_DIR <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/MOFA2/Updated"
+
+RDS_DIR <- file.path(OUT_DIR, "MOFA2_RDS")
+TABLE_DIR <- file.path(OUT_DIR, "MOFA2_Tables")
+MODEL_DIR <- file.path(OUT_DIR, "MOFA2_Model")
+PLOT_DIR <- file.path(OUT_DIR, "MOFA2_Plots")
+DOWNSTREAM_DIR <- file.path(OUT_DIR, "MOFA2_Downstream")
+
+dir.create(TABLE_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(PLOT_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(DOWNSTREAM_DIR, recursive = TRUE, showWarnings = FALSE)
+
+# Use the 6-factor model.
+candidate_model_files <- c(
+  file.path(MODEL_DIR, "MOFA2_updated_OncoKB_filtered_6factor_model.hdf5"),
+  file.path(MODEL_DIR, "MOFA2_updated_OncoKB_filtered_model.hdf5")
+)
+
+MODEL_HDF5 <- candidate_model_files[file.exists(candidate_model_files)][1]
+
+if (is.na(MODEL_HDF5) || length(MODEL_HDF5) == 0) {
+  stop(
+    "No trained MOFA2 HDF5 model found. Checked: ",
+    paste(candidate_model_files, collapse = "; ")
+  )
+}
+
+MODEL_HDF5
+```
+
+```{r load-trained-model}
+model <- load_model(MODEL_HDF5)
+
+model
+```
+```{r model-dimensions}
+model_dimensions <- get_dimensions(model)
+
+model_dimensions
+```
+```{r}
+# Create clean clinical metadata file for MOFA2 downstream analysis
+CLINICAL_FILE <- file.path(
+  OUT_DIR,
+  "ClinicalCorrelation.csv"
+)
+
+CLINICAL_CLEAN_FILE <- file.path(
+  OUT_DIR,
+  "ClinicalCorrelation_clean_for_MOFA2.csv"
+)
+
+clean_sample_id <- function(x) {
+  x <- as.character(x)
+  x <- basename(x)
+  x <- trimws(x)
+  x <- toupper(x)
+
+  x <- gsub("\\.", "-", x)
+
+  x <- sub("_T$", "", x)
+  x <- sub("-T$", "", x)
+  x <- sub("T$", "", x)
+
+  x <- sub("_N$", "", x)
+  x <- sub("-N$", "", x)
+  x <- sub("NL$", "", x)
+
+  x <- sub("^(TP[0-9]+)-0+([0-9]+)$", "\\1-\\2", x)
+
+  x
+}
+
+clean_text <- function(x) {
+  x <- trimws(as.character(x))
+  x[x %in% c("", "NA", "Na", "na", "N/A", "n/a")] <- NA_character_
+  x
+}
+
+parse_numeric_clinical <- function(x) {
+  x <- clean_text(x)
+
+  # Convert values like "<5" to 2.5 for plotting/association analyses.
+  x <- gsub("^<\\s*5$", "2.5", x)
+
+  suppressWarnings(as.numeric(x))
+}
+
+standardize_pos_neg <- function(x) {
+  x <- toupper(trimws(as.character(x)))
+
+  out <- rep(NA_character_, length(x))
+  out[grepl("^POS", x)] <- "Positive"
+  out[grepl("^NEG", x)] <- "Negative"
+
+  out
+}
+
+make_hr_status <- function(er, pr) {
+  out <- rep(NA_character_, length(er))
+
+  out[er == "Positive" | pr == "Positive"] <- "HR+"
+  out[er == "Negative" & pr == "Negative"] <- "HR-"
+
+  out
+}
+
+make_hr_her2_subtype <- function(hr, her2) {
+  out <- rep(NA_character_, length(hr))
+
+  out[hr == "HR+" & her2 == "Negative"] <- "HR+/HER2-"
+  out[hr == "HR+" & her2 == "Positive"] <- "HR+/HER2+"
+  out[hr == "HR-" & her2 == "Negative"] <- "Triple-negative"
+  out[hr == "HR-" & her2 == "Positive"] <- "HR-/HER2+"
+
+  out
+}
+
+pick_col <- function(dt, patterns, label) {
+  hits <- unique(unlist(lapply(patterns, function(p) {
+    grep(p, colnames(dt), value = TRUE)
+  })))
+
+  if (length(hits) == 0) {
+    stop("Could not find column for: ", label)
+  }
+
+  hits[1]
+}
+
+# ----------------------------
+# Load raw clinical file
+# ----------------------------
+
+clinical_raw <- fread(CLINICAL_FILE)
+
+# Clean column names for easier matching
+old_names <- colnames(clinical_raw)
+new_names <- make.names(trimws(old_names), unique = TRUE)
+setnames(clinical_raw, old_names, new_names)
+
+colnames(clinical_raw)
+
+# ----------------------------
+# Identify required columns
+# ----------------------------
+
+sample_col <- pick_col(
+  clinical_raw,
+  patterns = c("^Sample.name$"),
+  label = "Sample name"
+)
+
+age_col <- pick_col(
+  clinical_raw,
+  patterns = c("^Age.at.Diagnosis$"),
+  label = "Age at Diagnosis"
+)
+
+tumor_cell_col <- pick_col(
+  clinical_raw,
+  patterns = c("MirrorFFPE_overall_tumor_cellularity"),
+  label = "overall tumor cellularity"
+)
+
+pleo_cell_col <- pick_col(
+  clinical_raw,
+  patterns = c("MirrorFFPE_pleomorphic_invasive"),
+  label = "pleomorphic invasive component cellularity"
+)
+
+til_col <- pick_col(
+  clinical_raw,
+  patterns = c("MirrorFFPE_TILs"),
+  label = "TILs"
+)
+
+grade_col <- pick_col(
+  clinical_raw,
+  patterns = c("Grade.Differentiation"),
+  label = "Grade"
+)
+
+her2_col <- pick_col(
+  clinical_raw,
+  patterns = c("Her.2.Neu"),
+  label = "HER2"
+)
+
+er_col <- pick_col(
+  clinical_raw,
+  patterns = c("Tumor.Marker.*ER"),
+  label = "ER"
+)
+
+pr_col <- pick_col(
+  clinical_raw,
+  patterns = c("Tumor.Marker.*PR"),
+  label = "PR"
+)
+
+# ----------------------------
+# Generate clean clinical table
+# ----------------------------
+
+clinical_clean <- clinical_raw[
+  ,
+  .(
+    Sample = clean_sample_id(get(sample_col)),
+    Age_at_Diagnosis = parse_numeric_clinical(get(age_col)),
+    Tumor_cellularity = parse_numeric_clinical(get(tumor_cell_col)),
+    Pleomorphic_invasive_component_cellularity = parse_numeric_clinical(get(pleo_cell_col)),
+    TILs = parse_numeric_clinical(get(til_col)),
+    Grade = clean_text(get(grade_col)),
+    HER2_status = standardize_pos_neg(get(her2_col)),
+    ER_status = standardize_pos_neg(get(er_col)),
+    PR_status = standardize_pos_neg(get(pr_col))
+  )
+]
+
+clinical_clean[
+  ,
+  HR_status := make_hr_status(ER_status, PR_status)
+]
+
+clinical_clean[
+  ,
+  HR_HER2_subtype := make_hr_her2_subtype(HR_status, HER2_status)
+]
+
+# Remove duplicate sample rows if present
+clinical_clean <- unique(clinical_clean, by = "Sample")
+
+# Order by sample
+setorder(clinical_clean, Sample)
+
+clinical_clean
+
+# ----------------------------
+# Save clean file
+# ----------------------------
+
+fwrite(
+  clinical_clean,
+  CLINICAL_CLEAN_FILE
+)
+
+CLINICAL_CLEAN_FILE
+```
+```{r }
+# ------------------------------------------------------------
+# Add sample metadata to trained MOFA2 model
+# ------------------------------------------------------------
+
+CLINICAL_CLEAN_FILE <- file.path(
+  OUT_DIR,
+  "ClinicalCorrelation_clean_for_MOFA2.csv"
+)
+
+sample_view_file <- file.path(
+  TABLE_DIR,
+  "MOFA2_training_sample_view_presence.tsv"
+)
+
+if (!file.exists(CLINICAL_CLEAN_FILE)) {
+  stop("Clean clinical metadata file not found: ", CLINICAL_CLEAN_FILE)
+}
+
+if (!file.exists(sample_view_file)) {
+  stop("Sample-view metadata file not found: ", sample_view_file)
+}
+```
+
+```{r metadata-helper-functions}
+clean_sample_id <- function(x) {
+  x <- as.character(x)
+  x <- basename(x)
+  x <- trimws(x)
+  x <- toupper(x)
+
+  # Standardize RNA-style sample IDs
+  # TP03.117  -> TP03-117
+  # TP15.M509 -> TP15-M509
+  x <- gsub("\\.", "-", x)
+
+  # Remove tumor/normal suffixes
+  x <- sub("_T$", "", x)
+  x <- sub("-T$", "", x)
+  x <- sub("T$", "", x)
+
+  x <- sub("_N$", "", x)
+  x <- sub("-N$", "", x)
+  x <- sub("NL$", "", x)
+
+  # Normalize IDs such as TP09-09 -> TP09-9
+  x <- sub("^(TP[0-9]+)-0+([0-9]+)$", "\\1-\\2", x)
+
+  x
+}
+```
+
+```{r load-metadata-files}
+# ------------------------------------------------------------
+# Load model samples
+# ------------------------------------------------------------
+
+model_samples <- data.table(
+  sample = clean_sample_id(samples_names(model)[[1]])
+)
+
+# ------------------------------------------------------------
+# Load sample-view availability metadata
+# ------------------------------------------------------------
+
+sample_view_metadata <- fread(sample_view_file)
+
+sample_view_metadata[
+  ,
+  sample := clean_sample_id(sample)
+]
+
+sample_view_metadata[
+  ,
+  view_completeness := fifelse(
+    n_views_present == 4, "4 views",
+    fifelse(
+      n_views_present == 3, "3 views",
+      fifelse(
+        n_views_present == 2, "2 views",
+        fifelse(n_views_present == 1, "1 view", "Unknown")
+      )
+    )
+  )
+]
+
+# ------------------------------------------------------------
+# Load clean clinical metadata
+# ------------------------------------------------------------
+
+clinical_metadata <- fread(CLINICAL_CLEAN_FILE)
+
+clinical_metadata[
+  ,
+  sample := clean_sample_id(Sample)
+]
+
+clinical_metadata <- unique(clinical_metadata, by = "sample")
+```
+
+```{r merge-metadata}
+# ------------------------------------------------------------
+# Merge model samples with view metadata and clinical metadata
+# ------------------------------------------------------------
+
+sample_metadata <- merge(
+  model_samples,
+  sample_view_metadata,
+  by = "sample",
+  all.x = TRUE
+)
+
+sample_metadata <- merge(
+  sample_metadata,
+  clinical_metadata,
+  by = "sample",
+  all.x = TRUE
+)
+
+# Keep same sample order as model
+sample_metadata <- sample_metadata[
+  match(model_samples$sample, sample)
+]
+
+# Check for duplicated samples
+if (anyDuplicated(sample_metadata$sample) > 0) {
+  duplicated_samples <- sample_metadata[
+    duplicated(sample) | duplicated(sample, fromLast = TRUE),
+    sample
+  ]
+
+  stop(
+    "Duplicated samples found in metadata after merging: ",
+    paste(unique(duplicated_samples), collapse = ", ")
+  )
+}
+
+# Check for model samples missing clinical metadata
+missing_clinical <- sample_metadata[
+  is.na(Age_at_Diagnosis) &
+    is.na(Grade) &
+    is.na(HR_HER2_subtype),
+  sample
+]
+
+if (length(missing_clinical) > 0) {
+  message(
+    "Model samples without clinical metadata: ",
+    paste(missing_clinical, collapse = ", ")
+  )
+}
+
+sample_metadata
+```
+
+```{r add-metadata}
+# ------------------------------------------------------------
+# Add metadata to MOFA2 model
+# ------------------------------------------------------------
+
+samples_metadata(model) <- as.data.frame(sample_metadata)
+
+head(samples_metadata(model))
+
+# Save metadata table used in MOFA2 downstream analysis
+fwrite(
+  sample_metadata,
+  file.path(DOWNSTREAM_DIR, "MOFA2_sample_metadata_with_clinical_annotations.tsv"),
+  sep = "\t"
+)
+
+# Save model object with metadata attached
+saveRDS(
+  model,
+  file.path(RDS_DIR, "MOFA2_model_with_clinical_metadata.rds")
+)
+```
+
+```{r metadata-summary}
+# ------------------------------------------------------------
+# Metadata summary
+# ------------------------------------------------------------
+
+metadata_summary <- rbindlist(list(
+  data.table(
+    Metric = "Total model samples",
+    Value = nrow(sample_metadata)
+  ),
+  data.table(
+    Metric = "Samples with clinical metadata",
+    Value = sample_metadata[
+      !is.na(Age_at_Diagnosis) |
+        !is.na(Grade) |
+        !is.na(HR_HER2_subtype),
+      .N
+    ]
+  ),
+  data.table(
+    Metric = "Samples with HR/HER2 subtype",
+    Value = sample_metadata[!is.na(HR_HER2_subtype), .N]
+  ),
+  data.table(
+    Metric = "Samples with all 4 molecular views",
+    Value = sample_metadata[n_views_present == 4, .N]
+  ),
+  data.table(
+    Metric = "Samples with 3 molecular views",
+    Value = sample_metadata[n_views_present == 3, .N]
+  ),
+  data.table(
+    Metric = "Samples with 2 molecular views",
+    Value = sample_metadata[n_views_present == 2, .N]
+  ),
+  data.table(
+    Metric = "Samples with 1 molecular view",
+    Value = sample_metadata[n_views_present == 1, .N]
+  )
+))
+
+metadata_summary
+
+fwrite(
+  metadata_summary,
+  file.path(DOWNSTREAM_DIR, "MOFA2_metadata_summary.tsv"),
+  sep = "\t"
+)
+```
+# 6. Variance decomposition
+
+Variance decomposition identifies how much variance each MOFA2 factor explains in each molecular view. This helps determine which factors are biologically informative and which omics layers contribute most strongly to each factor.
+
+```{r variance-decomposition}
+# ------------------------------------------------------------
+# Calculate variance explained
+# ------------------------------------------------------------
+
+variance_explained <- get_variance_explained(model)
+
+names(variance_explained)
+
+variance_explained$r2_total
+variance_explained$r2_per_factor
+```
+
+```{r save-total-variance-explained}
+# ------------------------------------------------------------
+# Save total variance explained per view
+# ------------------------------------------------------------
+
+r2_total <- variance_explained$r2_total[[1]]
+
+# Convert 2D array/matrix safely to data.table
+r2_total_dt <- as.data.table(as.data.frame(r2_total), keep.rownames = "view")
+
+# Rename value column
+if (ncol(r2_total_dt) == 2) {
+  setnames(r2_total_dt, old = names(r2_total_dt)[2], new = "R2_total")
+}
+
+r2_total_dt
+
+fwrite(
+  r2_total_dt,
+  file.path(DOWNSTREAM_DIR, "MOFA2_total_variance_explained_by_view.tsv"),
+  sep = "\t"
+)
+```
+
+```{r save-variance-explained-per-factor}
+# ------------------------------------------------------------
+# Save variance explained by each factor in each view
+# ------------------------------------------------------------
+
+r2_per_factor <- variance_explained$r2_per_factor[[1]]
+
+r2_per_factor_dt <- as.data.table(
+  r2_per_factor,
+  keep.rownames = "factor"
+)
+
+r2_per_factor_dt
+
+fwrite(
+  r2_per_factor_dt,
+  file.path(DOWNSTREAM_DIR, "MOFA2_variance_explained_per_factor_per_view.tsv"),
+  sep = "\t"
+)
+```
+
+```{r reshape-variance-long}
+# ------------------------------------------------------------
+# Convert variance explained table to long format
+# ------------------------------------------------------------
+
+r2_per_factor_long <- melt(
+  r2_per_factor_dt,
+  id.vars = "factor",
+  variable.name = "view",
+  value.name = "R2"
+)
+
+r2_per_factor_long[
+  ,
+  factor := as.character(factor)
+]
+
+r2_per_factor_long[
+  ,
+  R2 := as.numeric(R2)
+]
+
+r2_per_factor_long <- r2_per_factor_long[
+  order(factor, -R2)
+]
+
+r2_per_factor_long
+
+fwrite(
+  r2_per_factor_long,
+  file.path(DOWNSTREAM_DIR, "MOFA2_variance_explained_per_factor_per_view_long.tsv"),
+  sep = "\t"
+)
+```
+
+```{r summarize-dominant-view-per-factor}
+# ------------------------------------------------------------
+# Identify dominant molecular view for each factor
+# ------------------------------------------------------------
+
+dominant_view_per_factor <- r2_per_factor_long[
+  ,
+  .SD[which.max(R2)],
+  by = factor
+]
+
+setnames(
+  dominant_view_per_factor,
+  old = c("view", "R2"),
+  new = c("dominant_view", "dominant_view_R2")
+)
+
+dominant_view_per_factor <- dominant_view_per_factor[
+  order(factor)
+]
+
+dominant_view_per_factor
+
+fwrite(
+  dominant_view_per_factor,
+  file.path(DOWNSTREAM_DIR, "MOFA2_dominant_view_per_factor.tsv"),
+  sep = "\t"
+)
+```
+
+```{r summarize-active-factors}
+# ------------------------------------------------------------
+# Summarize total variance explained across views for each factor
+# ------------------------------------------------------------
+
+factor_r2_summary <- r2_per_factor_long[
+  ,
+  .(
+    mean_R2_across_views = mean(R2, na.rm = TRUE),
+    max_R2_across_views = max(R2, na.rm = TRUE),
+    sum_R2_across_views = sum(R2, na.rm = TRUE),
+    n_views_with_R2_gt_1pct = sum(R2 > 1, na.rm = TRUE),
+    n_views_with_R2_gt_5pct = sum(R2 > 5, na.rm = TRUE)
+  ),
+  by = factor
+]
+
+factor_r2_summary <- factor_r2_summary[
+  order(-sum_R2_across_views)
+]
+
+factor_r2_summary
+
+fwrite(
+  factor_r2_summary,
+  file.path(DOWNSTREAM_DIR, "MOFA2_factor_variance_summary.tsv"),
+  sep = "\t"
+)
+```
+
+```{r plot-variance-explained-factor-by-view}
+# ------------------------------------------------------------
+# Plot variance explained by factor and view
+# ------------------------------------------------------------
+
+p_var_factor_view <- plot_variance_explained(
+  model,
+  x = "view",
+  y = "factor"
+)
+
+p_var_factor_view
+
+pdf(
+  file.path(DOWNSTREAM_DIR, "02_MOFA2_variance_explained_factor_by_view.pdf"),
+  width = 9,
+  height = 6
+)
+print(p_var_factor_view)
+dev.off()
+```
+
+```{r plot-total-variance-explained}
+# ------------------------------------------------------------
+# Plot total variance explained per view
+# ------------------------------------------------------------
+
+p_var_total <- plot_variance_explained(
+  model,
+  x = "view",
+  y = "factor",
+  plot_total = TRUE
+)
+
+# Depending on MOFA2 version, this may return either a ggplot object or a list.
+if (is.list(p_var_total)) {
+  p_total_to_save <- p_var_total[[2]]
+} else {
+  p_total_to_save <- p_var_total
+}
+
+p_total_to_save
+
+pdf(
+  file.path(DOWNSTREAM_DIR, "03_MOFA2_total_variance_explained_by_view.pdf"),
+  width = 8,
+  height = 5
+)
+print(p_total_to_save)
+dev.off()
+```
+
+```{r plot-custom-variance-heatmap}
+# ------------------------------------------------------------
+# Custom ggplot heatmap for variance explained
+# ------------------------------------------------------------
+
+p_var_heatmap <- ggplot(
+  r2_per_factor_long,
+  aes(x = view, y = factor, fill = R2)
+) +
+  geom_tile(color = "white") +
+  geom_text(
+    aes(label = round(R2, 1)),
+    size = 3
+  ) +
+  labs(
+    title = "MOFA2 variance explained by factor and molecular view",
+    x = "Molecular view",
+    y = "MOFA2 factor",
+    fill = "Variance explained (%)"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(hjust = 0.5)
+  )
+
+p_var_heatmap
+
+ggsave(
+  filename = file.path(DOWNSTREAM_DIR, "04_MOFA2_variance_explained_heatmap_custom.pdf"),
+  plot = p_var_heatmap,
+  width = 9,
+  height = 5
+)
+```
+
+```{r metadata-distribution}
+# View completeness distribution
+sample_metadata[
+  ,
+  .N,
+  by = view_completeness
+][
+  order(view_completeness)
+]
+
+# HR/HER2 subtype distribution
+sample_metadata[
+  ,
+  .N,
+  by = HR_HER2_subtype
+][
+  order(HR_HER2_subtype)
+]
+
+# Grade distribution
+sample_metadata[
+  ,
+  .N,
+  by = Grade
+][
+  order(Grade)
+]
+
+```
+# 7. Visualisation of factors
+
+MOFA2 factors represent major axes of multi-omic variation across samples. In this section, factor scores are exported and visualized using sample metadata, including view completeness and clinical annotations.
+
+```{r export-factor-scores}
+# ------------------------------------------------------------
+# Extract and save MOFA2 factor scores
+# ------------------------------------------------------------
+
+factor_scores_dt <- as.data.table(
+  get_factors(
+    model,
+    factors = "all",
+    as.data.frame = TRUE
+  )
+)
+
+factor_scores_dt
+
+factor_scores_wide <- dcast(
+  factor_scores_dt,
+  sample + group ~ factor,
+  value.var = "value"
+)
+
+factor_scores_wide
+
+fwrite(
+  factor_scores_wide,
+  file.path(DOWNSTREAM_DIR, "MOFA2_factor_scores_wide.tsv"),
+  sep = "\t"
+)
+```
+
+```{r factor-visualisation-settings}
+# ------------------------------------------------------------
+# Define factors and metadata variables for visualization
+# ------------------------------------------------------------
+
+n_factors <- get_dimensions(model)$K
+
+factors_to_plot <- seq_len(n_factors)
+
+metadata_available <- colnames(samples_metadata(model))
+
+metadata_available
+
+categorical_metadata <- c(
+  "view_completeness",
+  "HR_HER2_subtype",
+  "Grade",
+  "HER2_status",
+  "ER_status",
+  "PR_status",
+  "HR_status"
+)
+
+categorical_metadata <- categorical_metadata[
+  categorical_metadata %in% metadata_available
+]
+
+continuous_metadata <- c(
+  "Age_at_Diagnosis",
+  "Tumor_cellularity",
+  "Pleomorphic_invasive_component_cellularity",
+  "TILs"
+)
+
+continuous_metadata <- continuous_metadata[
+  continuous_metadata %in% metadata_available
+]
+
+categorical_metadata
+continuous_metadata
+```
+
+## Visualize individual factors by sample-view completeness
+
+```{r plot-factors-by-view-completeness, fig.width=10, fig.height=7}
+if ("view_completeness" %in% metadata_available) {
+  
+  p_factor_view_completeness <- plot_factor(
+    model,
+    factors = factors_to_plot,
+    color_by = "view_completeness",
+    dot_size = 3,
+    dodge = TRUE,
+    add_violin = TRUE,
+    violin_alpha = 0.25
+  )
+  
+  p_factor_view_completeness
+  
+  ggsave(
+    filename = file.path(
+      DOWNSTREAM_DIR,
+      "05_MOFA2_factor_scores_by_view_completeness.pdf"
+    ),
+    plot = p_factor_view_completeness,
+    width = 10,
+    height = 7
+  )
+}
+```
+
+## Visualize individual factors by HR/HER2 subtype
+
+```{r plot-factors-by-hr-her2-subtype, fig.width=10, fig.height=7}
+if ("HR_HER2_subtype" %in% metadata_available) {
+  
+  p_factor_hr_her2 <- plot_factor(
+    model,
+    factors = factors_to_plot,
+    color_by = "HR_HER2_subtype",
+    dot_size = 3,
+    dodge = TRUE,
+    add_violin = TRUE,
+    violin_alpha = 0.25
+  )
+  
+  p_factor_hr_her2
+  
+  ggsave(
+    filename = file.path(
+      DOWNSTREAM_DIR,
+      "06_MOFA2_factor_scores_by_HR_HER2_subtype.pdf"
+    ),
+    plot = p_factor_hr_her2,
+    width = 10,
+    height = 7
+  )
+}
+```
+
+## Visualize individual factors by grade
+
+```{r plot-factors-by-grade, fig.width=10, fig.height=7}
+if ("Grade" %in% metadata_available) {
+  
+  p_factor_grade <- plot_factor(
+    model,
+    factors = factors_to_plot,
+    color_by = "Grade",
+    dot_size = 3,
+    dodge = TRUE,
+    add_violin = TRUE,
+    violin_alpha = 0.25
+  )
+  
+  p_factor_grade
+  
+  ggsave(
+    filename = file.path(
+      DOWNSTREAM_DIR,
+      "07_MOFA2_factor_scores_by_grade.pdf"
+    ),
+    plot = p_factor_grade,
+    width = 10,
+    height = 7
+  )
+}
+```
+
+## Visualize individual factors by continuous clinical variables
+
+```{r plot-factors-by-continuous-clinical-variables, fig.width=10, fig.height=7}
+for (cc in continuous_metadata) {
+  
+  p <- plot_factor(
+    model,
+    factors = factors_to_plot,
+    color_by = cc,
+    dot_size = 3,
+    dodge = FALSE
+  )
+  
+  print(p)
+  
+  ggsave(
+    filename = file.path(
+      DOWNSTREAM_DIR,
+      paste0(
+        "08_MOFA2_factor_scores_by_",
+        gsub("[^A-Za-z0-9]+", "_", cc),
+        ".pdf"
+      )
+    ),
+    plot = p,
+    width = 10,
+    height = 7
+  )
+}
+```
+
+## Visualize combinations of factors
+
+```{r plot-factor-combinations-by-hr-her2-subtype}
+if (n_factors >= 2 && "HR_HER2_subtype" %in% metadata_available) {
+  
+  p_factor_pairs_hr_her2 <- plot_factors(
+    model,
+    factors = seq_len(min(6, n_factors)),
+    color_by = "HR_HER2_subtype",
+    dot_size = 3
+  )
+  
+  p_factor_pairs_hr_her2
+  
+  ggsave(
+    filename = file.path(
+      DOWNSTREAM_DIR,
+      "09_MOFA2_factor_combinations_by_HR_HER2_subtype.pdf"
+    ),
+    plot = p_factor_pairs_hr_her2,
+    width = 8,
+    height = 7
+  )
+}
+```
+
+```{r plot-factor-combinations-by-grade, fig.width=8, fig.height=7}
+if (n_factors >= 2 && "Grade" %in% metadata_available) {
+  
+  p_factor_pairs_grade <- plot_factors(
+    model,
+    factors = seq_len(min(6, n_factors)),
+    color_by = "Grade",
+    dot_size = 3
+  )
+  
+  p_factor_pairs_grade
+  
+  ggsave(
+    filename = file.path(
+      DOWNSTREAM_DIR,
+      "10_MOFA2_factor_combinations_by_grade.pdf"
+    ),
+    plot = p_factor_pairs_grade,
+    width = 8,
+    height = 7
+  )
+}
+```
+
+```{r plot-factor-combinations-by-view-completeness}
+if (n_factors >= 2 && "view_completeness" %in% metadata_available) {
+  
+  p_factor_pairs_view <- plot_factors(
+    model,
+    factors = seq_len(min(4, n_factors)),
+    color_by = "view_completeness",
+    dot_size = 3
+  )
+  
+  p_factor_pairs_view
+  
+  ggsave(
+    filename = file.path(
+      DOWNSTREAM_DIR,
+      "11_MOFA2_factor_combinations_by_view_completeness.pdf"
+    ),
+    plot = p_factor_pairs_view,
+    width = 8,
+    height = 7
+  )
+}
+```
+
+## Save factor-score table with metadata
+
+```{r save-factor-scores-with-metadata}
+# ------------------------------------------------------------
+# Merge factor scores with sample metadata
+# ------------------------------------------------------------
+
+metadata_dt <- as.data.table(samples_metadata(model))
+
+factor_scores_metadata_dt <- merge(
+  factor_scores_dt,
+  metadata_dt,
+  by = c("sample", "group"),
+  all.x = TRUE
+)
+
+factor_scores_metadata_dt
+
+fwrite(
+  factor_scores_metadata_dt,
+  file.path(DOWNSTREAM_DIR, "MOFA2_factor_scores_long_with_metadata.tsv"),
+  sep = "\t"
+)
+
+factor_scores_wide_metadata_dt <- merge(
+  factor_scores_wide,
+  metadata_dt,
+  by = c("sample", "group"),
+  all.x = TRUE
+)
+
+factor_scores_wide_metadata_dt
+
+fwrite(
+  factor_scores_wide_metadata_dt,
+  file.path(DOWNSTREAM_DIR, "MOFA2_factor_scores_wide_with_metadata.tsv"),
+  sep = "\t"
+)
+```
+
+## Factor visualization summary
+
+```{r factor-visualization-summary}
+factor_visualization_summary <- data.table(
+  Metric = c(
+    "Number of MOFA2 factors",
+    "Categorical metadata variables used",
+    "Continuous metadata variables used",
+    "Factor score table",
+    "Factor score table with metadata"
+  ),
+  Value = c(
+    n_factors,
+    paste(categorical_metadata, collapse = "; "),
+    paste(continuous_metadata, collapse = "; "),
+    file.path(DOWNSTREAM_DIR, "MOFA2_factor_scores_wide.tsv"),
+    file.path(DOWNSTREAM_DIR, "MOFA2_factor_scores_wide_with_metadata.tsv")
+  )
+)
+
+factor_visualization_summary
+
+fwrite(
+  factor_visualization_summary,
+  file.path(DOWNSTREAM_DIR, "MOFA2_factor_visualization_summary.tsv"),
+  sep = "\t"
+)
+```
+# 8. Visualisation of feature weights
+
+Feature weights indicate which genes or genomic features contribute most strongly to each MOFA2 factor. Features with large absolute weights are the most strongly associated with a factor. Positive and negative weights represent opposite directions along the same factor axis.
+
+Because variance decomposition showed that Factors 1–4 are the main informative factors, this section focuses on Factors 1–4 while still exporting weights for all factors.
+
+```{r weight-visualisation-settings}
+# ------------------------------------------------------------
+# Define views and factors for weight visualization
+# ------------------------------------------------------------
+
+all_views <- views_names(model)
+n_factors <- get_dimensions(model)$K
+
+all_factors <- seq_len(n_factors)
+
+# Based on variance decomposition, focus interpretation on Factors 1-4
+FOCUS_FACTORS <- seq_len(min(4, n_factors))
+
+TOP_N_WEIGHTS <- 25
+
+all_views
+all_factors
+FOCUS_FACTORS
+```
+
+```{r extract-feature-weights}
+# ------------------------------------------------------------
+# Extract feature weights from MOFA2 model
+# ------------------------------------------------------------
+
+weights_dt <- as.data.table(
+  get_weights(
+    model,
+    views = "all",
+    factors = "all",
+    as.data.frame = TRUE
+  )
+)
+
+weights_dt[
+  ,
+  abs_weight := abs(value)
+]
+
+weights_dt <- weights_dt[
+  order(view, factor, -abs_weight)
+]
+
+weights_dt
+
+fwrite(
+  weights_dt,
+  file.path(DOWNSTREAM_DIR, "MOFA2_feature_weights_long.tsv"),
+  sep = "\t"
+)
+```
+```{r top-weighted-features-by-view-factor}
+# ------------------------------------------------------------
+# Top features by absolute weight for each view and factor
+# ------------------------------------------------------------
+
+top_weights_dt <- weights_dt[
+  ,
+  .SD[seq_len(min(.N, TOP_N_WEIGHTS))],
+  by = .(view, factor)
+]
+
+top_weights_dt
+
+fwrite(
+  top_weights_dt,
+  file.path(DOWNSTREAM_DIR, "MOFA2_top25_weighted_features_by_view_factor.tsv"),
+  sep = "\t"
+)
+```
+```{r top-positive-negative-weights}
+# ------------------------------------------------------------
+# Save top positive and top negative weights separately
+# ------------------------------------------------------------
+
+top_positive_weights_dt <- weights_dt[
+  value > 0,
+  .SD[order(-value)][seq_len(min(.N, TOP_N_WEIGHTS))],
+  by = .(view, factor)
+]
+
+top_negative_weights_dt <- weights_dt[
+  value < 0,
+  .SD[order(value)][seq_len(min(.N, TOP_N_WEIGHTS))],
+  by = .(view, factor)
+]
+
+top_positive_weights_dt[
+  ,
+  direction := "Positive"
+]
+
+top_negative_weights_dt[
+  ,
+  direction := "Negative"
+]
+
+top_directional_weights_dt <- rbindlist(
+  list(top_positive_weights_dt, top_negative_weights_dt),
+  use.names = TRUE,
+  fill = TRUE
+)
+
+top_directional_weights_dt <- top_directional_weights_dt[
+  order(view, factor, direction, -abs_weight)
+]
+
+top_directional_weights_dt
+
+fwrite(
+  top_directional_weights_dt,
+  file.path(DOWNSTREAM_DIR, "MOFA2_top25_positive_negative_weights_by_view_factor.tsv"),
+  sep = "\t"
+)
+```
+```{r plot-weight-distribution-focused-factors, fig.width=8, fig.height=6}
+# ------------------------------------------------------------
+# plot_weights shows the full weight distribution and highlights top features
+# ------------------------------------------------------------
+
+for (vv in all_views) {
+  for (ff in FOCUS_FACTORS) {
+    
+    p <- tryCatch(
+      {
+        plot_weights(
+          model,
+          view = vv,
+          factor = ff,
+          nfeatures = 10,
+          scale = TRUE,
+          abs = FALSE
+        )
+      },
+      error = function(e) {
+        message(
+          "Skipping plot_weights for view = ", vv,
+          ", factor = ", ff,
+          ". Error: ", e$message
+        )
+        NULL
+      }
+    )
+    
+    if (!is.null(p)) {
+      print(p)
+      
+      ggsave(
+        filename = file.path(
+          DOWNSTREAM_DIR,
+          paste0(
+            "12_MOFA2_weight_distribution_",
+            gsub("[^A-Za-z0-9]+", "_", vv),
+            "_Factor",
+            ff,
+            ".pdf"
+          )
+        ),
+        plot = p,
+        width = 8,
+        height = 6
+      )
+    }
+  }
+}
+```
+```{r plot-top-weights-focused-factors, fig.width=8, fig.height=6}
+# ------------------------------------------------------------
+# plot_top_weights shows top contributing features for each view/factor
+# ------------------------------------------------------------
+
+for (vv in all_views) {
+  for (ff in FOCUS_FACTORS) {
+    
+    p <- tryCatch(
+      {
+        plot_top_weights(
+          model,
+          view = vv,
+          factor = ff,
+          nfeatures = 15
+        )
+      },
+      error = function(e) {
+        message(
+          "Skipping plot_top_weights for view = ", vv,
+          ", factor = ", ff,
+          ". Error: ", e$message
+        )
+        NULL
+      }
+    )
+    
+    if (!is.null(p)) {
+      print(p)
+      
+      ggsave(
+        filename = file.path(
+          DOWNSTREAM_DIR,
+          paste0(
+            "13_MOFA2_top_weights_",
+            gsub("[^A-Za-z0-9]+", "_", vv),
+            "_Factor",
+            ff,
+            ".pdf"
+          )
+        ),
+        plot = p,
+        width = 8,
+        height = 6
+      )
+    }
+  }
+}
+```
+```{r focused-rna-cnv-top-weights}
+# ------------------------------------------------------------
+# Focused top weights for RNA and WES CNV, based on variance decomposition
+# ------------------------------------------------------------
+
+focused_views <- c(
+  "RNA_VST_top5000var",
+  "WES_CNV_numeric"
+)
+
+focused_views <- focused_views[
+  focused_views %in% unique(weights_dt$view)
+]
+
+focused_top_weights_dt <- weights_dt[
+  view %in% focused_views &
+    factor %in% paste0("Factor", FOCUS_FACTORS)
+]
+
+# In case factor names are stored as "Factor1", "Factor2", etc.
+if (nrow(focused_top_weights_dt) == 0) {
+  focused_top_weights_dt <- weights_dt[
+    view %in% focused_views &
+      factor %in% paste("Factor", FOCUS_FACTORS)
+  ]
+}
+
+focused_top_weights_dt <- focused_top_weights_dt[
+  ,
+  .SD[seq_len(min(.N, TOP_N_WEIGHTS))],
+  by = .(view, factor)
+]
+
+focused_top_weights_dt
+
+fwrite(
+  focused_top_weights_dt,
+  file.path(DOWNSTREAM_DIR, "MOFA2_focused_top25_RNA_CNV_weights_Factors1to4.tsv"),
+  sep = "\t"
+)
+```
+```{r mutation-view-top-weights}
+# ------------------------------------------------------------
+# Mutation-view top weights
+# These are expected to have lower contribution based on variance decomposition,
+# but are still exported for interpretation.
+# ------------------------------------------------------------
+
+mutation_views <- c(
+  "WES_mutation_recurrent",
+  "IMPACT_mutation_recurrent"
+)
+
+mutation_views <- mutation_views[
+  mutation_views %in% unique(weights_dt$view)
+]
+
+mutation_top_weights_dt <- weights_dt[
+  view %in% mutation_views
+]
+
+mutation_top_weights_dt <- mutation_top_weights_dt[
+  ,
+  .SD[seq_len(min(.N, TOP_N_WEIGHTS))],
+  by = .(view, factor)
+]
+
+mutation_top_weights_dt
+
+fwrite(
+  mutation_top_weights_dt,
+  file.path(DOWNSTREAM_DIR, "MOFA2_top25_mutation_view_weights_by_factor.tsv"),
+  sep = "\t"
+)
+```
+```{r weight-summary-table}
+# ------------------------------------------------------------
+# Summary of strongest factor-view associations by weights
+# ------------------------------------------------------------
+
+weight_summary_dt <- weights_dt[
+  ,
+  .(
+    n_features = .N,
+    max_abs_weight = max(abs_weight, na.rm = TRUE),
+    mean_abs_weight = mean(abs_weight, na.rm = TRUE),
+    median_abs_weight = median(abs_weight, na.rm = TRUE),
+    top_feature = feature[which.max(abs_weight)],
+    top_feature_weight = value[which.max(abs_weight)]
+  ),
+  by = .(view, factor)
+]
+
+weight_summary_dt <- weight_summary_dt[
+  order(view, factor)
+]
+
+weight_summary_dt
+
+fwrite(
+  weight_summary_dt,
+  file.path(DOWNSTREAM_DIR, "MOFA2_weight_summary_by_view_factor.tsv"),
+  sep = "\t"
+)
+```
+```{r interpretation-ready-top-features}
+# ------------------------------------------------------------
+# Table for biological interpretation, top features for Factors 1–4
+# ------------------------------------------------------------
+
+interpretation_top_features_dt <- top_directional_weights_dt[
+  factor %in% paste0("Factor", FOCUS_FACTORS) |
+    factor %in% paste("Factor", FOCUS_FACTORS)
+]
+
+interpretation_top_features_dt <- interpretation_top_features_dt[
+  ,
+  .(
+    view,
+    factor,
+    direction,
+    feature,
+    weight = value,
+    abs_weight
+  )
+]
+
+interpretation_top_features_dt <- interpretation_top_features_dt[
+  order(factor, view, direction, -abs_weight)
+]
+
+interpretation_top_features_dt
+
+fwrite(
+  interpretation_top_features_dt,
+  file.path(DOWNSTREAM_DIR, "MOFA2_interpretation_top_features_Factors1to4.tsv"),
+  sep = "\t"
+)
+```
+```{r weight-visualization-summary}
+weight_visualization_summary <- data.table(
+  Metric = c(
+    "Number of views",
+    "Views analyzed",
+    "Number of factors in model",
+    "Focused factors for interpretation",
+    "Top features per view-factor exported",
+    "Main weight table",
+    "Interpretation-ready top feature table"
+  ),
+  Value = c(
+    length(all_views),
+    paste(all_views, collapse = "; "),
+    n_factors,
+    paste(paste0("Factor", FOCUS_FACTORS), collapse = "; "),
+    TOP_N_WEIGHTS,
+    file.path(DOWNSTREAM_DIR, "MOFA2_feature_weights_long.tsv"),
+    file.path(DOWNSTREAM_DIR, "MOFA2_interpretation_top_features_Factors1to4.tsv")
+  )
+)
+
+weight_visualization_summary
+
+fwrite(
+  weight_visualization_summary,
+  file.path(DOWNSTREAM_DIR, "MOFA2_weight_visualization_summary.tsv"),
+  sep = "\t"
+)
+```
+# 9. Visualisation of covariation patterns
+
+This section visualizes how top-weighted features vary across samples in the original input data. Because variance decomposition showed that the strongest signal is mainly from RNA expression with additional WES CNV contribution, we focus primarily on `RNA_VST_top5000var` and `WES_CNV_numeric` for Factors 1–4.
+
+```{r plot-data-heatmaps-rna-cnv}
+# ------------------------------------------------------------
+# Heatmaps of top-weighted features for RNA and CNV views
+# ------------------------------------------------------------
+# Top features are selected by their weights in the selected factor.
+# Samples are ordered by their factor values unless cluster_cols = TRUE.
+all_views <- views_names(model)
+n_factors <- get_dimensions(model)$K
+
+# Focus on major informative factors
+FOCUS_FACTORS <- seq_len(min(4, n_factors))
+
+# Focus on RNA and CNV views based on variance decomposition
+COVARIATION_VIEWS <- c(
+  "RNA_VST_top5000var",
+  "WES_CNV_numeric"
+)
+
+# Keep only views that actually exist in the trained model
+COVARIATION_VIEWS <- COVARIATION_VIEWS[
+  COVARIATION_VIEWS %in% all_views
+]
+
+COVARIATION_VIEWS
+for (vv in COVARIATION_VIEWS) {
+  for (ff in FOCUS_FACTORS) {
+    
+    output_file <- file.path(
+      DOWNSTREAM_DIR,
+      paste0(
+        "14_MOFA2_data_heatmap_",
+        gsub("[^A-Za-z0-9]+", "_", vv),
+        "_Factor",
+        ff,
+        ".pdf"
+      )
+    )
+    
+    message("Generating heatmap: view = ", vv, ", factor = ", ff)
+    
+    p <- tryCatch(
+      {
+        plot_data_heatmap(
+          model,
+          view = vv,
+          factor = ff,
+          features = 20,
+          cluster_rows = TRUE,
+          cluster_cols = FALSE,
+          show_rownames = TRUE,
+          show_colnames = TRUE
+        )
+      },
+      error = function(e) {
+        message(
+          "Skipping heatmap for view = ", vv,
+          ", factor = ", ff,
+          ". Error: ", e$message
+        )
+        NULL
+      }
+    )
+    
+    if (!is.null(p)) {
+      print(p)
+      
+      pdf(
+        output_file,
+        width = 8,
+        height = 8
+      )
+      print(p)
+      dev.off()
+    }
+  }
+}
+```
+
+```{r plot-data-scatter-rna-cnv}
+# ------------------------------------------------------------
+# Scatter plots of top-weighted features against factor values
+# ------------------------------------------------------------
+# These plots help evaluate whether top features show a clear relationship
+# with the corresponding MOFA2 factor.
+
+scatter_color_by <- "HR_HER2_subtype"
+
+if (!scatter_color_by %in% colnames(samples_metadata(model))) {
+  scatter_color_by <- "view_completeness"
+}
+
+for (vv in COVARIATION_VIEWS) {
+  for (ff in FOCUS_FACTORS) {
+    
+    output_file <- file.path(
+      DOWNSTREAM_DIR,
+      paste0(
+        "15_MOFA2_data_scatter_",
+        gsub("[^A-Za-z0-9]+", "_", vv),
+        "_Factor",
+        ff,
+        "_colored_by_",
+        scatter_color_by,
+        ".pdf"
+      )
+    )
+    
+    message("Generating scatter plot: view = ", vv, ", factor = ", ff)
+    
+    p <- tryCatch(
+      {
+        plot_data_scatter(
+          model,
+          view = vv,
+          factor = ff,
+          features = 5,
+          add_lm = TRUE,
+          color_by = scatter_color_by
+        )
+      },
+      error = function(e) {
+        message(
+          "Skipping scatter plot for view = ", vv,
+          ", factor = ", ff,
+          ". Error: ", e$message
+        )
+        NULL
+      }
+    )
+    
+    if (!is.null(p)) {
+      print(p)
+      
+      ggsave(
+        filename = output_file,
+        plot = p,
+        width = 8,
+        height = 6
+      )
+    }
+  }
+}
+```
+
+```{r plot-data-scatter-by-grade}
+# ------------------------------------------------------------
+# scatter plots colored by histologic grade 
+# ------------------------------------------------------------
+
+if ("Grade" %in% colnames(samples_metadata(model))) {
+  
+  for (vv in COVARIATION_VIEWS) {
+    for (ff in FOCUS_FACTORS) {
+      
+      output_file <- file.path(
+        DOWNSTREAM_DIR,
+        paste0(
+          "16_MOFA2_data_scatter_",
+          gsub("[^A-Za-z0-9]+", "_", vv),
+          "_Factor",
+          ff,
+          "_colored_by_Grade.pdf"
+        )
+      )
+      
+      p <- tryCatch(
+        {
+          plot_data_scatter(
+            model,
+            view = vv,
+            factor = ff,
+            features = 5,
+            add_lm = TRUE,
+            color_by = "Grade"
+          )
+        },
+        error = function(e) {
+          message(
+            "Skipping grade-colored scatter plot for view = ", vv,
+            ", factor = ", ff,
+            ". Error: ", e$message
+          )
+          NULL
+        }
+      )
+      
+      if (!is.null(p)) {
+        print(p)
+        
+        ggsave(
+          filename = output_file,
+          plot = p,
+          width = 8,
+          height = 6
+        )
+      }
+    }
+  }
+}
+```
+
+```{r plot-data-heatmaps-mutation-views}
+# ------------------------------------------------------------
+# mutation-view heatmaps
+# ------------------------------------------------------------
+
+MUTATION_VIEWS <- c(
+  "WES_mutation_recurrent",
+  "IMPACT_mutation_recurrent"
+)
+
+MUTATION_VIEWS <- MUTATION_VIEWS[
+  MUTATION_VIEWS %in% all_views
+]
+
+for (vv in MUTATION_VIEWS) {
+  for (ff in FOCUS_FACTORS) {
+    
+    output_file <- file.path(
+      DOWNSTREAM_DIR,
+      paste0(
+        "17_MOFA2_mutation_data_heatmap_",
+        gsub("[^A-Za-z0-9]+", "_", vv),
+        "_Factor",
+        ff,
+        ".pdf"
+      )
+    )
+    
+    message("Generating mutation heatmap: view = ", vv, ", factor = ", ff)
+    
+    p <- tryCatch(
+      {
+        plot_data_heatmap(
+          model,
+          view = vv,
+          factor = ff,
+          features = 20,
+          cluster_rows = TRUE,
+          cluster_cols = FALSE,
+          show_rownames = TRUE,
+          show_colnames = TRUE
+        )
+      },
+      error = function(e) {
+        message(
+          "Skipping mutation heatmap for view = ", vv,
+          ", factor = ", ff,
+          ". Error: ", e$message
+        )
+        NULL
+      }
+    )
+    
+    if (!is.null(p)) {
+      print(p)
+      
+      pdf(
+        output_file,
+        width = 8,
+        height = 8
+      )
+      print(p)
+      dev.off()
+    }
+  }
+}
+```
+
+```{r covariation-summary}
+# ------------------------------------------------------------
+# Save summary of covariation plots generated
+# ------------------------------------------------------------
+
+covariation_summary <- data.table(
+  Metric = c(
+    "Focused factors",
+    "Primary covariation views",
+    "Mutation views exported optionally",
+    "Heatmap features per view-factor",
+    "Scatter features per view-factor",
+    "Scatter color variable"
+  ),
+  Value = c(
+    paste(paste0("Factor", FOCUS_FACTORS), collapse = "; "),
+    paste(COVARIATION_VIEWS, collapse = "; "),
+    paste(MUTATION_VIEWS, collapse = "; "),
+    20,
+    5,
+    scatter_color_by
+  )
+)
+
+covariation_summary
+
+fwrite(
+  covariation_summary,
+  file.path(DOWNSTREAM_DIR, "MOFA2_covariation_visualization_summary.tsv"),
+  sep = "\t"
+)
+```
+# Association between MOFA2 factors and clinical features
+
+This section tests associations between MOFA2 factor scores and clinical features, then generates a heatmap of p-values.
+
+```{r factor-clinical-association-setup}
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+})
+
+# Use factor scores already merged with metadata 
+factor_metadata_file <- file.path(
+  DOWNSTREAM_DIR,
+  "MOFA2_factor_scores_wide_with_metadata.tsv"
+)
+
+if (file.exists(factor_metadata_file)) {
+  factor_meta_dt <- fread(factor_metadata_file)
+} else {
+  factor_scores_dt <- as.data.table(
+    get_factors(
+      model,
+      factors = "all",
+      as.data.frame = TRUE
+    )
+  )
+  
+  factor_scores_wide <- dcast(
+    factor_scores_dt,
+    sample + group ~ factor,
+    value.var = "value"
+  )
+  
+  metadata_dt <- as.data.table(samples_metadata(model))
+  
+  factor_meta_dt <- merge(
+    factor_scores_wide,
+    metadata_dt,
+    by = c("sample", "group"),
+    all.x = TRUE
+  )
+}
+
+factor_cols <- grep("^Factor", colnames(factor_meta_dt), value = TRUE)
+
+clinical_continuous <- c(
+  "Age_at_Diagnosis",
+  "Tumor_cellularity",
+  "Pleomorphic_invasive_component_cellularity",
+  "TILs"
+)
+
+clinical_categorical <- c(
+  "Grade",
+  "HER2_status",
+  "ER_status",
+  "PR_status",
+  "HR_status",
+  "HR_HER2_subtype"
+)
+
+clinical_continuous <- clinical_continuous[
+  clinical_continuous %in% colnames(factor_meta_dt)
+]
+
+clinical_categorical <- clinical_categorical[
+  clinical_categorical %in% colnames(factor_meta_dt)
+]
+
+clinical_features <- c(clinical_continuous, clinical_categorical)
+
+factor_cols
+clinical_features
+```
+
+```{r factor-clinical-association-tests}
+# ------------------------------------------------------------
+# Helper function for one factor-clinical association test
+# ------------------------------------------------------------
+
+test_factor_clinical <- function(dt, factor_col, clinical_col, variable_type) {
+  
+  tmp <- dt[
+    ,
+    .(
+      factor_value = as.numeric(get(factor_col)),
+      clinical_value = get(clinical_col)
+    )
+  ]
+  
+  tmp <- tmp[
+    !is.na(factor_value) &
+      !is.na(clinical_value)
+  ]
+  
+  if (nrow(tmp) < 4) {
+    return(data.table(
+      factor = factor_col,
+      clinical_feature = clinical_col,
+      variable_type = variable_type,
+      test_used = NA_character_,
+      n_samples = nrow(tmp),
+      n_groups = NA_integer_,
+      estimate = NA_real_,
+      p_value = NA_real_
+    ))
+  }
+  
+  if (variable_type == "continuous") {
+    
+    tmp[
+      ,
+      clinical_value := suppressWarnings(as.numeric(clinical_value))
+    ]
+    
+    tmp <- tmp[
+      !is.na(clinical_value)
+    ]
+    
+    if (
+      nrow(tmp) < 4 ||
+      length(unique(tmp$clinical_value)) < 3 ||
+      length(unique(tmp$factor_value)) < 3
+    ) {
+      return(data.table(
+        factor = factor_col,
+        clinical_feature = clinical_col,
+        variable_type = variable_type,
+        test_used = "Spearman correlation",
+        n_samples = nrow(tmp),
+        n_groups = NA_integer_,
+        estimate = NA_real_,
+        p_value = NA_real_
+      ))
+    }
+    
+    ct <- suppressWarnings(
+      cor.test(
+        tmp$factor_value,
+        tmp$clinical_value,
+        method = "spearman",
+        exact = FALSE
+      )
+    )
+    
+    return(data.table(
+      factor = factor_col,
+      clinical_feature = clinical_col,
+      variable_type = variable_type,
+      test_used = "Spearman correlation",
+      n_samples = nrow(tmp),
+      n_groups = NA_integer_,
+      estimate = unname(ct$estimate),
+      p_value = ct$p.value
+    ))
+  }
+  
+  if (variable_type == "categorical") {
+    
+    tmp[
+      ,
+      clinical_value := as.factor(as.character(clinical_value))
+    ]
+    
+    tmp <- tmp[
+      !is.na(clinical_value)
+    ]
+    
+    n_groups <- length(unique(tmp$clinical_value))
+    
+    if (nrow(tmp) < 4 || n_groups < 2) {
+      return(data.table(
+        factor = factor_col,
+        clinical_feature = clinical_col,
+        variable_type = variable_type,
+        test_used = NA_character_,
+        n_samples = nrow(tmp),
+        n_groups = n_groups,
+        estimate = NA_real_,
+        p_value = NA_real_
+      ))
+    }
+    
+    if (n_groups == 2) {
+      
+      wt <- suppressWarnings(
+        wilcox.test(
+          factor_value ~ clinical_value,
+          data = tmp,
+          exact = FALSE
+        )
+      )
+      
+      group_medians <- tmp[
+        ,
+        .(median_factor = median(factor_value, na.rm = TRUE)),
+        by = clinical_value
+      ]
+      
+      estimate <- diff(group_medians$median_factor)
+      
+      return(data.table(
+        factor = factor_col,
+        clinical_feature = clinical_col,
+        variable_type = variable_type,
+        test_used = "Wilcoxon rank-sum",
+        n_samples = nrow(tmp),
+        n_groups = n_groups,
+        estimate = estimate,
+        p_value = wt$p.value
+      ))
+      
+    } else {
+      
+      kt <- suppressWarnings(
+        kruskal.test(
+          factor_value ~ clinical_value,
+          data = tmp
+        )
+      )
+      
+      return(data.table(
+        factor = factor_col,
+        clinical_feature = clinical_col,
+        variable_type = variable_type,
+        test_used = "Kruskal-Wallis",
+        n_samples = nrow(tmp),
+        n_groups = n_groups,
+        estimate = NA_real_,
+        p_value = kt$p.value
+      ))
+    }
+  }
+}
+```
+
+```{r run-factor-clinical-association-tests}
+# ------------------------------------------------------------
+# Run all factor-clinical association tests
+# ------------------------------------------------------------
+
+association_list <- list()
+
+for (ff in factor_cols) {
+  
+  for (cc in clinical_continuous) {
+    association_list[[length(association_list) + 1]] <- test_factor_clinical(
+      dt = factor_meta_dt,
+      factor_col = ff,
+      clinical_col = cc,
+      variable_type = "continuous"
+    )
+  }
+  
+  for (cc in clinical_categorical) {
+    association_list[[length(association_list) + 1]] <- test_factor_clinical(
+      dt = factor_meta_dt,
+      factor_col = ff,
+      clinical_col = cc,
+      variable_type = "categorical"
+    )
+  }
+}
+
+factor_clinical_assoc_dt <- rbindlist(association_list, fill = TRUE)
+
+factor_clinical_assoc_dt[
+  ,
+  FDR := p.adjust(p_value, method = "BH")
+]
+
+factor_clinical_assoc_dt[
+  ,
+  neg_log10_p := -log10(p_value)
+]
+
+factor_clinical_assoc_dt[
+  ,
+  p_label := fifelse(
+    is.na(p_value),
+    "NA",
+    fifelse(
+      p_value < 0.001,
+      "<0.001",
+      sprintf("%.3f", p_value)
+    )
+  )
+]
+
+factor_clinical_assoc_dt[
+  ,
+  FDR_label := fifelse(
+    is.na(FDR),
+    "NA",
+    fifelse(
+      FDR < 0.001,
+      "<0.001",
+      sprintf("%.3f", FDR)
+    )
+  )
+]
+
+factor_clinical_assoc_dt <- factor_clinical_assoc_dt[
+  order(factor, clinical_feature)
+]
+
+factor_clinical_assoc_dt
+
+fwrite(
+  factor_clinical_assoc_dt,
+  file.path(DOWNSTREAM_DIR, "MOFA2_factor_clinical_association_tests.tsv"),
+  sep = "\t"
+)
+```
+
+```{r create-pvalue-matrix}
+# ------------------------------------------------------------
+# Create factor x clinical feature p-value matrix
+# ------------------------------------------------------------
+
+pvalue_matrix_dt <- dcast(
+  factor_clinical_assoc_dt,
+  factor ~ clinical_feature,
+  value.var = "p_value"
+)
+
+pvalue_matrix_dt
+
+fwrite(
+  pvalue_matrix_dt,
+  file.path(DOWNSTREAM_DIR, "MOFA2_factor_clinical_pvalue_matrix.tsv"),
+  sep = "\t"
+)
+
+fdr_matrix_dt <- dcast(
+  factor_clinical_assoc_dt,
+  factor ~ clinical_feature,
+  value.var = "FDR"
+)
+
+fdr_matrix_dt
+
+fwrite(
+  fdr_matrix_dt,
+  file.path(DOWNSTREAM_DIR, "MOFA2_factor_clinical_FDR_matrix.tsv"),
+  sep = "\t"
+)
+```
+
+```{r plot-factor-clinical-pvalue-heatmap}
+# ------------------------------------------------------------
+# Heatmap of factor-clinical p-values
+# ------------------------------------------------------------
+
+plot_dt <- copy(factor_clinical_assoc_dt)
+
+plot_dt[
+  ,
+  clinical_feature := factor(
+    clinical_feature,
+    levels = clinical_features
+  )
+]
+
+plot_dt[
+  ,
+  factor := factor(
+    factor,
+    levels = factor_cols
+  )
+]
+
+p_factor_clinical_heatmap <- ggplot(
+  plot_dt,
+  aes(
+    x = clinical_feature,
+    y = factor,
+    fill = neg_log10_p
+  )
+) +
+  geom_tile(color = "white") +
+  geom_text(
+    aes(label = p_label),
+    size = 3
+  ) +
+  scale_fill_gradient(
+    low = "white",
+    high = "red",
+    na.value = "grey90"
+  ) +
+  labs(
+    title = "Association between MOFA2 factors and clinical features",
+    subtitle = "Cell labels show raw p-values; color intensity shows −log10(p-value)",
+    x = "Clinical feature",
+    y = "MOFA2 factor",
+    fill = "-log10(p-value)"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5)
+  )
+
+p_factor_clinical_heatmap
+
+ggsave(
+  filename = file.path(
+    DOWNSTREAM_DIR,
+    "MOFA2_factor_clinical_pvalue_heatmap.pdf"
+  ),
+  plot = p_factor_clinical_heatmap,
+  width = 10,
+  height = 6
+)
+```
+
+```{r plot-factor-clinical-fdr-heatmap}
+# ------------------------------------------------------------
+# heatmap using FDR labels
+# ------------------------------------------------------------
+
+plot_dt[
+  ,
+  neg_log10_FDR := -log10(FDR)
+]
+
+p_factor_clinical_fdr_heatmap <- ggplot(
+  plot_dt,
+  aes(
+    x = clinical_feature,
+    y = factor,
+    fill = neg_log10_FDR
+  )
+) +
+  geom_tile(color = "white") +
+  geom_text(
+    aes(label = FDR_label),
+    size = 3
+  ) +
+  scale_fill_gradient(
+    low = "white",
+    high = "red",
+    na.value = "grey90"
+  ) +
+  labs(
+    title = "Association between MOFA2 factors and clinical features",
+    subtitle = "Values shown are BH-adjusted FDR; color intensity shows −log10(p-value)",
+    x = "Clinical feature",
+    y = "MOFA2 factor",
+    fill = "-log10(FDR)"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    plot.title = element_text(hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5)
+  )
+
+p_factor_clinical_fdr_heatmap
+
+ggsave(
+  filename = file.path(
+    DOWNSTREAM_DIR,
+    "MOFA2_factor_clinical_FDR_heatmap.pdf"
+  ),
+  plot = p_factor_clinical_fdr_heatmap,
+  width = 10,
+  height = 6
+)
+```
+```{r}
+# ============================================================
+# Ranked GSEA using all RNA genes and signed MOFA2 weights.
+# Factor 1 and Factor 2 are analyzed separately.
+# ============================================================
+
+# -----------------------------
+# R library
+# -----------------------------
+USER_LIB <- "/ihome/alee/rak373/R/x86_64-pc-linux-gnu-library/4.6"
+.libPaths(c(USER_LIB, .libPaths()))
+
+required_packages <- c(
+  "data.table",
+  "ggplot2",
+  "fgsea",
+  "msigdbr",
+  "AnnotationDbi",
+  "org.Hs.eg.db"
+)
+
+missing_packages <- required_packages[
+  !vapply(
+    required_packages,
+    requireNamespace,
+    logical(1),
+    quietly = TRUE
+  )
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Missing packages: ",
+    paste(missing_packages, collapse = ", "),
+    "\nInstall them first, then rerun."
+  )
+}
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+  library(fgsea)
+  library(msigdbr)
+  library(AnnotationDbi)
+  library(org.Hs.eg.db)
+})
+
+set.seed(42)
+
+# -----------------------------
+# Paths and settings
+# -----------------------------
+OUT_DIR <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/MOFA2/Updated"
+
+DOWNSTREAM_DIR <- file.path(
+  OUT_DIR,
+  "MOFA2_Downstream"
+)
+
+GSEA_DIR <- file.path(
+  OUT_DIR,
+  "MOFA2_Pathway_GSEA_Factor1_Factor2"
+)
+
+dir.create(
+  GSEA_DIR,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+WEIGHTS_FILE <- file.path(
+  DOWNSTREAM_DIR,
+  "MOFA2_feature_weights_long.tsv"
+)
+
+RNA_VIEW <- "RNA_VST_top5000var"
+FACTORS_TO_TEST <- c("Factor1", "Factor2")
+
+MIN_PATHWAY_SIZE <- 10
+MAX_PATHWAY_SIZE <- 500
+FDR_CUTOFF <- 0.05
+TOP_PATHWAYS_PER_DIRECTION <- 8
+
+if (!file.exists(WEIGHTS_FILE)) {
+  stop("Cannot find file: ", WEIGHTS_FILE)
+}
+
+# -----------------------------
+# Read all RNA MOFA weights
+# -----------------------------
+weights_dt <- fread(WEIGHTS_FILE)
+
+required_columns <- c(
+  "view",
+  "factor",
+  "feature",
+  "value"
+)
+
+missing_columns <- setdiff(
+  required_columns,
+  colnames(weights_dt)
+)
+
+if (length(missing_columns) > 0) {
+  stop(
+    "Missing required columns: ",
+    paste(missing_columns, collapse = ", ")
+  )
+}
+
+rna_weights <- weights_dt[
+  view == RNA_VIEW &
+    factor %in% FACTORS_TO_TEST,
+  .(
+    factor = as.character(factor),
+    feature = as.character(feature),
+    weight = as.numeric(value)
+  )
+]
+
+rna_weights <- rna_weights[
+  is.finite(weight)
+]
+
+if (nrow(rna_weights) == 0) {
+  stop("No RNA weights found for Factor1 or Factor2.")
+}
+
+# -----------------------------
+# Map Ensembl IDs to gene symbols
+# -----------------------------
+rna_weights[
+  ,
+  feature_clean := sub("\\..*$", "", feature)
+]
+
+# Remove accidental view suffix if it exists.
+rna_weights[
+  ,
+  gene_symbol := sub(
+    "_RNA_VST_top5000var$",
+    "",
+    feature_clean
+  )
+]
+
+ensembl_ids <- unique(
+  rna_weights[
+    grepl("^ENSG[0-9]+$", feature_clean),
+    feature_clean
+  ]
+)
+
+if (length(ensembl_ids) > 0) {
+
+  ensembl_map <- AnnotationDbi::select(
+    org.Hs.eg.db,
+    keys = ensembl_ids,
+    keytype = "ENSEMBL",
+    columns = "SYMBOL"
+  )
+
+  ensembl_map <- as.data.table(ensembl_map)
+
+  ensembl_map <- ensembl_map[
+    !is.na(SYMBOL) &
+      SYMBOL != ""
+  ][
+    ,
+    .SD[1],
+    by = ENSEMBL
+  ]
+
+  setnames(
+    ensembl_map,
+    old = c("ENSEMBL", "SYMBOL"),
+    new = c("feature_clean", "mapped_symbol")
+  )
+
+  rna_weights <- merge(
+    rna_weights,
+    ensembl_map,
+    by = "feature_clean",
+    all.x = TRUE
+  )
+
+  rna_weights[
+    !is.na(mapped_symbol) &
+      mapped_symbol != "",
+    gene_symbol := mapped_symbol
+  ]
+}
+
+rna_weights <- rna_weights[
+  !is.na(gene_symbol) &
+    gene_symbol != "" &
+    is.finite(weight)
+]
+
+# Retain one entry per gene and factor:
+# the entry with the largest absolute MOFA weight.
+rna_weights_unique <- rna_weights[
+  ,
+  .SD[which.max(abs(weight))],
+  by = .(factor, gene_symbol)
+]
+
+rna_weights_unique <- rna_weights_unique[
+  order(factor, -weight)
+]
+
+fwrite(
+  rna_weights_unique,
+  file.path(
+    GSEA_DIR,
+    "Factor1_Factor2_all_RNA_weights_mapped.tsv"
+  ),
+  sep = "\t"
+)
+
+# -----------------------------
+# Helper: retrieve MSigDB data
+# Works with recent and older msigdbr versions.
+# -----------------------------
+get_msigdb <- function(collection_name, subcollection_name = NULL) {
+
+  msigdbr_arguments <- names(
+    formals(msigdbr::msigdbr)
+  )
+
+  if ("collection" %in% msigdbr_arguments) {
+
+    arguments <- list(
+      species = "Homo sapiens",
+      collection = collection_name
+    )
+
+    if (
+      !is.null(subcollection_name) &&
+      "subcollection" %in% msigdbr_arguments
+    ) {
+      arguments$subcollection <- subcollection_name
+    }
+
+  } else {
+
+    arguments <- list(
+      species = "Homo sapiens",
+      category = collection_name
+    )
+
+    if (
+      !is.null(subcollection_name) &&
+      "subcategory" %in% msigdbr_arguments
+    ) {
+      arguments$subcategory <- subcollection_name
+    }
+  }
+
+  as.data.table(
+    do.call(
+      msigdbr::msigdbr,
+      arguments
+    )
+  )
+}
+
+# -----------------------------
+# Get pathway collections
+# -----------------------------
+msig_hallmark <- get_msigdb(
+  collection_name = "H"
+)
+
+msig_reactome <- get_msigdb(
+  collection_name = "C2",
+  subcollection_name = "CP:REACTOME"
+)
+
+msig_go_bp <- get_msigdb(
+  collection_name = "C5",
+  subcollection_name = "GO:BP"
+)
+
+make_pathway_list <- function(msig_dt) {
+
+  msig_dt <- msig_dt[
+    !is.na(gene_symbol) &
+      gene_symbol != "" &
+      !is.na(gs_name) &
+      gs_name != ""
+  ]
+
+  split(
+    x = msig_dt$gene_symbol,
+    f = msig_dt$gs_name
+  )
+}
+
+pathway_collections <- list(
+  Hallmark = make_pathway_list(msig_hallmark),
+  Reactome = make_pathway_list(msig_reactome),
+  GO_BP = make_pathway_list(msig_go_bp)
+)
+
+# -----------------------------
+# Helper: run one GSEA analysis
+# -----------------------------
+run_gsea <- function(
+  factor_weight_dt,
+  pathways,
+  factor_name,
+  collection_name
+) {
+
+  ranks <- setNames(
+    factor_weight_dt$weight,
+    factor_weight_dt$gene_symbol
+  )
+
+  ranks <- sort(
+    ranks,
+    decreasing = TRUE
+  )
+
+  if (length(ranks) < 100) {
+    stop(
+      "Too few genes for GSEA in ",
+      factor_name
+    )
+  }
+
+  result_dt <- fgseaMultilevel(
+    pathways = pathways,
+    stats = ranks,
+    minSize = MIN_PATHWAY_SIZE,
+    maxSize = MAX_PATHWAY_SIZE
+  )
+
+  result_dt <- as.data.table(result_dt)
+
+  # Convert list column to text for TSV export.
+  if ("leadingEdge" %in% colnames(result_dt)) {
+    result_dt[
+      ,
+      leadingEdge := vapply(
+        leadingEdge,
+        function(x) paste(x, collapse = ";"),
+        character(1)
+      )
+    ]
+  }
+
+  result_dt[
+    ,
+    `:=`(
+      factor = factor_name,
+      collection = collection_name,
+      direction = fifelse(
+        NES > 0,
+        "Positive Factor weights",
+        "Negative Factor weights"
+      )
+    )
+  ]
+
+  result_dt[]
+}
+
+# -----------------------------
+# Run GSEA separately:
+# Factor 1 and Factor 2
+# -----------------------------
+gsea_list <- list()
+
+for (ff in FACTORS_TO_TEST) {
+
+  factor_weight_dt <- rna_weights_unique[
+    factor == ff
+  ]
+
+  for (collection_name in names(pathway_collections)) {
+
+    message(
+      "Running GSEA: ",
+      ff,
+      " | ",
+      collection_name
+    )
+
+    result_name <- paste(
+      ff,
+      collection_name,
+      sep = "_"
+    )
+
+    gsea_list[[result_name]] <- run_gsea(
+      factor_weight_dt = factor_weight_dt,
+      pathways = pathway_collections[[collection_name]],
+      factor_name = ff,
+      collection_name = collection_name
+    )
+  }
+}
+
+gsea_results <- rbindlist(
+  gsea_list,
+  use.names = TRUE,
+  fill = TRUE
+)
+
+# Use order(), not setorder(), because abs(NES) is an expression.
+gsea_results <- gsea_results[
+  order(
+    factor,
+    collection,
+    padj,
+    -abs(NES)
+  )
+]
+
+fwrite(
+  gsea_results,
+  file.path(
+    GSEA_DIR,
+    "Factor1_Factor2_ranked_GSEA_all_results.tsv"
+  ),
+  sep = "\t"
+)
+
+# -----------------------------
+# FDR-significant results
+# -----------------------------
+gsea_significant <- gsea_results[
+  !is.na(padj) &
+    padj < FDR_CUTOFF
+]
+
+fwrite(
+  gsea_significant,
+  file.path(
+    GSEA_DIR,
+    "Factor1_Factor2_ranked_GSEA_FDR_significant.tsv"
+  ),
+  sep = "\t"
+)
+
+# -----------------------------
+# Presentation pathway table
+# Hallmark pathways only
+# -----------------------------
+ppt_dt <- gsea_significant[
+  collection == "Hallmark"
+]
+
+if (nrow(ppt_dt) > 0) {
+
+  ppt_dt <- ppt_dt[
+    ,
+    .SD[
+      order(-abs(NES), padj)
+    ][
+      seq_len(
+        min(.N, TOP_PATHWAYS_PER_DIRECTION)
+      )
+    ],
+    by = .(factor, direction)
+  ]
+
+  ppt_dt[
+    ,
+    pathway_label := gsub(
+      "_",
+      " ",
+      sub("^HALLMARK_", "", pathway)
+    )
+  ]
+
+  fwrite(
+    ppt_dt,
+    file.path(
+      GSEA_DIR,
+      "PPT_Factor1_Factor2_Hallmark_top_pathways.tsv"
+    ),
+    sep = "\t"
+  )
+
+  # Unique IDs allow separate ordering in every facet.
+  ppt_dt[
+    ,
+    panel := paste(
+      factor,
+      direction,
+      sep = " | "
+    )
+  ]
+
+  ppt_dt[
+    ,
+    pathway_id := paste(
+      panel,
+      pathway_label,
+      sep = "___"
+    )
+  ]
+
+  ordered_pathways <- ppt_dt[
+    order(NES),
+    pathway_id
+  ]
+
+  ppt_dt[
+    ,
+    pathway_id := factor(
+      pathway_id,
+      levels = unique(ordered_pathways)
+    )
+  ]
+
+  p_gsea <- ggplot(
+    ppt_dt,
+    aes(
+      x = NES,
+      y = pathway_id,
+      fill = NES
+    )
+  ) +
+    geom_col(width = 0.75) +
+    geom_vline(
+      xintercept = 0,
+      color = "black",
+      linewidth = 0.4
+    ) +
+    facet_wrap(
+      ~ panel,
+      scales = "free_y",
+      ncol = 2
+    ) +
+    scale_y_discrete(
+      labels = function(x) {
+        sub("^.*___", "", x)
+      }
+    ) +
+    scale_fill_gradient2(
+      low = "#3C78A8",
+      mid = "white",
+      high = "#B4513C",
+      midpoint = 0,
+      name = "NES"
+    ) +
+    labs(
+      title = "Ranked pathway analysis of Factors 1 and 2",
+      subtitle = "Hallmark pathways; BH-FDR < 0.05",
+      x = "Normalized enrichment score",
+      y = NULL
+    ) +
+    theme_classic(base_size = 13) +
+    theme(
+      plot.title = element_text(
+        face = "bold",
+        size = 18
+      ),
+      plot.subtitle = element_text(
+        size = 13
+      ),
+      axis.text.y = element_text(
+        size = 9
+      ),
+      strip.text = element_text(
+        face = "bold",
+        size = 12
+      ),
+      legend.position = "right"
+    )
+
+  print(p_gsea)
+
+  ggsave(
+    file.path(
+      GSEA_DIR,
+      "PPT_Factor1_Factor2_Hallmark_ranked_GSEA.pdf"
+    ),
+    p_gsea,
+    width = 13,
+    height = 9
+  )
+
+  ggsave(
+    file.path(
+      GSEA_DIR,
+      "PPT_Factor1_Factor2_Hallmark_ranked_GSEA.png"
+    ),
+    p_gsea,
+    width = 13,
+    height = 9,
+    dpi = 300
+  )
+
+} else {
+
+  message(
+    "No Hallmark pathways passed BH-FDR < ",
+    FDR_CUTOFF,
+    ". Review the full results table for nominal findings."
+  )
+}
+
+# -----------------------------
+# Save run summary
+# -----------------------------
+genes_per_factor <- rna_weights_unique[
+  ,
+  .N,
+  by = factor
+]
+
+summary_dt <- data.table(
+  Metric = c(
+    "RNA view",
+    "Factors analyzed separately",
+    "Mapped genes per factor",
+    "Pathway collections",
+    "FDR cutoff",
+    "Total GSEA pathways tested",
+    "FDR-significant pathways"
+  ),
+  Value = c(
+    RNA_VIEW,
+    paste(FACTORS_TO_TEST, collapse = "; "),
+    paste(
+      genes_per_factor[
+        ,
+        paste(factor, N, sep = "=")
+      ],
+      collapse = "; "
+    ),
+    paste(
+      names(pathway_collections),
+      collapse = "; "
+    ),
+    FDR_CUTOFF,
+    nrow(gsea_results),
+    nrow(gsea_significant)
+  )
+)
+
+fwrite(
+  summary_dt,
+  file.path(
+    GSEA_DIR,
+    "Factor1_Factor2_ranked_GSEA_summary.tsv"
+  ),
+  sep = "\t"
+)
+
+message("Completed ranked GSEA.")
+message("Results saved in: ", GSEA_DIR)
+```
+
+
+```{r}
+library(data.table)
+library(ggplot2)
+
+GSEA_DIR <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/MOFA2/Updated/MOFA2_Pathway_GSEA_Factor1_Factor2"
+
+# This file already contains only FDR-significant pathways
+sig <- fread(
+  file.path(
+    GSEA_DIR,
+    "Factor1_Factor2_ranked_GSEA_FDR_significant.tsv"
+  )
+)
+
+# Safety check
+sig <- sig[
+  factor %chin% c("Factor1", "Factor2") &
+    is.finite(padj) &
+    padj < 0.05
+]
+
+# Cleaner pathway names
+sig[, pathway_label := pathway]
+sig[, pathway_label := sub("^GOBP_", "GO BP: ", pathway_label)]
+sig[, pathway_label := sub("^REACTOME_", "Reactome: ", pathway_label)]
+sig[, pathway_label := gsub("_", " ", pathway_label)]
+
+collection_colors <- c(
+  "GO_BP" = "#3C78A8",
+  "Reactome" = "#7B5EA7",
+  "Hallmark" = "#D97A2B"
+)
+
+make_gsea_plot <- function(df, factor_name) {
+
+  plot_dt <- copy(df[factor == factor_name])
+
+  if (nrow(plot_dt) == 0) {
+    stop(paste("No significant pathways found for", factor_name))
+  }
+
+  # Order pathways by NES within this factor
+  setorder(plot_dt, NES)
+  plot_dt[, pathway_label := make.unique(pathway_label)]
+  plot_dt[, pathway_label := factor(
+    pathway_label,
+    levels = pathway_label
+  )]
+
+  ggplot(plot_dt, aes(x = NES, y = pathway_label, fill = collection)) +
+    geom_vline(
+      xintercept = 0,
+      color = "grey35",
+      linewidth = 0.4
+    ) +
+    geom_col(width = 0.72) +
+    scale_fill_manual(
+      values = collection_colors,
+      name = "Pathway collection"
+    ) +
+    scale_x_continuous(
+      expand = expansion(mult = c(0.05, 0.05))
+    ) +
+    labs(
+      title = paste0(
+        factor_name,
+        ": significant pathways from RNA-weight GSEA"
+      ),
+      subtitle = "All displayed pathways have FDR < 0.05",
+      x = "Normalized enrichment score (NES)",
+      y = NULL
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", size = 16),
+      plot.subtitle = element_text(size = 11),
+      axis.text.y = element_text(size = 9),
+      legend.position = "top",
+      legend.title = element_text(face = "bold")
+    )
+}
+
+# Create separate plots
+p_factor1 <- make_gsea_plot(sig, "Factor1")
+p_factor2 <- make_gsea_plot(sig, "Factor2")
+
+# Height adapts to the number of pathways
+factor1_height <- max(4.5, 0.42 * nrow(sig[factor == "Factor1"]) + 2)
+factor2_height <- max(5.5, 0.42 * nrow(sig[factor == "Factor2"]) + 2)
+
+# Save Factor 1
+ggsave(
+  file.path(GSEA_DIR, "Factor1_all_significant_GSEA.pdf"),
+  p_factor1,
+  width = 11,
+  height = factor1_height
+)
+
+ggsave(
+  file.path(GSEA_DIR, "Factor1_all_significant_GSEA.png"),
+  p_factor1,
+  width = 11,
+  height = factor1_height,
+  dpi = 300
+)
+
+# Save Factor 2
+ggsave(
+  file.path(GSEA_DIR, "Factor2_all_significant_GSEA.pdf"),
+  p_factor2,
+  width = 11,
+  height = factor2_height
+)
+
+ggsave(
+  file.path(GSEA_DIR, "Factor2_all_significant_GSEA.png"),
+  p_factor2,
+  width = 11,
+  height = factor2_height,
+  dpi = 300
+)
+```
+
+
+```{r}
+# ============================================================
+# Factor 1 RNA weights and candidate immune-TIL axis
+# ============================================================
+
+library(data.table)
+library(ggplot2)
+
+# -----------------------------
+# Paths
+# -----------------------------
+DOWNSTREAM_DIR <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/MOFA2/Updated/MOFA2_Downstream"
+
+weights_file <- file.path(
+  DOWNSTREAM_DIR,
+  "MOFA2_top25_positive_negative_weights_by_view_factor.tsv"
+)
+
+if (!file.exists(weights_file)) {
+  stop("Cannot find weight table: ", weights_file)
+}
+
+# -----------------------------
+# Load and filter Factor 1 RNA weights
+# -----------------------------
+weights_dt <- fread(weights_file)
+
+required_cols <- c(
+  "view", "factor", "feature",
+  "value", "abs_weight", "direction"
+)
+
+missing_cols <- setdiff(required_cols, colnames(weights_dt))
+
+if (length(missing_cols) > 0) {
+  stop(
+    "Missing columns in input table: ",
+    paste(missing_cols, collapse = ", ")
+  )
+}
+
+factor1_rna_dt <- weights_dt[
+  view == "RNA_VST_top5000var" &
+    factor == "Factor1"
+]
+
+if (nrow(factor1_rna_dt) == 0) {
+  stop("No Factor 1 RNA weights found.")
+}
+
+# -----------------------------
+# Define candidate immune-associated transcripts
+# -----------------------------
+immune_features <- c(
+  "KLRK1-AS1",
+  "GZMH-AS1",
+  "CCR5AS",
+  "PSMB8-AS1"
+)
+
+# -----------------------------
+# Select displayed features
+# -----------------------------
+
+# Top 7 negative weights by absolute magnitude
+negative_top <- factor1_rna_dt[
+  direction == "Negative"
+][
+  order(abs_weight, decreasing = TRUE)
+][
+  seq_len(min(.N, 7))
+]
+
+# Force-add the immune-associated negative features,
+# even if they are not among the top 7 by absolute weight.
+negative_immune <- factor1_rna_dt[
+  direction == "Negative" &
+    feature %in% immune_features
+]
+
+negative_dt <- unique(
+  rbindlist(
+    list(negative_top, negative_immune),
+    use.names = TRUE,
+    fill = TRUE
+  ),
+  by = "feature"
+)
+
+# Top 8 positive weights by absolute magnitude
+positive_dt <- factor1_rna_dt[
+  direction == "Positive"
+][
+  order(abs_weight, decreasing = TRUE)
+][
+  seq_len(min(.N, 8))
+]
+
+plot_dt <- rbindlist(
+  list(negative_dt, positive_dt),
+  use.names = TRUE,
+  fill = TRUE
+)
+
+# Add an asterisk to the selected immune-associated transcripts
+plot_dt[
+  ,
+  feature_label := fifelse(
+    feature %in% immune_features,
+    paste0(feature, " *"),
+    feature
+  )
+]
+
+# Order labels from most negative to most positive
+plot_dt[
+  ,
+  feature_label := factor(
+    feature_label,
+    levels = feature_label[order(value)]
+  )
+]
+
+# -----------------------------
+# Create plot
+# -----------------------------
+p_factor1_immune <- ggplot(
+  plot_dt,
+  aes(
+    x = feature_label,
+    y = value,
+    fill = direction
+  )
+) +
+  geom_col(width = 0.75) +
+  geom_hline(
+    yintercept = 0,
+    color = "black",
+    linewidth = 0.5
+  ) +
+  coord_flip() +
+  scale_fill_manual(
+    values = c(
+      "Negative" = "#3C78A8",
+      "Positive" = "#B4513C"
+    )
+  ) +
+  scale_y_continuous(
+    limits = c(-1.15, 1.25),
+    breaks = c(-1, -0.5, 0, 0.5, 1)
+  ) +
+  labs(
+    title = "Factor 1 RNA weights: candidate immune-TIL axis",
+    subtitle = "Negative Factor 1 scores are associated with higher TIL levels",
+    x = NULL,
+    y = "MOFA2 RNA feature weight",
+    fill = NULL,
+    caption = paste(
+      "* Candidate immune-associated antisense transcripts:",
+      "KLRK1-AS1, GZMH-AS1, CCR5AS, and PSMB8-AS1."
+    )
+  ) +
+  theme_classic(base_size = 16) +
+  theme(
+    plot.title = element_text(
+      face = "bold",
+      size = 21
+    ),
+    plot.subtitle = element_text(
+      size = 15,
+      margin = margin(b = 12)
+    ),
+    axis.text.y = element_text(
+      face = "bold",
+      size = 13
+    ),
+    axis.text.x = element_text(
+      size = 12
+    ),
+    axis.title.x = element_text(
+      size = 15
+    ),
+    legend.position = "top",
+    legend.text = element_text(
+      size = 14
+    ),
+    plot.caption = element_text(
+      hjust = 0,
+      face = "italic",
+      size = 11,
+      margin = margin(t = 12)
+    ),
+    plot.margin = margin(
+      t = 15,
+      r = 25,
+      b = 20,
+      l = 15
+    )
+  )
+
+print(p_factor1_immune)
+
+# -----------------------------
+# Save PPT-ready outputs
+# -----------------------------
+pdf_file <- file.path(
+  DOWNSTREAM_DIR,
+  "Factor1_RNA_candidate_immune_TIL_axis.pdf"
+)
+
+png_file <- file.path(
+  DOWNSTREAM_DIR,
+  "Factor1_RNA_candidate_immune_TIL_axis.png"
+)
+
+ggsave(
+  filename = pdf_file,
+  plot = p_factor1_immune,
+  width = 12,
+  height = 8,
+  units = "in"
+)
+
+ggsave(
+  filename = png_file,
+  plot = p_factor1_immune,
+  width = 12,
+  height = 8,
+  units = "in",
+  dpi = 300
+)
+
+message("Saved PDF: ", pdf_file)
+message("Saved PNG: ", png_file)
+```
+```{r}
+# ============================================================
+# Factor 2 RNA weights and candidate B-cell/plasma-cell axis
+# ============================================================
+
+library(data.table)
+library(ggplot2)
+
+# -----------------------------
+# Paths
+# -----------------------------
+DOWNSTREAM_DIR <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/MOFA2/Updated/MOFA2_Downstream"
+
+weights_file <- file.path(
+  DOWNSTREAM_DIR,
+  "MOFA2_top25_positive_negative_weights_by_view_factor.tsv"
+)
+
+if (!file.exists(weights_file)) {
+  stop("Cannot find weight table: ", weights_file)
+}
+
+# -----------------------------
+# Load and filter Factor 2 RNA weights
+# -----------------------------
+weights_dt <- fread(weights_file)
+
+required_cols <- c(
+  "view", "factor", "feature",
+  "value", "abs_weight", "direction"
+)
+
+missing_cols <- setdiff(required_cols, colnames(weights_dt))
+
+if (length(missing_cols) > 0) {
+  stop(
+    "Missing columns in input table: ",
+    paste(missing_cols, collapse = ", ")
+  )
+}
+
+factor2_rna_dt <- weights_dt[
+  view == "RNA_VST_top5000var" &
+    factor == "Factor2"
+]
+
+if (nrow(factor2_rna_dt) == 0) {
+  stop("No Factor 2 RNA weights found.")
+}
+
+# -----------------------------
+# Define candidate B-cell/plasma-cell features
+# -----------------------------
+humoral_features <- c(
+  "IGHG1",
+  "IGHG3",
+  "IGKC",
+  "IL21R-AS1",
+  "CD27-AS1"
+)
+
+# -----------------------------
+# Select displayed features
+# -----------------------------
+
+# Top 7 negative weights by absolute magnitude
+negative_top <- factor2_rna_dt[
+  direction == "Negative"
+][
+  order(abs_weight, decreasing = TRUE)
+][
+  seq_len(min(.N, 7))
+]
+
+# Force-add B-cell/plasma-cell-associated genes,
+# even if they are not among the top 7.
+negative_humoral <- factor2_rna_dt[
+  direction == "Negative" &
+    feature %in% humoral_features
+]
+
+negative_dt <- unique(
+  rbindlist(
+    list(negative_top, negative_humoral),
+    use.names = TRUE,
+    fill = TRUE
+  ),
+  by = "feature"
+)
+
+# Top 8 positive weights by absolute magnitude
+positive_dt <- factor2_rna_dt[
+  direction == "Positive"
+][
+  order(abs_weight, decreasing = TRUE)
+][
+  seq_len(min(.N, 8))
+]
+
+plot_dt <- rbindlist(
+  list(negative_dt, positive_dt),
+  use.names = TRUE,
+  fill = TRUE
+)
+
+# Add an asterisk to the candidate B-cell/plasma-cell features
+plot_dt[
+  ,
+  feature_label := fifelse(
+    feature %in% humoral_features,
+    paste0(feature, " *"),
+    feature
+  )
+]
+
+# Order features from most negative to most positive
+plot_dt[
+  ,
+  feature_label := factor(
+    feature_label,
+    levels = feature_label[order(value)]
+  )
+]
+
+# -----------------------------
+# Create plot
+# -----------------------------
+p_factor2_humoral <- ggplot(
+  plot_dt,
+  aes(
+    x = feature_label,
+    y = value,
+    fill = direction
+  )
+) +
+  geom_col(width = 0.75) +
+  geom_hline(
+    yintercept = 0,
+    color = "black",
+    linewidth = 0.5
+  ) +
+  coord_flip() +
+  scale_fill_manual(
+    values = c(
+      "Negative" = "#3C78A8",
+      "Positive" = "#B4513C"
+    )
+  ) +
+  scale_y_continuous(
+    limits = c(-1.10, 1.35),
+    breaks = c(-1, -0.5, 0, 0.5, 1)
+  ) +
+  labs(
+    title = "Factor 2 RNA weights: candidate B-cell/plasma-cell axis",
+    subtitle = "Negative Factor 2 weights include immunoglobulin transcripts",
+    x = NULL,
+    y = "MOFA2 RNA feature weight",
+    fill = NULL,
+    caption = paste(
+      "* Candidate B-cell/plasma-cell-associated features:",
+      "IGHG1, IGHG3, IGKC, IL21R-AS1, and CD27-AS1."
+    )
+  ) +
+  theme_classic(base_size = 16) +
+  theme(
+    plot.title = element_text(
+      face = "bold",
+      size = 21
+    ),
+    plot.subtitle = element_text(
+      size = 15,
+      margin = margin(b = 12)
+    ),
+    axis.text.y = element_text(
+      face = "bold",
+      size = 13
+    ),
+    axis.text.x = element_text(
+      size = 12
+    ),
+    axis.title.x = element_text(
+      size = 15
+    ),
+    legend.position = "top",
+    legend.text = element_text(
+      size = 14
+    ),
+    plot.caption = element_text(
+      hjust = 0,
+      face = "italic",
+      size = 11,
+      margin = margin(t = 12)
+    ),
+    plot.margin = margin(
+      t = 15,
+      r = 25,
+      b = 20,
+      l = 15
+    )
+  )
+
+print(p_factor2_humoral)
+
+# -----------------------------
+# Save PPT-ready outputs
+# -----------------------------
+pdf_file <- file.path(
+  DOWNSTREAM_DIR,
+  "Factor2_RNA_candidate_Bcell_plasmacell_axis.pdf"
+)
+
+png_file <- file.path(
+  DOWNSTREAM_DIR,
+  "Factor2_RNA_candidate_Bcell_plasmacell_axis.png"
+)
+
+ggsave(
+  filename = pdf_file,
+  plot = p_factor2_humoral,
+  width = 12,
+  height = 8,
+  units = "in"
+)
+
+ggsave(
+  filename = png_file,
+  plot = p_factor2_humoral,
+  width = 12,
+  height = 8,
+  units = "in",
+  dpi = 300
+)
+
+message("Saved PDF: ", pdf_file)
+message("Saved PNG: ", png_file)
+```
