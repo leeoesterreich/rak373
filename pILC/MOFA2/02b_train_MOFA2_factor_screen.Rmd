@@ -1,0 +1,404 @@
+---
+title: "02b_train_MOFA2_factor_screen"
+output: html_document
+date: "2026-09-16"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+USER_LIB <- "/ihome/alee/rak373/R/x86_64-pc-linux-gnu-library/4.6"
+.libPaths(c(USER_LIB, .libPaths()))
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(MOFA2)
+})
+
+MODEL_SEED <- 42
+set.seed(MODEL_SEED)
+```
+
+```{r define-paths}
+OUT_DIR <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/MOFA2/Updated"
+
+RDS_DIR <- file.path(OUT_DIR, "MOFA2_RDS")
+TABLE_DIR <- file.path(OUT_DIR, "MOFA2_Tables")
+MODEL_DIR <- file.path(OUT_DIR, "MOFA2_Model")
+PLOT_DIR <- file.path(OUT_DIR, "MOFA2_Plots")
+
+dir.create(RDS_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(TABLE_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(MODEL_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(PLOT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+PREPARED_VIEW_MATRIX_FILE <- file.path(
+  RDS_DIR,
+  "MOFA2_prepared_input_view_matrices.rds"
+)
+
+# New filenames preserve the original six-factor model.
+MODEL_TAG <- "K10_drop02_seed42"
+
+MODEL_OUTFILE <- file.path(
+  MODEL_DIR,
+  paste0("MOFA2_updated_OncoKB_filtered_model_", MODEL_TAG, ".hdf5")
+)
+
+TRAINED_MODEL_RDS <- file.path(
+  RDS_DIR,
+  paste0("MOFA2_updated_OncoKB_filtered_model_", MODEL_TAG, "_trained.rds")
+)
+```
+
+```{r load-and-check-input-views}
+if (!file.exists(PREPARED_VIEW_MATRIX_FILE)) {
+  stop("Prepared MOFA input file not found: ", PREPARED_VIEW_MATRIX_FILE)
+}
+
+view_mats <- readRDS(PREPARED_VIEW_MATRIX_FILE)
+
+expected_views <- c(
+  "RNA_VST_top5000var",
+  "WES_CNV_numeric",
+  "WES_mutation_recurrent",
+  "IMPACT_mutation_OncoKB"
+)
+
+missing_views <- setdiff(expected_views, names(view_mats))
+
+if (length(missing_views) > 0) {
+  stop(
+    "Missing expected input view(s): ",
+    paste(missing_views, collapse = ", ")
+  )
+}
+
+# Keep exactly the same four views and view order as the original model.
+view_mats <- view_mats[expected_views]
+
+valid_views <- vapply(view_mats, function(x) {
+  is.matrix(x) && nrow(x) > 0 && ncol(x) > 0
+}, logical(1))
+
+if (!all(valid_views)) {
+  stop(
+    "Empty or invalid input view(s): ",
+    paste(names(view_mats)[!valid_views], collapse = ", ")
+  )
+}
+
+names(view_mats)
+```
+
+```{r summarize-input-views}
+view_summary <- rbindlist(lapply(names(view_mats), function(v) {
+  mat <- view_mats[[v]]
+
+  data.table(
+    view = v,
+    n_features = nrow(mat),
+    n_samples = ncol(mat),
+    n_non_missing_values = sum(is.finite(mat)),
+    n_missing_values = sum(!is.finite(mat))
+  )
+}))
+
+print(view_summary)
+
+fwrite(
+  view_summary,
+  file.path(
+    TABLE_DIR,
+    paste0("MOFA2_training_input_view_summary_", MODEL_TAG, ".tsv")
+  ),
+  sep = "\t"
+)
+```
+
+```{r sample-view-presence}
+sample_view_dt <- rbindlist(lapply(names(view_mats), function(v) {
+  data.table(
+    sample = colnames(view_mats[[v]]),
+    view = v,
+    present = 1
+  )
+}))
+
+sample_summary <- dcast(
+  sample_view_dt,
+  sample ~ view,
+  value.var = "present",
+  fill = 0
+)
+
+view_cols <- setdiff(colnames(sample_summary), "sample")
+
+sample_summary[
+  ,
+  n_views_present := rowSums(.SD),
+  .SDcols = view_cols
+]
+
+sample_summary <- sample_summary[order(-n_views_present, sample)]
+
+if (sample_summary[n_views_present >= 2, .N] == 0) {
+  stop("No samples are shared across at least two views. Check sample IDs.")
+}
+
+print(sample_summary)
+
+fwrite(
+  sample_summary,
+  file.path(
+    TABLE_DIR,
+    paste0("MOFA2_training_sample_view_presence_", MODEL_TAG, ".tsv")
+  ),
+  sep = "\t"
+)
+```
+
+```{r convert-matrices-to-long-format}
+matrix_to_long <- function(mat, view_name) {
+  dt <- as.data.table(as.table(mat))
+  setnames(dt, c("feature", "sample", "value"))
+
+  dt[
+    ,
+    `:=`(
+      sample = as.character(sample),
+      feature = as.character(feature),
+      view = view_name,
+      value = as.numeric(value)
+    )
+  ]
+
+  dt[is.finite(value), .(sample, feature, view, value)]
+}
+
+mofa_dt <- rbindlist(
+  lapply(names(view_mats), function(v) {
+    matrix_to_long(view_mats[[v]], v)
+  }),
+  use.names = TRUE
+)
+
+mofa_dt <- mofa_dt[, .(sample, feature, view, value)]
+
+fwrite(
+  mofa_dt,
+  file.path(
+    TABLE_DIR,
+    paste0("MOFA2_training_input_long_format_", MODEL_TAG, ".tsv")
+  ),
+  sep = "\t"
+)
+
+saveRDS(
+  mofa_dt,
+  file.path(
+    RDS_DIR,
+    paste0("MOFA2_training_input_long_format_", MODEL_TAG, ".rds")
+  )
+)
+
+print(mofa_dt)
+```
+
+```{r create-mofa-object}
+MOFAobject <- create_mofa(as.data.frame(mofa_dt))
+
+print(MOFAobject)
+
+pdf(
+  file.path(
+    PLOT_DIR,
+    paste0("MOFA2_training_data_overview_", MODEL_TAG, ".pdf")
+  ),
+  width = 8,
+  height = 5
+)
+
+plot_data_overview(MOFAobject)
+dev.off()
+```
+
+```{r define-data-model-and-training-options}
+data_opts <- get_default_data_options(MOFAobject)
+
+# RNA and CNV are Gaussian views; mutation views are Bernoulli 0/1 views.
+# Keep binary mutation values unchanged.
+data_opts$scale_views <- FALSE
+
+model_opts <- get_default_model_options(MOFAobject)
+
+# Start with a maximum of 10 factors.
+model_opts$num_factors <- 10
+
+view_likelihoods <- c(
+  RNA_VST_top5000var = "gaussian",
+  WES_CNV_numeric = "gaussian",
+  WES_mutation_recurrent = "bernoulli",
+  IMPACT_mutation_OncoKB = "bernoulli"
+)
+
+# Match likelihoods to the exact MOFA view order.
+mofa_views <- names(model_opts$likelihoods)
+view_likelihoods <- view_likelihoods[mofa_views]
+
+if (anyNA(view_likelihoods)) {
+  stop(
+    "Could not match likelihoods to MOFA views. Current MOFA views: ",
+    paste(mofa_views, collapse = ", ")
+  )
+}
+
+model_opts$likelihoods <- view_likelihoods
+
+train_opts <- get_default_training_options(MOFAobject)
+train_opts$convergence_mode <- "medium"
+train_opts$maxiter <- 1000
+train_opts$verbose <- TRUE
+train_opts$seed <- MODEL_SEED
+
+# Automatically drop factors explaining <2% variance during training.
+# 0.02 means 2% variance explained.
+train_opts$drop_factor_threshold <- 0.02
+
+print(data_opts)
+print(model_opts)
+print(train_opts)
+```
+
+```{r prepare-model}
+MOFAobject <- prepare_mofa(
+  object = MOFAobject,
+  data_options = data_opts,
+  model_options = model_opts,
+  training_options = train_opts
+)
+
+print(MOFAobject)
+```
+
+```{r train-model}
+MOFAobject.trained <- run_mofa(
+  object = MOFAobject,
+  outfile = MODEL_OUTFILE,
+  use_basilisk = TRUE
+)
+
+saveRDS(MOFAobject.trained, TRAINED_MODEL_RDS)
+
+print(MOFAobject.trained)
+```
+
+```{r trained-model-overview}
+pdf(
+  file.path(
+    PLOT_DIR,
+    paste0("MOFA2_trained_model_data_overview_", MODEL_TAG, ".pdf")
+  ),
+  width = 8,
+  height = 5
+)
+
+plot_data_overview(MOFAobject.trained)
+dev.off()
+```
+
+```{r retained-factor-summary}
+# The trained object printout also reports the retained factor number.
+# Extract factor-score names for a machine-readable summary.
+factor_scores <- get_factors(
+  MOFAobject.trained,
+  factors = "all",
+  as.data.frame = TRUE
+)
+
+factor_scores <- as.data.table(factor_scores)
+
+if (!"factor" %in% colnames(factor_scores)) {
+  stop("Could not find column 'factor' in get_factors() output.")
+}
+
+retained_factors <- unique(as.character(factor_scores$factor))
+
+factor_number <- suppressWarnings(
+  as.integer(sub("^Factor", "", retained_factors))
+)
+
+retained_factors <- retained_factors[order(factor_number)]
+
+factor_screen_summary <- data.table(
+  Metric = c(
+    "Initial maximum factors requested",
+    "Automatic factor-drop threshold",
+    "Number of retained factors after training",
+    "Retained factor names",
+    "Training seed"
+  ),
+  Value = c(
+    10,
+    "0.02 (2% variance explained)",
+    length(retained_factors),
+    paste(retained_factors, collapse = "; "),
+    MODEL_SEED
+  )
+)
+
+print(factor_screen_summary)
+
+fwrite(
+  factor_screen_summary,
+  file.path(
+    TABLE_DIR,
+    paste0("MOFA2_factor_screening_summary_", MODEL_TAG, ".tsv")
+  ),
+  sep = "\t"
+)
+```
+
+```{r final-training-summary}
+training_summary <- data.table(
+  Metric = c(
+    "Number of views used for training",
+    "Views used for training",
+    "Number of unique samples across all views",
+    "Number of samples present in at least two views",
+    "Initial maximum factors requested",
+    "Automatic factor-drop threshold",
+    "Number of retained factors after training",
+    "Retained factor names",
+    "Model output file",
+    "Trained model RDS file"
+  ),
+  Value = c(
+    length(view_mats),
+    paste(names(view_mats), collapse = "; "),
+    uniqueN(mofa_dt$sample),
+    sample_summary[n_views_present >= 2, .N],
+    10,
+    "0.02 (2% variance explained)",
+    length(retained_factors),
+    paste(retained_factors, collapse = "; "),
+    MODEL_OUTFILE,
+    TRAINED_MODEL_RDS
+  )
+)
+
+print(training_summary)
+
+fwrite(
+  training_summary,
+  file.path(
+    TABLE_DIR,
+    paste0("MOFA2_training_summary_", MODEL_TAG, ".tsv")
+  ),
+  sep = "\t"
+)
+```
+
+```{r session-info}
+sessionInfo()
+```
