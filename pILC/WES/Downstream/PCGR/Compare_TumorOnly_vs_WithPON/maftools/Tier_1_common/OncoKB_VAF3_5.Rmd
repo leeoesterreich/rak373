@@ -1,0 +1,828 @@
+---
+title: "OncoKB cancer genes with PCGR tumor VAF ≥3% or ≥5%"
+output: html_document
+date: "2026-09-21"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(readxl)
+  library(ggplot2)
+})
+
+set.seed(42)
+```
+
+```{r}
+# ============================================================
+# Rank OncoKB cancer genes after retaining nonsilent Tier 1
+# variants with matched With-PoN PCGR VAF_TUMOR >= 0.05.
+# ============================================================
+
+maf_file <- paste0(
+  "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/",
+  "Compare_TumorOnly_vs_WithPON/maftools/Tier_1_common/Combined_MAF/",
+  "Tier_1_common_all_samples.combined.maf"
+)
+
+cancer_gene_file <- paste0(
+  "/ix1/alee/LO_LAB/Personal/Rahul/pILC/MOFA2/Updated/",
+  "cancerGeneList.tsv"
+)
+
+pcgr_dir <- paste0(
+  "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/",
+  "With_PON/pcgr_outputs"
+)
+
+out_dir <- paste0(
+  "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/",
+  "Compare_TumorOnly_vs_WithPON/maftools/Tier_1_common/plots/",
+  "Oncovar_gene/VAFge5pct"
+)
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+run_date <- format(Sys.Date(), "%Y-%m-%d")
+MIN_VAF <- 0.05
+
+summary_file <- file.path(
+  out_dir,
+  paste0(
+    "Tier1_common_OncoKB_nonsilent_VAFge5pct_all_genes_",
+    run_date,
+    ".tsv"
+  )
+)
+
+match_audit_file <- file.path(
+  out_dir,
+  paste0(
+    "Tier1_common_OncoKB_variant_PCGR_VAF_match_audit_",
+    run_date,
+    ".tsv"
+  )
+)
+```
+
+```{r}
+# -------------------------------
+# Read OncoKB cancer-gene list
+# -------------------------------
+
+cancer_dt <- fread(
+  cancer_gene_file,
+  sep = "\t",
+  header = TRUE,
+  data.table = TRUE
+)
+
+possible_hugo_cols <- c(
+  "Hugo Symbol",
+  "Hugo_Symbol",
+  "HugoSymbol",
+  "Gene",
+  "SYMBOL"
+)
+
+hugo_col <- possible_hugo_cols[
+  possible_hugo_cols %in% names(cancer_dt)
+]
+
+if (!length(hugo_col)) {
+  stop(
+    "No recognized gene-symbol column found in cancerGeneList.tsv. ",
+    "Available columns: ",
+    paste(names(cancer_dt), collapse = ", ")
+  )
+}
+
+if (length(hugo_col) > 1L) {
+  message(
+    "Multiple candidate symbol columns found; using: ",
+    hugo_col[1]
+  )
+}
+
+cancer_genes <- unique(
+  toupper(trimws(as.character(cancer_dt[[hugo_col[1]]])))
+)
+cancer_genes <- cancer_genes[
+  !is.na(cancer_genes) &
+    cancer_genes != ""
+]
+
+message("OncoKB cancer genes loaded: ", length(cancer_genes))
+```
+
+```{r}
+# -------------------------------
+# Helper functions
+# -------------------------------
+
+clean_sample <- function(x) {
+  x <- toupper(trimws(as.character(x)))
+  x <- sub("(_T|-T|\\.T)$", "", x)
+  x[x %in% c("", ".", "NA", "N/A")] <- NA_character_
+  x
+}
+
+clean_gene <- function(x) {
+  x <- toupper(trimws(as.character(x)))
+  x[x %in% c("", ".", "NA", "N/A")] <- NA_character_
+  x
+}
+
+to_numeric <- function(x) {
+  suppressWarnings(
+    as.numeric(gsub("%", "", trimws(as.character(x))))
+  )
+}
+
+# Produce a consistent genomic-allele key.
+# MAF insertions represented with REF="-" use the left-flank coordinate;
+# therefore the inserted sequence begins at Start_Position + 1.
+edit_key <- function(chr, pos, ref, alt, maf_format = FALSE) {
+  chr <- sub("^CHR", "", toupper(trimws(as.character(chr))))
+  pos <- suppressWarnings(as.integer(pos))
+  ref <- toupper(trimws(as.character(ref)))
+  alt <- toupper(trimws(as.character(alt)))
+
+  if (anyNA(c(chr, pos, ref, alt)) ||
+      !nzchar(chr) || pos < 1L ||
+      !grepl("^([ACGTN]+|-)$", ref) ||
+      !grepl("^([ACGTN]+|-)$", alt)) {
+    return(NA_character_)
+  }
+
+  if (maf_format && ref == "-") {
+    pos <- pos + 1L
+  }
+
+  if (ref == "-") ref <- ""
+  if (alt == "-") alt <- ""
+
+  # Remove identical suffixes.
+  while (nzchar(ref) && nzchar(alt) &&
+         substr(ref, nchar(ref), nchar(ref)) ==
+           substr(alt, nchar(alt), nchar(alt))) {
+    ref <- substr(ref, 1, nchar(ref) - 1L)
+    alt <- substr(alt, 1, nchar(alt) - 1L)
+  }
+
+  # Remove identical prefixes and shift the position.
+  while (nzchar(ref) && nzchar(alt) &&
+         substr(ref, 1, 1) == substr(alt, 1, 1)) {
+    ref <- substring(ref, 2)
+    alt <- substring(alt, 2)
+    pos <- pos + 1L
+  }
+
+  if (!nzchar(ref) && !nzchar(alt)) {
+    return(NA_character_)
+  }
+
+  paste(
+    chr,
+    pos,
+    ifelse(nzchar(ref), ref, "-"),
+    ifelse(nzchar(alt), alt, "-"),
+    sep = ":"
+  )
+}
+
+# Parse PCGR GENOMIC_CHANGE values such as 16:g.68801891C>T.
+pcgr_genomic_key <- function(x) {
+  x <- trimws(as.character(x))
+
+  if (is.na(x) || !nzchar(x)) {
+    return(NA_character_)
+  }
+
+  pattern <- paste0(
+    "^(?:chr)?([^:]+):g\\.([0-9]+)",
+    "([ACGTN]+|-)>([ACGTN]+|-)$"
+  )
+
+  hit <- regmatches(
+    x,
+    regexec(pattern, x, perl = TRUE, ignore.case = TRUE)
+  )[[1]]
+
+  if (length(hit) == 5L) {
+    return(edit_key(hit[2], hit[3], hit[4], hit[5]))
+  }
+
+  NA_character_
+}
+```
+
+```{r}
+# -------------------------------
+# Read Tier 1 common MAF
+# -------------------------------
+
+maf_dt <- fread(
+  maf_file,
+  sep = "\t",
+  header = TRUE,
+  data.table = TRUE,
+  na.strings = c("", ".", "NA", "N/A")
+)
+
+required_cols <- c(
+  "Hugo_Symbol",
+  "Tumor_Sample_Barcode",
+  "Variant_Classification",
+  "Chromosome",
+  "Start_Position",
+  "Reference_Allele",
+  "Tumor_Seq_Allele2"
+)
+
+missing_cols <- setdiff(required_cols, names(maf_dt))
+
+if (length(missing_cols)) {
+  stop(
+    "Missing required columns in MAF: ",
+    paste(missing_cols, collapse = ", ")
+  )
+}
+
+maf_dt[, Hugo_Symbol_clean := clean_gene(Hugo_Symbol)]
+maf_dt[, Sample_key := clean_sample(Tumor_Sample_Barcode)]
+maf_dt[, Variant_key := mapply(
+  edit_key,
+  Chromosome,
+  Start_Position,
+  Reference_Allele,
+  Tumor_Seq_Allele2,
+  MoreArgs = list(maf_format = TRUE),
+  USE.NAMES = FALSE
+)]
+maf_dt[, Match_key := paste(
+  Sample_key,
+  Hugo_Symbol_clean,
+  Variant_key,
+  sep = "|"
+)]
+
+if (anyNA(maf_dt$Sample_key) ||
+    anyNA(maf_dt$Hugo_Symbol_clean) ||
+    anyNA(maf_dt$Variant_key)) {
+  stop("Some MAF rows could not be normalized for PCGR matching.")
+}
+```
+
+```{r}
+# -------------------------------
+# Read VAF_TUMOR from all With-PoN PCGR workbooks
+# -------------------------------
+
+pcgr_files <- list.files(
+  pcgr_dir,
+  pattern = "\\.pcgr\\.grch38\\.xlsx$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+if (!length(pcgr_files)) {
+  stop("No PCGR workbooks found under: ", pcgr_dir)
+}
+
+pcgr_list <- vector("list", length(pcgr_files))
+file_audit <- vector("list", length(pcgr_files))
+
+for (i in seq_along(pcgr_files)) {
+  file_path <- pcgr_files[i]
+  sample_folder <- basename(dirname(file_path))
+
+  sheets <- tryCatch(
+    excel_sheets(file_path),
+    error = function(e) character()
+  )
+
+  if (!"SOMATIC_SNV_INDEL" %in% sheets) {
+    file_audit[[i]] <- data.table(
+      SAMPLE_FOLDER = sample_folder,
+      STATUS = "missing_sheet",
+      PCGR_FILE = file_path
+    )
+    next
+  }
+
+  dt <- tryCatch(
+    as.data.table(
+      read_excel(
+        file_path,
+        sheet = "SOMATIC_SNV_INDEL",
+        guess_max = 100000
+      )
+    ),
+    error = function(e) NULL
+  )
+
+  required_pcgr <- c("SYMBOL", "GENOMIC_CHANGE", "VAF_TUMOR")
+
+  if (is.null(dt)) {
+    file_audit[[i]] <- data.table(
+      SAMPLE_FOLDER = sample_folder,
+      STATUS = "read_error",
+      PCGR_FILE = file_path
+    )
+    next
+  }
+
+  missing_pcgr <- setdiff(required_pcgr, names(dt))
+
+  if (length(missing_pcgr)) {
+    file_audit[[i]] <- data.table(
+      SAMPLE_FOLDER = sample_folder,
+      STATUS = paste0(
+        "missing_columns:",
+        paste(missing_pcgr, collapse = ",")
+      ),
+      PCGR_FILE = file_path
+    )
+    next
+  }
+
+  tmp <- dt[
+    ,
+    .(
+      Sample_key = clean_sample(sample_folder),
+      Hugo_Symbol_clean = clean_gene(SYMBOL),
+      Variant_key = vapply(
+        GENOMIC_CHANGE,
+        pcgr_genomic_key,
+        character(1)
+      ),
+      VAF_TUMOR_raw = to_numeric(VAF_TUMOR),
+      GENOMIC_CHANGE = as.character(GENOMIC_CHANGE),
+      PCGR_FILE = file_path
+    )
+  ]
+
+  numeric_vaf <- tmp$VAF_TUMOR_raw[!is.na(tmp$VAF_TUMOR_raw)]
+
+  if (length(numeric_vaf) && max(numeric_vaf) > 1) {
+    if (max(numeric_vaf) <= 100) {
+      tmp[, VAF_TUMOR_fraction := VAF_TUMOR_raw / 100]
+      scale_type <- "percent"
+    } else {
+      scale_type <- "invalid"
+      tmp[, VAF_TUMOR_fraction := NA_real_]
+    }
+  } else {
+    tmp[, VAF_TUMOR_fraction := VAF_TUMOR_raw]
+    scale_type <- if (length(numeric_vaf)) "fraction" else "no_numeric_VAF"
+  }
+
+  tmp[, Match_key := paste(
+    Sample_key,
+    Hugo_Symbol_clean,
+    Variant_key,
+    sep = "|"
+  )]
+
+  pcgr_list[[i]] <- tmp
+  file_audit[[i]] <- data.table(
+    SAMPLE_FOLDER = sample_folder,
+    STATUS = "ok",
+    VAF_SCALE = scale_type,
+    VARIANT_ROWS = nrow(tmp),
+    NUMERIC_VAF_ROWS = sum(!is.na(tmp$VAF_TUMOR_fraction)),
+    PCGR_FILE = file_path
+  )
+}
+
+pcgr_dt <- rbindlist(pcgr_list, use.names = TRUE, fill = TRUE)
+pcgr_file_audit <- rbindlist(file_audit, use.names = TRUE, fill = TRUE)
+
+fwrite(
+  pcgr_file_audit,
+  file.path(
+    out_dir,
+    paste0("PCGR_VAF_file_audit_", run_date, ".tsv")
+  ),
+  sep = "\t",
+  na = "NA"
+)
+
+if (!nrow(pcgr_dt)) {
+  stop("No PCGR VAF records were extracted. Review PCGR_VAF_file_audit.")
+}
+
+if (any(
+  !is.na(pcgr_dt$VAF_TUMOR_fraction) &
+    (pcgr_dt$VAF_TUMOR_fraction < 0 |
+       pcgr_dt$VAF_TUMOR_fraction > 1)
+)) {
+  stop("PCGR VAF_TUMOR values outside the valid 0–1 range were detected.")
+}
+
+# Collapse duplicate PCGR rows for the same exact sample-gene-variant key.
+pcgr_vaf <- pcgr_dt[
+  !is.na(Variant_key),
+  .(
+    VAF_TUMOR_fraction = if (all(is.na(VAF_TUMOR_fraction))) {
+      NA_real_
+    } else {
+      median(VAF_TUMOR_fraction, na.rm = TRUE)
+    },
+    PCGR_rows = .N
+  ),
+  by = Match_key
+]
+```
+
+```{r}
+# -------------------------------
+# Add PCGR VAF to the MAF by exact sample-gene-variant match
+# -------------------------------
+
+maf_vaf <- merge(
+  maf_dt,
+  pcgr_vaf,
+  by = "Match_key",
+  all.x = TRUE,
+  sort = FALSE
+)
+
+maf_vaf[, VAF_match_status := fifelse(
+  is.na(VAF_TUMOR_fraction),
+  "unmatched_or_missing_VAF",
+  "matched"
+)]
+
+maf_vaf[, VAF_filter_status := fifelse(
+  is.na(VAF_TUMOR_fraction),
+  "excluded_missing_VAF",
+  fifelse(
+    VAF_TUMOR_fraction >= MIN_VAF,
+    "retained_VAF_ge_0.05",
+    "excluded_VAF_lt_0.05"
+  )
+)]
+
+fwrite(
+  maf_vaf[
+    ,
+    .(
+      Hugo_Symbol,
+      Tumor_Sample_Barcode,
+      Variant_Classification,
+      Chromosome,
+      Start_Position,
+      Reference_Allele,
+      Tumor_Seq_Allele2,
+      Match_key,
+      VAF_TUMOR_fraction,
+      VAF_match_status,
+      VAF_filter_status
+    )
+  ],
+  match_audit_file,
+  sep = "\t",
+  quote = FALSE,
+  na = "NA"
+)
+
+cat("Tier 1 MAF variant rows:", nrow(maf_vaf), "\n")
+cat(
+  "Variant rows with matched PCGR VAF:",
+  sum(!is.na(maf_vaf$VAF_TUMOR_fraction)),
+  "\n"
+)
+cat(
+  "Variant rows without matched PCGR VAF:",
+  sum(is.na(maf_vaf$VAF_TUMOR_fraction)),
+  "\n"
+)
+cat(
+  "Variant rows retained at VAF >= 0.05:",
+  sum(
+    !is.na(maf_vaf$VAF_TUMOR_fraction) &
+      maf_vaf$VAF_TUMOR_fraction >= MIN_VAF
+  ),
+  "\n"
+)
+cat(
+  "Variant rows excluded at VAF < 0.05:",
+  sum(
+    !is.na(maf_vaf$VAF_TUMOR_fraction) &
+      maf_vaf$VAF_TUMOR_fraction < MIN_VAF
+  ),
+  "\n"
+)
+```
+
+```{r}
+# -------------------------------
+# Define and retain nonsilent variants
+# -------------------------------
+
+nonsilent_classes <- c(
+  "Missense_Mutation",
+  "Nonsense_Mutation",
+  "Nonstop_Mutation",
+  "Frame_Shift_Del",
+  "Frame_Shift_Ins",
+  "In_Frame_Del",
+  "In_Frame_Ins",
+  "Splice_Site",
+  "Splice_Region",
+  "Translation_Start_Site"
+)
+
+cancer_maf <- maf_vaf[
+  Hugo_Symbol_clean %in% cancer_genes &
+    Variant_Classification %in% nonsilent_classes &
+    !is.na(Hugo_Symbol_clean) &
+    Hugo_Symbol_clean != "" &
+    !is.na(VAF_TUMOR_fraction) &
+    VAF_TUMOR_fraction >= MIN_VAF
+]
+
+message("Total MAF rows: ", nrow(maf_vaf))
+message(
+  "OncoKB cancer-gene nonsilent rows with VAF >= 3%: ",
+  nrow(cancer_maf)
+)
+message("Applied tumor VAF threshold: VAF_TUMOR >= ", MIN_VAF)
+message(
+  "Unique retained OncoKB genes: ",
+  uniqueN(cancer_maf$Hugo_Symbol_clean)
+)
+message(
+  "Unique retained mutated samples: ",
+  uniqueN(cancer_maf$Tumor_Sample_Barcode)
+)
+
+if (!nrow(cancer_maf)) {
+  stop(
+    "No OncoKB cancer-gene nonsilent variants remained after ",
+    "requiring matched PCGR VAF_TUMOR >= 0.05."
+  )
+}
+
+filtered_maf_file <- file.path(
+  out_dir,
+  paste0(
+    "Tier1_common_OncoKB_nonsilent_VAFge5pct_",
+    run_date,
+    ".maf"
+  )
+)
+
+fwrite(
+  cancer_maf[
+    ,
+    setdiff(
+      names(cancer_maf),
+      c(
+        "Hugo_Symbol_clean",
+        "Sample_key",
+        "Variant_key",
+        "Match_key",
+        "PCGR_rows"
+      )
+    ),
+    with = FALSE
+  ],
+  filtered_maf_file,
+  sep = "\t",
+  quote = FALSE,
+  na = ""
+)
+```
+
+```{r}
+# -------------------------------
+# Rank genes by sample-level mutation frequency
+# -------------------------------
+
+# Preserve the original denominator.
+total_samples <- uniqueN(maf_dt$Tumor_Sample_Barcode)
+
+gene_summary <- cancer_maf[
+  ,
+  .(
+    Mutated_Samples = uniqueN(Tumor_Sample_Barcode),
+    Variant_Count = .N,
+    Variant_Classification = paste(
+      sort(unique(Variant_Classification)),
+      collapse = ";"
+    ),
+    # One added VAF column:
+    # median across matched nonsilent Tier 1 variant records in this gene.
+    Median_VAF_Percent = if (all(is.na(VAF_TUMOR_fraction))) {
+      NA_real_
+    } else {
+      round(100 * median(VAF_TUMOR_fraction, na.rm = TRUE), 2)
+    }
+  ),
+  by = .(Hugo_Symbol = Hugo_Symbol_clean)
+]
+
+gene_summary[
+  ,
+  Frequency_Percent := round(
+    (Mutated_Samples / total_samples) * 100,
+    2
+  )
+]
+
+setcolorder(
+  gene_summary,
+  c(
+    "Hugo_Symbol",
+    "Mutated_Samples",
+    "Frequency_Percent",
+    "Variant_Count",
+    "Median_VAF_Percent",
+    "Variant_Classification"
+  )
+)
+
+setorder(
+  gene_summary,
+  -Mutated_Samples,
+  -Variant_Count,
+  Hugo_Symbol
+)
+
+fwrite(
+  gene_summary,
+  summary_file,
+  sep = "\t",
+  quote = FALSE,
+  na = "NA"
+)
+
+message("Gene-frequency table with PCGR VAF saved:")
+message(summary_file)
+
+head(gene_summary, 20)
+```
+
+```{r}
+# -------------------------------
+# Save top 100 genes
+# -------------------------------
+
+top100 <- head(copy(gene_summary), 100)
+
+top100_file <- file.path(
+  out_dir,
+  paste0(
+    "Tier1_common_OncoKB_nonsilent_VAFge5pct_top100_",
+    run_date,
+    ".tsv"
+  )
+)
+
+fwrite(
+  top100,
+  top100_file,
+  sep = "\t",
+  quote = FALSE,
+  na = "NA"
+)
+```
+
+```{r}
+# -------------------------------
+# Barplot: top 100 frequently mutated OncoKB genes
+# -------------------------------
+
+plot_dt <- copy(top100)
+plot_dt[, Hugo_Symbol := factor(
+  Hugo_Symbol,
+  levels = rev(Hugo_Symbol)
+)]
+
+p <- ggplot(
+  plot_dt,
+  aes(x = Hugo_Symbol, y = Mutated_Samples)
+) +
+  geom_col(width = 0.75, fill = "#5B5B5B") +
+  geom_text(
+    aes(
+      label = paste0(
+        Mutated_Samples,
+        " / ",
+        total_samples,
+        " (",
+        Frequency_Percent,
+        "%)"
+      )
+    ),
+    hjust = -0.05,
+    size = 3
+  ) +
+  coord_flip() +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.20))
+  ) +
+  labs(
+    title = "Top 100 Frequently Mutated OncoKB Cancer Genes",
+    subtitle = paste0(
+      "Tier 1 common nonsilent variants with matched PCGR ",
+      "VAF_TUMOR ≥3%; n = ",
+      total_samples,
+      " samples"
+    ),
+    x = "Cancer gene",
+    y = "Number of mutated samples"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    text = element_text(colour = "black"),
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 11),
+    axis.text = element_text(colour = "black"),
+    axis.text.y = element_text(size = 9),
+    panel.grid.major.y = element_blank()
+  )
+
+pdf_file <- file.path(
+  out_dir,
+  paste0(
+    "Tier1_common_OncoKB_nonsilent_VAFge5pct_top100_",
+    run_date,
+    ".pdf"
+  )
+)
+
+png_file <- file.path(
+  out_dir,
+  paste0(
+    "Tier1_common_OncoKB_nonsilent_VAFge5pct_top100_",
+    run_date,
+    ".png"
+  )
+)
+
+ggsave(
+  filename = pdf_file,
+  plot = p,
+  width = 10,
+  height = 12,
+  units = "in"
+)
+
+ggsave(
+  filename = png_file,
+  plot = p,
+  width = 10,
+  height = 12,
+  units = "in",
+  dpi = 300,
+  bg = "white"
+)
+```
+
+```{r}
+# -------------------------------
+# Genes altered in at least 20% of the full cohort
+# -------------------------------
+
+altered_20pct_genes <- gene_summary[
+  Frequency_Percent >= 20
+]
+
+setorder(
+  altered_20pct_genes,
+  -Frequency_Percent,
+  -Mutated_Samples,
+  -Variant_Count,
+  Hugo_Symbol
+)
+
+altered_20pct_file <- file.path(
+  out_dir,
+  paste0(
+    "Tier1_common_OncoKB_nonsilent_VAFge5pct_genes_",
+    "altered_atleast20pct_",
+    run_date,
+    ".tsv"
+  )
+)
+
+fwrite(
+  altered_20pct_genes,
+  altered_20pct_file,
+  sep = "\t",
+  quote = FALSE,
+  na = "NA"
+)
+
+cat(
+  "Genes altered in at least 20% of samples after VAF filtering:",
+  nrow(altered_20pct_genes),
+  "\n"
+)
+```
