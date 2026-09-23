@@ -1,0 +1,429 @@
+---
+title: "extract_PCGR_annotations_29_genes"
+output: html_document
+date: "2026-07-29"
+---
+# ============================================================
+# Extract PCGR annotations for 29 multi-tool consensus genes
+#
+# Input:
+#   One *.pcgr.grch38.xlsx file per sample folder
+#   Sheet: SOMATIC_SNV_INDEL
+#
+# Primary extracted fields:
+#   LOSS_OF_FUNCTION
+#   VAF_TUMOR
+#   ONCOGENICITY
+#
+# Output:
+#   One combined TSV containing all variants from the 29 genes
+# ============================================================
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+suppressPackageStartupMessages({
+  library(data.table)
+  library(readxl)
+})
+
+# ============================================================
+# 1. Paths
+# ============================================================
+
+PCGR_DIR <- paste0(
+  "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/",
+  "With_PON/pcgr_outputs"
+)
+
+OUTPUT_DIR <- paste0(
+  "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/",
+  "Compare_TumorOnly_vs_WithPON/Driver_Gene_Analysis/",
+  "MultiTool_Consensus_29_Genes"
+)
+
+OUTPUT_FILE <- file.path(
+  OUTPUT_DIR,
+  "MultiTool_Consensus_29_Genes_PCGR_LOF_VAF_Oncogenicity.tsv"
+)
+
+dir.create(
+  OUTPUT_DIR,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+# ============================================================
+# 2. Consensus genes
+# ============================================================
+
+CONSENSUS_GENES <- c(
+  # Supported by four tools
+  "AGAP2",
+  "CD2BP2",
+  "DLK2",
+  "HSD17B14",
+  "MTMR2",
+  "NINJ2",
+  "PLXNA1",
+  "POLD1",
+
+  # Supported by three tools
+  "CACNA1B",
+  "CDH1",
+  "DLG1",
+  "EPHA8",
+  "FHIP1B",
+  "GALNT14",
+  "GLT1D1",
+  "GPR179",
+  "GPX4",
+  "IGFBP6",
+  "JPH1",
+  "PHLDB3",
+  "PIK3CA",
+  "RBFOX1",
+  "SYTL3",
+  "TDG",
+  "TSPAN18",
+  "TTN",
+  "TYW1",
+  "ZMYM3",
+  "ZNF536"
+)
+
+if (length(unique(CONSENSUS_GENES)) != 29) {
+  stop("The consensus gene list does not contain exactly 29 unique genes.")
+}
+
+# ============================================================
+# 3. Find PCGR Excel files
+# ============================================================
+
+pcgr_files <- list.files(
+  PCGR_DIR,
+  pattern = "\\.pcgr\\.grch38\\.xlsx$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+if (length(pcgr_files) == 0) {
+  stop(
+    "No *.pcgr.grch38.xlsx files were found under:\n",
+    PCGR_DIR
+  )
+}
+
+cat("PCGR files found:", length(pcgr_files), "\n")
+
+# ============================================================
+# 4. Columns to retain
+# ============================================================
+
+# LOSS_OF_FUNCTION, VAF_TUMOR and ONCOGENICITY are the primary
+# requested columns. Additional fields are retained to support
+# biological interpretation of each variant.
+
+KEEP_COLUMNS <- c(
+  "SAMPLE_ID",
+  "GENOMIC_CHANGE",
+  "GENOME_VERSION",
+  "VARIANT_CLASS",
+  "SYMBOL",
+  "GENENAME",
+  "ALTERATION",
+  "PROTEIN_CHANGE",
+  "CONSEQUENCE",
+  "PFAM_DOMAIN_NAME",
+  "LOSS_OF_FUNCTION",
+  "LOF_FILTER",
+  "VAF_TUMOR",
+  "DP_TUMOR",
+  "MUTATION_HOTSPOT",
+  "MUTATION_HOTSPOT_CANCERTYPE",
+  "ONCOGENICITY",
+  "ONCOGENICITY_CODE",
+  "ONCOGENICITY_SCORE",
+  "HGVSc",
+  "HGVSp",
+  "CGC_TIER",
+  "ONCOGENE",
+  "ONCOGENE_SUPPORT",
+  "TUMOR_SUPPRESSOR",
+  "TUMOR_SUPPRESSOR_SUPPORT",
+  "CALL_CONFIDENCE"
+)
+
+# ============================================================
+# 5. Read each PCGR workbook
+# ============================================================
+
+results_list <- vector(
+  mode = "list",
+  length = length(pcgr_files)
+)
+
+files_read <- 0L
+files_skipped <- 0L
+
+for (i in seq_along(pcgr_files)) {
+
+  file_path <- pcgr_files[i]
+  sample_folder <- basename(dirname(file_path))
+
+  cat(
+    "[",
+    i,
+    "/",
+    length(pcgr_files),
+    "] Reading ",
+    sample_folder,
+    "\n",
+    sep = ""
+  )
+
+  sheets <- tryCatch(
+    excel_sheets(file_path),
+    error = function(e) {
+      warning(
+        "Could not inspect workbook: ",
+        file_path,
+        "\nReason: ",
+        e$message
+      )
+      character()
+    }
+  )
+
+  if (!"SOMATIC_SNV_INDEL" %in% sheets) {
+    warning(
+      "SOMATIC_SNV_INDEL sheet not found in:\n",
+      file_path
+    )
+
+    files_skipped <- files_skipped + 1L
+    next
+  }
+
+  pcgr_dt <- tryCatch(
+    as.data.table(
+      read_excel(
+        file_path,
+        sheet = "SOMATIC_SNV_INDEL"
+      )
+    ),
+    error = function(e) {
+      warning(
+        "Could not read SOMATIC_SNV_INDEL sheet:\n",
+        file_path,
+        "\nReason: ",
+        e$message
+      )
+      NULL
+    }
+  )
+
+  if (is.null(pcgr_dt) || nrow(pcgr_dt) == 0) {
+    files_skipped <- files_skipped + 1L
+    next
+  }
+
+  if (!"SYMBOL" %in% colnames(pcgr_dt)) {
+    warning(
+      "SYMBOL column was not found in:\n",
+      file_path
+    )
+
+    files_skipped <- files_skipped + 1L
+    next
+  }
+
+  # Standardize gene symbols.
+  pcgr_dt[, SYMBOL := toupper(trimws(as.character(SYMBOL)))]
+
+  # Retain only the 29 consensus genes.
+  selected_dt <- pcgr_dt[
+    SYMBOL %in% CONSENSUS_GENES
+  ]
+
+  if (nrow(selected_dt) == 0) {
+    files_read <- files_read + 1L
+    next
+  }
+
+  # Add any missing requested columns as NA.
+  missing_columns <- setdiff(
+    KEEP_COLUMNS,
+    colnames(selected_dt)
+  )
+
+  if (length(missing_columns) > 0) {
+    for (column_name in missing_columns) {
+      selected_dt[, (column_name) := NA_character_]
+    }
+  }
+
+  # Keep a consistent column order.
+  selected_dt <- selected_dt[
+    ,
+    ..KEEP_COLUMNS
+  ]
+
+  # Add source identifiers.
+  selected_dt[
+    ,
+    `:=`(
+      SAMPLE_FOLDER = sample_folder,
+      PCGR_FILE = file_path
+    )
+  ]
+
+  setcolorder(
+    selected_dt,
+    c(
+      "SAMPLE_FOLDER",
+      "SAMPLE_ID",
+      "SYMBOL",
+      setdiff(
+        colnames(selected_dt),
+        c(
+          "SAMPLE_FOLDER",
+          "SAMPLE_ID",
+          "SYMBOL",
+          "PCGR_FILE"
+        )
+      ),
+      "PCGR_FILE"
+    )
+  )
+
+  results_list[[i]] <- selected_dt
+  files_read <- files_read + 1L
+}
+
+# ============================================================
+# 6. Combine results
+# ============================================================
+
+results_list <- Filter(
+  Negate(is.null),
+  results_list
+)
+
+if (length(results_list) == 0) {
+  stop(
+    "No variants from the 29 genes were found in the PCGR files."
+  )
+}
+
+combined_dt <- rbindlist(
+  results_list,
+  use.names = TRUE,
+  fill = TRUE
+)
+
+# Convert VAF to numeric when possible.
+combined_dt[
+  ,
+  VAF_TUMOR := suppressWarnings(
+    as.numeric(VAF_TUMOR)
+  )
+]
+
+combined_dt[
+  ,
+  DP_TUMOR := suppressWarnings(
+    as.numeric(DP_TUMOR)
+  )
+]
+
+combined_dt[
+  ,
+  ONCOGENICITY_SCORE := suppressWarnings(
+    as.numeric(ONCOGENICITY_SCORE)
+  )
+]
+
+# Sort consistently.
+setorder(
+  combined_dt,
+  SYMBOL,
+  SAMPLE_FOLDER,
+  GENOMIC_CHANGE
+)
+
+# ============================================================
+# 7. Save combined output
+# ============================================================
+
+fwrite(
+  combined_dt,
+  file = OUTPUT_FILE,
+  sep = "\t",
+  quote = FALSE,
+  na = ""
+)
+
+# ============================================================
+# 8. Print summary
+# ============================================================
+
+cat("\n============================================================\n")
+cat("PCGR extraction completed successfully\n")
+cat("============================================================\n")
+cat("PCGR files found:             ", length(pcgr_files), "\n")
+cat("Files successfully examined:  ", files_read, "\n")
+cat("Files skipped:                ", files_skipped, "\n")
+cat("Extracted variant rows:       ", nrow(combined_dt), "\n")
+cat("Samples with retained rows:   ", uniqueN(combined_dt$SAMPLE_FOLDER), "\n")
+cat("Consensus genes represented:  ", uniqueN(combined_dt$SYMBOL), " of 29\n")
+cat("Output:\n", OUTPUT_FILE, "\n")
+cat("============================================================\n\n")
+
+cat("Variant rows by gene:\n")
+
+print(
+  combined_dt[
+    ,
+    .(
+      Variant_rows = .N,
+      Mutated_samples = uniqueN(SAMPLE_FOLDER),
+      Median_VAF = if (
+        all(is.na(VAF_TUMOR))
+      ) {
+        NA_real_
+      } else {
+        median(VAF_TUMOR, na.rm = TRUE)
+      },
+      LOF_annotated_rows = sum(
+        !is.na(LOSS_OF_FUNCTION) &
+          trimws(as.character(LOSS_OF_FUNCTION)) != ""
+      ),
+      Oncogenic_rows = sum(
+        ONCOGENICITY == "Oncogenic",
+        na.rm = TRUE
+      ),
+      Likely_Oncogenic_rows = sum(
+        ONCOGENICITY == "Likely_Oncogenic",
+        na.rm = TRUE
+      )
+    ),
+    by = SYMBOL
+  ][order(-Mutated_samples, -Variant_rows)]
+)
+
+missing_genes <- setdiff(
+  CONSENSUS_GENES,
+  unique(combined_dt$SYMBOL)
+)
+
+if (length(missing_genes) > 0) {
+  cat("\nConsensus genes with no retained PCGR variant rows:\n")
+  cat(
+    paste(missing_genes, collapse = ", "),
+    "\n"
+  )
+}
+```
+

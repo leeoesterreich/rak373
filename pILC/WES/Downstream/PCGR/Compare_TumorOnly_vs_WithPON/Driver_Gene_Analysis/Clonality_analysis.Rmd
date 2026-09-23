@@ -1,0 +1,711 @@
+---
+title: "Clonality_analysis"
+output: html_document
+date: "2026-09-22"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r}
+# ============================================================
+# CTNNA1 clonality analysis in the pILC WES cohort
+# Date: 2026-09-22
+#
+# Inputs
+#   1. Tier-1 common cohort MAF
+#   2. With-PoN PCGR workbooks: SOMATIC_SNV_INDEL sheet
+#   3. FACETS allele-specific copy-number segments
+#   4. FACETS purity table, or purity column found in FACETS files
+#
+# Important
+#   VAF alone is NOT used to make a definitive clonality call.
+#   Clonality is assessed from purity/copy-number-adjusted CCF.
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(readxl)
+})
+
+set.seed(42)
+
+# -------------------------------
+# Paths
+# -------------------------------
+
+WES_ROOT <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES"
+
+MAF_FILE <- file.path(
+  WES_ROOT,
+  "Downstream/PCGR/Compare_TumorOnly_vs_WithPON/maftools/",
+  "Tier_1_common/Combined_MAF/Tier_1_common_all_samples.combined.maf"
+)
+
+PCGR_DIR <- file.path(
+  WES_ROOT,
+  "Downstream/PCGR/With_PON/pcgr_outputs"
+)
+
+FACETS_DIR <- file.path(
+  WES_ROOT,
+  "Downstream/FACETS/Result"
+)
+
+OUT_DIR <- file.path(
+  WES_ROOT,
+  paste0(
+    "Downstream/PCGR/Compare_TumorOnly_vs_WithPON/",
+    "CTNNA1_Clonality"
+  )
+)
+
+dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+RUN_DATE <- format(Sys.Date(), "%Y-%m-%d")
+
+out_file <- function(stem) {
+  file.path(OUT_DIR, paste0(stem, "_", RUN_DATE, ".tsv"))
+}
+
+# -------------------------------
+# Helper functions
+# -------------------------------
+
+clean_text <- function(x) {
+  x <- trimws(as.character(x))
+  x[x %in% c("", ".", "NA", "N/A", "NULL")] <- NA_character_
+  x
+}
+
+clean_sample <- function(x) {
+  x <- toupper(clean_text(x))
+  x <- sub("(_T|-T|\\.T)$", "", x)
+  x
+}
+
+clean_chr <- function(x) {
+  x <- toupper(clean_text(x))
+  x <- sub("^CHR", "", x)
+  x[x == "23"] <- "X"
+  x[x == "24"] <- "Y"
+  x
+}
+
+to_num <- function(x) {
+  suppressWarnings(as.numeric(gsub("%", "", clean_text(x))))
+}
+
+pick_col <- function(dt, candidates, required = FALSE, label = NULL) {
+  lower_names <- tolower(names(dt))
+  hit <- match(tolower(candidates), lower_names, nomatch = 0L)
+  hit <- hit[hit > 0L]
+
+  if (length(hit)) return(names(dt)[hit[1]])
+
+  if (required) {
+    stop(
+      "Could not identify ", ifelse(is.null(label), "required column", label),
+      ". Tried: ", paste(candidates, collapse = ", ")
+    )
+  }
+
+  NA_character_
+}
+
+extract_sample_from_path <- function(path) {
+  hit <- regmatches(
+    path,
+    regexpr("TP[0-9]+-[A-Z0-9]+(?:_T)?", toupper(path), perl = TRUE)
+  )
+  if (!length(hit) || !nzchar(hit)) return(NA_character_)
+  clean_sample(hit)
+}
+
+# Normalize REF/ALT representations to a common edit key.
+edit_key <- function(chr, pos, ref, alt, maf_format = FALSE) {
+  chr <- clean_chr(chr)
+  pos <- suppressWarnings(as.integer(pos))
+  ref <- toupper(clean_text(ref))
+  alt <- toupper(clean_text(alt))
+
+  if (anyNA(c(chr, pos, ref, alt)) || pos < 1L ||
+      !grepl("^([ACGTN]+|-)$", ref) ||
+      !grepl("^([ACGTN]+|-)$", alt)) {
+    return(NA_character_)
+  }
+
+  # MAF insertions with REF='-' begin one base after Start_Position.
+  if (maf_format && ref == "-") pos <- pos + 1L
+  if (ref == "-") ref <- ""
+  if (alt == "-") alt <- ""
+
+  while (nzchar(ref) && nzchar(alt) &&
+         substr(ref, nchar(ref), nchar(ref)) ==
+           substr(alt, nchar(alt), nchar(alt))) {
+    ref <- substr(ref, 1L, nchar(ref) - 1L)
+    alt <- substr(alt, 1L, nchar(alt) - 1L)
+  }
+
+  while (nzchar(ref) && nzchar(alt) &&
+         substr(ref, 1L, 1L) == substr(alt, 1L, 1L)) {
+    ref <- substring(ref, 2L)
+    alt <- substring(alt, 2L)
+    pos <- pos + 1L
+  }
+
+  if (!nzchar(ref) && !nzchar(alt)) return(NA_character_)
+
+  paste(
+    chr,
+    pos,
+    ifelse(nzchar(ref), ref, "-"),
+    ifelse(nzchar(alt), alt, "-"),
+    sep = ":"
+  )
+}
+
+pcgr_genomic_key <- function(x) {
+  x <- clean_text(x)
+  if (is.na(x)) return(NA_character_)
+
+  hit <- regmatches(
+    x,
+    regexec(
+      "^(?:chr)?([^:]+):g\\.([0-9]+)([ACGTN]+|-)>([ACGTN]+|-)$",
+      x,
+      perl = TRUE,
+      ignore.case = TRUE
+    )
+  )[[1]]
+
+  if (length(hit) != 5L) return(NA_character_)
+  edit_key(hit[2], hit[3], hit[4], hit[5])
+}
+
+normalize_vaf <- function(x) {
+  x <- to_num(x)
+  nonmissing <- x[!is.na(x)]
+  if (!length(nonmissing)) return(x)
+
+  # PCGR may store VAF as 0-1 or as percent. Detect safely.
+  if (max(nonmissing, na.rm = TRUE) > 1) x <- x / 100
+  x
+}
+
+beta_ci <- function(vaf, depth, conf = 0.95) {
+  if (is.na(vaf) || is.na(depth) || depth <= 0) return(c(NA_real_, NA_real_))
+  alt <- max(0L, min(as.integer(round(depth)), as.integer(round(vaf * depth))))
+  n <- as.integer(round(depth))
+  alpha <- 1 - conf
+  lower <- if (alt == 0L) 0 else qbeta(alpha / 2, alt, n - alt + 1)
+  upper <- if (alt == n) 1 else qbeta(1 - alpha / 2, alt + 1, n - alt)
+  c(lower, upper)
+}
+
+# CCF = VAF * [purity * total_CN + 2*(1-purity)] /
+#       [purity * mutation_multiplicity]
+estimate_ccf <- function(vaf, depth, purity, total_cn) {
+  empty <- list(
+    Mutation_Multiplicity = NA_integer_,
+    CCF = NA_real_,
+    CCF_CI_Lower = NA_real_,
+    CCF_CI_Upper = NA_real_,
+    Clonality = "Indeterminate",
+    Clonality_Note = NA_character_
+  )
+
+  if (anyNA(c(vaf, purity, total_cn))) {
+    empty$Clonality_Note <- "Missing VAF, FACETS purity, or total copy number"
+    return(empty)
+  }
+
+  if (vaf < 0 || vaf > 1 || purity <= 0 || purity > 1 || total_cn <= 0) {
+    empty$Clonality_Note <- "Invalid VAF, purity, or total copy-number value"
+    return(empty)
+  }
+
+  denominator_cn <- purity * total_cn + 2 * (1 - purity)
+  max_mult <- max(1L, as.integer(round(total_cn)))
+  multiplicities <- seq_len(max_mult)
+  ccfs <- vaf * denominator_cn / (purity * multiplicities)
+
+  # Prefer a biologically feasible CCF. If several are feasible, choose the
+  # value closest to 1. Values up to 1.20 are allowed for measurement noise.
+  feasible <- which(ccfs <= 1.20)
+  if (length(feasible)) {
+    chosen <- feasible[which.min(abs(ccfs[feasible] - 1))]
+  } else {
+    chosen <- which.min(abs(ccfs - 1))
+  }
+
+  mult <- multiplicities[chosen]
+  ccf <- ccfs[chosen]
+  vaf_ci <- beta_ci(vaf, depth)
+  scale_factor <- denominator_cn / (purity * mult)
+  ccf_ci <- vaf_ci * scale_factor
+
+  if (all(!is.na(ccf_ci))) {
+    if (ccf_ci[1] <= 1 && ccf_ci[2] >= 1) {
+      call <- "Clonal"
+      note <- "95% CCF interval includes 1"
+    } else if (ccf_ci[2] < 1) {
+      call <- "Subclonal"
+      note <- "95% CCF interval is below 1"
+    } else {
+      call <- "Indeterminate"
+      note <- "CCF interval is above 1; review purity/CN/multiplicity"
+    }
+  } else {
+    call <- if (ccf >= 0.90 && ccf <= 1.20) {
+      "Likely_clonal"
+    } else if (ccf < 0.90) {
+      "Likely_subclonal"
+    } else {
+      "Indeterminate"
+    }
+    note <- "Heuristic call because read depth was unavailable"
+  }
+
+  list(
+    Mutation_Multiplicity = mult,
+    CCF = ccf,
+    CCF_CI_Lower = ccf_ci[1],
+    CCF_CI_Upper = ccf_ci[2],
+    Clonality = call,
+    Clonality_Note = note
+  )
+}
+
+# -------------------------------
+# 1. Read Tier-1 common CTNNA1 variants
+# -------------------------------
+
+if (!file.exists(MAF_FILE)) stop("MAF not found: ", MAF_FILE)
+
+maf <- fread(
+  MAF_FILE,
+  sep = "\t",
+  header = TRUE,
+  data.table = TRUE,
+  na.strings = c("", ".", "NA", "N/A"),
+  skip = "Hugo_Symbol"
+)
+
+required_maf <- c(
+  "Hugo_Symbol", "Tumor_Sample_Barcode", "Chromosome",
+  "Start_Position", "End_Position", "Reference_Allele",
+  "Tumor_Seq_Allele2", "Variant_Classification"
+)
+
+missing_maf <- setdiff(required_maf, names(maf))
+if (length(missing_maf)) {
+  stop("MAF missing columns: ", paste(missing_maf, collapse = ", "))
+}
+
+maf[, Gene := toupper(clean_text(Hugo_Symbol))]
+maf[, Sample_key := clean_sample(Tumor_Sample_Barcode)]
+maf[, Chromosome_clean := clean_chr(Chromosome)]
+maf[, Position := as.integer(Start_Position)]
+maf[, Variant_key := mapply(
+  edit_key,
+  Chromosome,
+  Start_Position,
+  Reference_Allele,
+  Tumor_Seq_Allele2,
+  MoreArgs = list(maf_format = TRUE),
+  USE.NAMES = FALSE
+)]
+
+ctnna1 <- maf[Gene == "CTNNA1"]
+
+if (!nrow(ctnna1)) stop("No CTNNA1 variants were found in the Tier-1 common MAF.")
+
+ctnna1[, Match_key := paste(Sample_key, Gene, Variant_key, sep = "|")]
+
+# -------------------------------
+# 2. Read CTNNA1 rows from With-PoN PCGR workbooks
+# -------------------------------
+
+pcgr_files <- list.files(
+  PCGR_DIR,
+  pattern = "\\.pcgr\\.grch38\\.xlsx$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+if (!length(pcgr_files)) stop("No PCGR workbooks found under: ", PCGR_DIR)
+
+pcgr_list <- vector("list", length(pcgr_files))
+pcgr_audit <- vector("list", length(pcgr_files))
+
+for (i in seq_along(pcgr_files)) {
+  f <- pcgr_files[i]
+  sample_from_path <- extract_sample_from_path(f)
+
+  sheets <- tryCatch(excel_sheets(f), error = function(e) character())
+  if (!"SOMATIC_SNV_INDEL" %in% sheets) {
+    pcgr_audit[[i]] <- data.table(
+      Sample_key = sample_from_path,
+      File = f,
+      Status = "Missing SOMATIC_SNV_INDEL sheet"
+    )
+    next
+  }
+
+  dt <- tryCatch(
+    as.data.table(read_excel(f, sheet = "SOMATIC_SNV_INDEL", guess_max = 100000)),
+    error = function(e) NULL
+  )
+
+  if (is.null(dt)) {
+    pcgr_audit[[i]] <- data.table(
+      Sample_key = sample_from_path,
+      File = f,
+      Status = "Read error"
+    )
+    next
+  }
+
+  needed <- c("SYMBOL", "GENOMIC_CHANGE", "VAF_TUMOR")
+  if (length(setdiff(needed, names(dt)))) {
+    pcgr_audit[[i]] <- data.table(
+      Sample_key = sample_from_path,
+      File = f,
+      Status = paste("Missing columns:", paste(setdiff(needed, names(dt)), collapse = ","))
+    )
+    next
+  }
+
+  dt <- dt[toupper(clean_text(SYMBOL)) == "CTNNA1"]
+
+  if (!nrow(dt)) {
+    pcgr_audit[[i]] <- data.table(
+      Sample_key = sample_from_path,
+      File = f,
+      Status = "No CTNNA1 row"
+    )
+    next
+  }
+
+  keep_optional <- intersect(
+    c(
+      "SYMBOL", "GENOMIC_CHANGE", "ALTERATION", "PROTEIN_CHANGE",
+      "CONSEQUENCE", "LOSS_OF_FUNCTION", "LOF_FILTER", "VAF_TUMOR",
+      "DP_TUMOR", "ONCOGENICITY", "ONCOGENICITY_CODE",
+      "CALL_CONFIDENCE", "MUTATION_HOTSPOT"
+    ),
+    names(dt)
+  )
+
+  dt <- dt[, ..keep_optional]
+  dt[, Sample_key := sample_from_path]
+  dt[, Gene := "CTNNA1"]
+  dt[, Variant_key := vapply(GENOMIC_CHANGE, pcgr_genomic_key, character(1))]
+  dt[, Match_key := paste(Sample_key, Gene, Variant_key, sep = "|")]
+  dt[, VAF_TUMOR_fraction := normalize_vaf(VAF_TUMOR)]
+  dt[, DP_TUMOR_numeric := if ("DP_TUMOR" %in% names(dt)) to_num(DP_TUMOR) else NA_real_]
+  dt[, PCGR_FILE := f]
+
+  pcgr_list[[i]] <- dt
+  pcgr_audit[[i]] <- data.table(
+    Sample_key = sample_from_path,
+    File = f,
+    Status = paste0("CTNNA1 rows: ", nrow(dt))
+  )
+}
+
+pcgr <- rbindlist(pcgr_list, fill = TRUE)
+fwrite(rbindlist(pcgr_audit, fill = TRUE), out_file("CTNNA1_PCGR_file_audit"), sep = "\t")
+
+if (is.null(pcgr) || !nrow(pcgr)) {
+  stop("No CTNNA1 rows were found in the PCGR workbooks.")
+}
+
+# If PCGR contains duplicate annotations for the same variant, retain one row
+# and combine using the median numeric VAF/depth.
+pcgr_collapsed <- pcgr[, c(
+  list(
+    PCGR_VAF = if (all(is.na(VAF_TUMOR_fraction))) NA_real_ else median(VAF_TUMOR_fraction, na.rm = TRUE),
+    PCGR_Depth = if (all(is.na(DP_TUMOR_numeric))) NA_real_ else median(DP_TUMOR_numeric, na.rm = TRUE),
+    PCGR_FILE = paste(unique(PCGR_FILE), collapse = ";")
+  ),
+  lapply(.SD, function(x) paste(unique(na.omit(as.character(x))), collapse = ";"))
+), by = .(Match_key, Sample_key, Gene, Variant_key), .SDcols = setdiff(
+  names(pcgr),
+  c(
+    "Match_key", "Sample_key", "Gene", "Variant_key",
+    "VAF_TUMOR_fraction", "DP_TUMOR_numeric", "PCGR_FILE"
+  )
+)]
+
+# Join MAF variants to PCGR annotations.
+maf_keep <- intersect(
+  c(
+    "Match_key", "Sample_key", "Tumor_Sample_Barcode", "Gene",
+    "Chromosome_clean", "Position", "Start_Position", "End_Position",
+    "Reference_Allele", "Tumor_Seq_Allele2", "Variant_key",
+    "Variant_Classification", "HGVSc", "HGVSp", "HGVSp_Short"
+  ),
+  names(ctnna1)
+)
+
+result <- merge(
+  unique(ctnna1[, ..maf_keep]),
+  pcgr_collapsed,
+  by = c("Match_key", "Sample_key", "Gene", "Variant_key"),
+  all.x = TRUE,
+  sort = FALSE
+)
+
+result[, PCGR_Match_Status := fifelse(
+  is.na(PCGR_VAF),
+  "No matched numeric PCGR VAF",
+  "Matched"
+)]
+
+fwrite(result, out_file("CTNNA1_Tier1_PCGR_VAF_audit"), sep = "\t", quote = FALSE, na = "")
+
+# -------------------------------
+# 3. Read FACETS purity RDS and CTNNA1 gene-level copy number
+# -------------------------------
+
+if (!dir.exists(FACETS_DIR)) stop("FACETS result directory not found: ", FACETS_DIR)
+
+purity_rds_files <- list.files(
+  FACETS_DIR,
+  pattern = "_purity\\.rds$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+if (!length(purity_rds_files)) {
+  stop("No *_purity.rds files found under: ", FACETS_DIR)
+}
+
+facets_list <- vector("list", length(purity_rds_files))
+facets_audit <- vector("list", length(purity_rds_files))
+
+for (i in seq_along(purity_rds_files)) {
+  rds_file <- purity_rds_files[i]
+  sample_id <- sub("_purity\\.rds$", "", basename(rds_file), ignore.case = TRUE)
+  sample_key <- clean_sample(sample_id)
+
+  gene_file <- file.path(
+    dirname(rds_file),
+    paste0(sample_id, ".gene_level.txt")
+  )
+
+  x <- tryCatch(readRDS(rds_file), error = function(e) NULL)
+
+  if (is.null(x) || !is.list(x)) {
+    facets_audit[[i]] <- data.table(
+      Sample_key = sample_key,
+      Purity_RDS = rds_file,
+      Gene_Level_File = gene_file,
+      Status = "Could not read purity RDS"
+    )
+    next
+  }
+
+  if (!file.exists(gene_file)) {
+    facets_audit[[i]] <- data.table(
+      Sample_key = sample_key,
+      Purity_RDS = rds_file,
+      Gene_Level_File = gene_file,
+      Status = "Missing gene-level file"
+    )
+    next
+  }
+
+  gene_dt <- tryCatch(fread(gene_file, data.table = TRUE), error = function(e) NULL)
+
+  if (is.null(gene_dt) || !nrow(gene_dt) ||
+      !all(c("gene", "tcn.em", "lcn.em", "cf.em") %in% names(gene_dt))) {
+    facets_audit[[i]] <- data.table(
+      Sample_key = sample_key,
+      Purity_RDS = rds_file,
+      Gene_Level_File = gene_file,
+      Status = "Unreadable gene-level file or missing gene/tcn.em/lcn.em/cf.em"
+    )
+    next
+  }
+
+  gene_hit <- gene_dt[toupper(clean_text(gene)) == "CTNNA1"]
+
+  if (!nrow(gene_hit)) {
+    facets_audit[[i]] <- data.table(
+      Sample_key = sample_key,
+      Purity_RDS = rds_file,
+      Gene_Level_File = gene_file,
+      Status = "CTNNA1 absent from gene-level file"
+    )
+    next
+  }
+
+  # Normally one CTNNA1 row is expected. Prefer PASS and a row not spanning
+  # multiple segments if the annotation file contains duplicates.
+  if ("filter" %in% names(gene_hit)) {
+    gene_hit[, filter_rank := fifelse(toupper(clean_text(filter)) == "PASS", 0L, 1L)]
+  } else {
+    gene_hit[, filter_rank := 0L]
+  }
+
+  if ("spans_segs" %in% names(gene_hit)) {
+    spans_value <- tolower(clean_text(gene_hit$spans_segs))
+    gene_hit[, spans_rank := fifelse(spans_value %in% c("true", "t", "1", "yes"), 1L, 0L)]
+  } else {
+    gene_hit[, spans_rank := 0L]
+  }
+
+  setorder(gene_hit, filter_rank, spans_rank)
+  gene_hit <- gene_hit[1]
+
+  get_optional <- function(column, default = NA) {
+    if (column %in% names(gene_hit)) gene_hit[[column]][1] else default
+  }
+
+  purity_value <- if (!is.null(x$purity) && length(x$purity)) {
+    as.numeric(x$purity[1])
+  } else {
+    NA_real_
+  }
+
+  ploidy_value <- if (!is.null(x$ploidy) && length(x$ploidy)) {
+    as.numeric(x$ploidy[1])
+  } else {
+    NA_real_
+  }
+
+  facets_list[[i]] <- data.table(
+    Sample_key = sample_key,
+    FACETS_Purity = purity_value,
+    FACETS_Ploidy = ploidy_value,
+    FACETS_Flags = paste(x$flags, collapse = ";"),
+    FACETS_EM_Flags = paste(x$em_flags, collapse = ";"),
+    FACETS_Genome = "hg19",
+    CTNNA1_FACETS_Chromosome = as.character(get_optional("chrom")),
+    CTNNA1_Gene_Start_hg19 = to_num(get_optional("gene_start")),
+    CTNNA1_Gene_End_hg19 = to_num(get_optional("gene_end")),
+    FACETS_Segment_Start_hg19 = to_num(get_optional("seg_start")),
+    FACETS_Segment_End_hg19 = to_num(get_optional("seg_end")),
+    FACETS_Total_CN = to_num(get_optional("tcn.em")),
+    FACETS_Minor_CN = to_num(get_optional("lcn.em")),
+    FACETS_Segment_CF = to_num(get_optional("cf.em")),
+    FACETS_CN_State = as.character(get_optional("cn_state")),
+    FACETS_Filter = as.character(get_optional("filter")),
+    FACETS_Spans_Segments = as.character(get_optional("spans_segs")),
+    FACETS_Purity_RDS = rds_file,
+    FACETS_Gene_Level_File = gene_file
+  )
+
+  facets_audit[[i]] <- data.table(
+    Sample_key = sample_key,
+    Purity_RDS = rds_file,
+    Gene_Level_File = gene_file,
+    Status = "CTNNA1 purity and copy-number data read"
+  )
+}
+
+facets_dt <- rbindlist(facets_list, fill = TRUE)
+facets_audit_dt <- rbindlist(facets_audit, fill = TRUE)
+
+fwrite(
+  facets_audit_dt,
+  out_file("CTNNA1_FACETS_file_audit"),
+  sep = "\t",
+  quote = FALSE,
+  na = ""
+)
+
+if (is.null(facets_dt) || !nrow(facets_dt)) {
+  stop("No usable CTNNA1 FACETS purity/copy-number records were found.")
+}
+
+# Gene-level matching is intentional: FACETS is hg19 and PCGR/MAF is GRCh38.
+# Never directly overlap their genomic coordinates without liftover.
+result <- merge(result, facets_dt, by = "Sample_key", all.x = TRUE, sort = FALSE)
+
+result[, LOH := fcase(
+  is.na(FACETS_Minor_CN), "Unknown",
+  FACETS_Minor_CN < 0.5, "Yes",
+  default = "No"
+)]
+
+result[, FACETS_Low_Purity_Flag := grepl(
+  "low purity",
+  FACETS_EM_Flags,
+  ignore.case = TRUE
+)]
+
+result[is.na(FACETS_EM_Flags), FACETS_Low_Purity_Flag := NA]
+
+# -------------------------------
+# 4. Estimate mutation CCF and call clonality
+# -------------------------------
+
+ccf_list <- lapply(seq_len(nrow(result)), function(i) {
+  estimate_ccf(
+    vaf = result$PCGR_VAF[i],
+    depth = result$PCGR_Depth[i],
+    purity = result$FACETS_Purity[i],
+    total_cn = result$FACETS_Total_CN[i]
+  )
+})
+
+ccf_dt <- rbindlist(ccf_list, fill = TRUE)
+result <- cbind(result, ccf_dt)
+
+# Do not issue a firm call where CTNNA1 spans more than one FACETS segment.
+spans_true <- tolower(clean_text(result$FACETS_Spans_Segments)) %in%
+  c("true", "t", "1", "yes")
+
+result[spans_true == TRUE, `:=`(
+  Clonality = "Indeterminate",
+  Clonality_Note = paste0(
+    "CTNNA1 spans multiple FACETS segments; ",
+    "mutation-level hg19 liftover is required"
+  )
+)]
+
+result[, Missing_Data := apply(
+  .SD,
+  1,
+  function(z) paste(names(z)[is.na(z)], collapse = ";")
+), .SDcols = c("PCGR_VAF", "PCGR_Depth", "FACETS_Purity", "FACETS_Total_CN")]
+
+setorder(result, Sample_key, Position)
+
+fwrite(
+  result,
+  out_file("CTNNA1_clonality_results"),
+  sep = "\t",
+  quote = FALSE,
+  na = ""
+)
+
+summary <- result[, .(
+  CTNNA1_Variants = .N,
+  CTNNA1_Mutated_Samples = uniqueN(Sample_key),
+  Variants_With_PCGR_VAF = sum(!is.na(PCGR_VAF)),
+  Variants_With_FACETS_Purity_CN = sum(
+    !is.na(FACETS_Purity) & !is.na(FACETS_Total_CN)
+  ),
+  Clonal = sum(Clonality == "Clonal", na.rm = TRUE),
+  Subclonal = sum(Clonality == "Subclonal", na.rm = TRUE),
+  Likely_clonal = sum(Clonality == "Likely_clonal", na.rm = TRUE),
+  Likely_subclonal = sum(Clonality == "Likely_subclonal", na.rm = TRUE),
+  Indeterminate = sum(Clonality == "Indeterminate", na.rm = TRUE),
+  CTNNA1_with_LOH = sum(LOH == "Yes", na.rm = TRUE),
+  FACETS_Low_Purity_Flagged = sum(FACETS_Low_Purity_Flag == TRUE, na.rm = TRUE)
+)]
+
+fwrite(summary, out_file("CTNNA1_clonality_cohort_summary"), sep = "\t")
+
+cat("\nCTNNA1 clonality analysis completed.\n")
+cat("FACETS source: *_purity.rds plus *.gene_level.txt (hg19)\n")
+cat("PCGR/MAF source: GRCh38; matched to FACETS by sample and gene, not coordinates.\n\n")
+print(summary)
+cat("\nMain result:\n", out_file("CTNNA1_clonality_results"), "\n", sep = "")
+cat("Summary:\n", out_file("CTNNA1_clonality_cohort_summary"), "\n", sep = "")
+
+```

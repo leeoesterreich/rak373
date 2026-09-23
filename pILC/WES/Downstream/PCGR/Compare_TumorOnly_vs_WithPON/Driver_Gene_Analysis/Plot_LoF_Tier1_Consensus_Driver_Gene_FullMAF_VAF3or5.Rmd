@@ -1,0 +1,236 @@
+---
+title: "Plot_LoF_Tier1_Consensus_Driver_Gene_FullMAF_VAF3or5"
+output: html_document
+date: "2026-09-21"
+---
+# Lollipop plot of predicted loss-of-function mutations in consensus candidate driver genes
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r}
+# Plot predicted LoF-positive samples among Tier 1 common mutated samples.
+# Run AFTER the corrected PCGR extraction script. No oncogenicity filter is used.
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+})
+set.seed(42)
+
+# ---- EDIT THESE PATHS if your output location or extraction date differs ----
+BASE_DIR <- paste0(
+  "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/",
+  "Compare_TumorOnly_vs_WithPON/Driver_Gene_Analysis/",
+  "MultiTool_Consensus_29_Genes"
+)
+EXTRACTION_DATE <- "2026-09-21"
+
+# Change only this line to switch between the upstream VAF >=3% and >=5%
+# Full-MAF gene-frequency lists. This script does not calculate or apply
+# an additional VAF cutoff from MAF rows.
+MIN_VAF_PERCENT <- 3
+VAF_TAG <- paste0("VAFge", MIN_VAF_PERCENT, "pct")
+VAF_LABEL <- paste0("VAF ≥", MIN_VAF_PERCENT, "%")
+
+full_maf_gene_list_date <- switch(
+  as.character(MIN_VAF_PERCENT),
+  "3" = "2026-09-21",
+  "5" = "2026-09-23",
+  stop("MIN_VAF_PERCENT must be 3 or 5.")
+)
+
+FULL_MAF_GENE_LIST_FILE <- file.path(
+  "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Compare_TumorOnly_vs_WithPON/maftools/Tier_1_common/Combined_MAF",
+  paste0(
+    "Full_MAF_nonsilent_",
+    VAF_TAG,
+    "_gene_mutation_frequency_",
+    full_maf_gene_list_date,
+    ".tsv"
+  )
+)
+
+PCGR_FILE <- file.path(BASE_DIR, paste0(
+  "MultiTool_Consensus_29_Genes_Tier1_common_PCGR_", EXTRACTION_DATE, ".tsv"))
+MAF_AUDIT_FILE <- sub("\\.tsv$", "_MAF_match_audit.tsv", PCGR_FILE)
+OUT_DIR <- file.path(BASE_DIR, "LoF_Tier1_common_FullMAF", VAF_TAG)
+RUN_DATE <- format(Sys.Date(), "%Y-%m-%d")
+dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+output <- function(suffix) file.path(OUT_DIR, paste0("LoF_Tier1_common_", RUN_DATE, suffix))
+
+if (!file.exists(PCGR_FILE) || !file.exists(MAF_AUDIT_FILE) || !file.exists(FULL_MAF_GENE_LIST_FILE)) {
+  stop("Input file missing. Check BASE_DIR, EXTRACTION_DATE, and FULL_MAF_GENE_LIST_FILE.")
+}
+p <- fread(PCGR_FILE, na.strings = c("", "NA"))
+m <- fread(MAF_AUDIT_FILE, na.strings = c("", "NA"))
+full_maf_gene_dt <- fread(FULL_MAF_GENE_LIST_FILE, sep = "\t", header = TRUE, data.table = TRUE)
+require_cols <- function(d, cols, label) {
+  missing <- setdiff(cols, names(d))
+  if (length(missing)) stop(label, " missing columns: ", paste(missing, collapse=", "))
+}
+require_cols(p, c("Match_key", "LOSS_OF_FUNCTION"), "PCGR")
+require_cols(m, c("Match_key", "Hugo_Symbol", "Tumor_Sample_Barcode"), "MAF audit")
+require_cols(full_maf_gene_dt, "Hugo_Symbol", "VAF-filtered Full MAF gene list")
+if (!nrow(m)) stop("MAF audit is empty.")
+
+# The VAF threshold is defined upstream by the selected Full MAF gene-frequency
+# list. Keep only consensus-driver genes present in that list; do not apply a second
+# per-variant VAF filter to the MAF audit.
+full_maf_genes <- unique(toupper(trimws(as.character(full_maf_gene_dt$Hugo_Symbol))))
+full_maf_genes <- full_maf_genes[!is.na(full_maf_genes) & full_maf_genes != ""]
+desired_genes <- unique(toupper(trimws(as.character(m$Hugo_Symbol))))
+present_genes <- intersect(desired_genes, full_maf_genes)
+missing_genes <- setdiff(desired_genes, full_maf_genes)
+
+cat("Desired consensus-driver genes:", length(desired_genes), "\n")
+cat("Present in the ", VAF_LABEL, " Full MAF list:", length(present_genes), "\n", sep = "")
+cat("Missing:", length(missing_genes), "\n\n")
+gene_eligibility_audit <- data.table(
+  Hugo_Symbol = sort(desired_genes),
+  Present_in_selected_FullMAF_list = sort(desired_genes) %in% full_maf_genes,
+  Selected_VAF_cutoff = VAF_LABEL
+)
+fwrite(gene_eligibility_audit, output("_gene_eligibility_audit.tsv"), sep = "\t", na = "NA")
+
+m <- m[toupper(trimws(Hugo_Symbol)) %in% full_maf_genes]
+p <- p[Match_key %in% m$Match_key]
+if (!nrow(m)) stop("No MAF-audit variants remain after restricting genes to the ", VAF_LABEL, " Full MAF list.")
+if (!nrow(p)) stop("No matched PCGR variants remain after restricting genes to the ", VAF_LABEL, " Full MAF list.")
+if (anyNA(m$Match_key) || anyNA(p$Match_key)) stop("Missing variant matching keys.")
+if (!all(p$Match_key %in% m$Match_key)) stop("PCGR file includes variants outside the VAF-filtered MAF audit.")
+
+# LOSS_OF_FUNCTION is treated as a binary flag only after inspecting its values.
+# Unknown/unrecognized values NEVER become positive just because nonempty.
+# If your PCGR version uses other codes, verify their definition before editing.
+POSITIVE_VALUES <- c("TRUE", "T", "1", "YES", "Y")
+NEGATIVE_VALUES <- c("FALSE", "F", "0", "NO", "N")
+MISSING_VALUES <- c("", ".", "NA", "N/A", "NAN", "NULL")
+p[, LOF_VALUE := toupper(trimws(as.character(LOSS_OF_FUNCTION)))]
+p[LOF_VALUE %in% MISSING_VALUES, LOF_VALUE := NA_character_]
+value_audit <- p[, .(Variant_records=.N), by=.(LOSS_OF_FUNCTION, LOF_VALUE)]
+print(value_audit)
+fwrite(value_audit, output("_annotation_values.tsv"), sep="\t", na="NA")
+bad <- setdiff(unique(na.omit(p$LOF_VALUE)), c(POSITIVE_VALUES, NEGATIVE_VALUES))
+if (length(bad)) stop("Unrecognized LOSS_OF_FUNCTION values: ", paste(bad, collapse=", "),
+                     ". Check annotation_values.tsv and verify encoding before continuing.")
+p[, LoF := fifelse(is.na(LOF_VALUE), NA, LOF_VALUE %in% POSITIVE_VALUES)]
+
+# Duplicate PCGR records are collapsed by exact matched variant.
+# Conflicting positive/negative annotations require review, not automatic selection.
+conflicts <- p[, .(n_states=uniqueN(LoF[!is.na(LoF)])), by=Match_key][n_states > 1L]
+if (nrow(conflicts)) {
+  fwrite(conflicts, output("_conflicting_annotations.tsv"), sep="\t")
+  stop("Conflicting LoF calls for identical variants; review conflicting_annotations.tsv.")
+}
+variant_calls <- p[, .(LoF=if (all(is.na(LoF))) NA else unique(LoF[!is.na(LoF)])[1]),
+                   by=Match_key]
+variants <- unique(m[, .(Match_key, Hugo_Symbol, Tumor_Sample_Barcode)])
+variants <- merge(variants, variant_calls, by="Match_key", all.x=TRUE, sort=FALSE)
+
+# A sample is positive if ANY retained variant is positive.
+# With no positive and at least one unknown variant, its LoF status is unknown.
+samples <- variants[, .(
+  LoF_positive=any(LoF %in% TRUE),
+  Has_unknown_variant=any(is.na(LoF)),
+  Retained_variants=.N
+), by=.(Hugo_Symbol, Tumor_Sample_Barcode)]
+samples[, LoF_status := fifelse(LoF_positive, "positive",
+  fifelse(Has_unknown_variant, "unknown", "negative"))]
+summary <- samples[, .(
+  Mutated_samples=.N,
+  LoF_positive_samples=sum(LoF_status == "positive"),
+  LoF_negative_samples=sum(LoF_status == "negative"),
+  LoF_unknown_samples=sum(LoF_status == "unknown"),
+  Samples_with_any_unknown_variant=sum(Has_unknown_variant)
+), by=Hugo_Symbol]
+stopifnot(all(summary$LoF_positive_samples + summary$LoF_negative_samples +
+              summary$LoF_unknown_samples == summary$Mutated_samples))
+# Gene role comes from PCGR gene-level flags, NOT variant ONCOGENICITY.
+require_cols(p, c("ONCOGENE", "TUMOR_SUPPRESSOR"), "PCGR gene-role annotations")
+parse_role_flag <- function(x, field) {
+  v <- toupper(trimws(as.character(x)))
+  v[v %in% MISSING_VALUES] <- NA_character_
+  bad <- setdiff(unique(na.omit(v)), c(POSITIVE_VALUES, NEGATIVE_VALUES))
+  if (length(bad)) stop("Unrecognized ", field, " values: ", paste(bad, collapse=", "),
+                       ". Verify flag encoding before assigning gene roles.")
+  fifelse(is.na(v), NA, v %in% POSITIVE_VALUES)
+}
+p[, Oncogene_flag := parse_role_flag(ONCOGENE, "ONCOGENE")]
+p[, TSG_flag := parse_role_flag(TUMOR_SUPPRESSOR, "TUMOR_SUPPRESSOR")]
+# Resolve gene identities through the same MAF matching keys used for LoF counts.
+role_rows <- merge(unique(m[, .(Match_key, Hugo_Symbol)]),
+                   p[, .(Match_key, Oncogene_flag, TSG_flag)],
+                   by="Match_key", all.x=TRUE, allow.cartesian=TRUE)
+roles <- role_rows[, .(
+  Is_oncogene=any(Oncogene_flag %in% TRUE),
+  Is_TSG=any(TSG_flag %in% TRUE),
+  Oncogene_flag_conflict=uniqueN(Oncogene_flag[!is.na(Oncogene_flag)]) > 1L,
+  TSG_flag_conflict=uniqueN(TSG_flag[!is.na(TSG_flag)]) > 1L,
+  Role_annotation_available=any(!is.na(Oncogene_flag) | !is.na(TSG_flag))
+), by=Hugo_Symbol]
+roles[, Gene_role := fifelse(Is_oncogene & Is_TSG, "Both oncogene and TSG",
+  fifelse(Is_TSG, "Tumor suppressor", fifelse(Is_oncogene, "Oncogene", "Other/Unclassified")))]
+fwrite(roles, output("_gene_role_audit.tsv"), sep="\t", na="NA")
+if (any(roles$Oncogene_flag_conflict | roles$TSG_flag_conflict)) {
+  stop("Inconsistent gene-role flags across PCGR records; review gene_role_audit.tsv.")
+}
+summary <- merge(summary, roles, by="Hugo_Symbol", all.x=TRUE, sort=FALSE)
+role_levels <- c("Tumor suppressor", "Oncogene", "Other/Unclassified", "Both oncogene and TSG")
+summary[, Gene_role := factor(Gene_role, levels=role_levels)]
+role_colours <- c("Tumor suppressor"="#1F77B4", "Oncogene"="#FF7F0E",
+                  "Other/Unclassified"="#2CA02C", "Both oncogene and TSG"="#9467BD")
+role_shapes <- c("Tumor suppressor"=15, "Oncogene"=17,
+                 "Other/Unclassified"=16, "Both oncogene and TSG"=18)
+
+summary[, LoF_percent_of_mutated := 100 * LoF_positive_samples / Mutated_samples]
+setorder(summary, -LoF_positive_samples, -Mutated_samples, Hugo_Symbol)
+summary[, Label := paste0(LoF_positive_samples, "/", Mutated_samples,
+                         fifelse(LoF_unknown_samples > 0, "*", ""))]
+fwrite(summary, output("_gene_summary.tsv"), sep="\t", na="NA")
+fwrite(samples, output("_sample_audit.tsv"), sep="\t", na="NA")
+fwrite(variants, output("_variant_audit.tsv"), sep="\t", na="NA")
+cat("\nCDH1 counts (calculated, never hard-coded):\n")
+print(summary[Hugo_Symbol == "CDH1"])
+
+# Each gene's marker position is LoF-positive SAMPLE count.
+# All markers use the same size; shape and colour indicate PCGR gene role.
+summary[, Gene_plot := factor(Hugo_Symbol, levels=rev(Hugo_Symbol))]
+unknown_note <- if (any(summary$LoF_unknown_samples > 0)) {
+  "* Some mutated samples have unknown LoF status; see sample audit. Positive counts may be incomplete."
+} else {
+  "Each sample is counted once per gene. LoF status uses the PCGR LOSS_OF_FUNCTION flag."
+}
+plot <- ggplot(summary, aes(y=Gene_plot)) +
+  geom_segment(aes(x=0, xend=LoF_positive_samples, yend=Gene_plot),
+               colour="#2878A5", linewidth=0.6) +
+  geom_point(aes(x=LoF_positive_samples, colour=Gene_role, shape=Gene_role),
+             size=4.5) +
+  scale_colour_manual(name="PCGR gene role", values=role_colours, drop=TRUE) +
+  scale_shape_manual(name="PCGR gene role", values=role_shapes, drop=TRUE) +
+  geom_text(aes(x=LoF_positive_samples, label=Label),
+            nudge_x=0.6, hjust=0, size=3.6, colour="black") +
+  scale_x_continuous(limits=c(0, max(summary$LoF_positive_samples)+5),
+                     breaks=function(lim) pretty(lim)[pretty(lim) >= 0],
+                     expand=expansion(mult=c(0.015,0.02))) +
+  labs(title=paste0("Predicted loss-of-function mutations in consensus candidate driver genes (", VAF_LABEL, ")"),
+       subtitle=paste0("Candidate driver genes; Tier 1 common variants only\n",
+                       "Labels: LoF-positive samples / samples with any retained mutation"),
+       x="Samples with at least one predicted LoF mutation (n)", y=NULL,
+       caption=unknown_note) +
+  theme_classic(base_size=12) +
+  theme(text=element_text(colour="black"),
+        axis.text=element_text(colour="black"),
+        plot.title=element_text(face="bold", size=14),
+        plot.subtitle=element_text(size=11),
+        plot.caption=element_text(hjust=0, size=9),
+        panel.grid.major.x=element_line(colour="grey90", linewidth=0.3),
+        plot.margin=margin(25,35,25,25), legend.position="bottom")
+height <- max(7, 3 + 0.30*nrow(summary))
+ggsave(output(".pdf"), plot=plot, width=11, height=height, units="in")
+ggsave(output(".png"), plot=plot, width=11, height=height, units="in", dpi=300, bg="white")
+cat("\nSaved plot and audit tables to:\n", OUT_DIR, "\n")
+# Predicted LoF does not establish biallelic loss or functional validation.
+# This figure does not count oncogenic variants or apply LOF_FILTER thresholds.
+
+```
+
