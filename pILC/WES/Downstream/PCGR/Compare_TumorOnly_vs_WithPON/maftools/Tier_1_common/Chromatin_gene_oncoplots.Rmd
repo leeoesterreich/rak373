@@ -1,0 +1,2006 @@
+---
+title: "Chromatin_gene_oncoplots"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    theme: readable
+date: "2026-09-24"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(readxl)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(grid)
+})
+
+set.seed(42)
+graphics.off()
+gc()
+```
+
+# Oncoplots of chromatin genes: RNA leading-edge and curated sets
+
+This Rmd plots somatic mutations (WES) in two chromatin gene lists:
+
+- **Leading-edge genes**: rows of the RNA-seq leading-edge heatmap (RNA-selected).
+- **Curated chromatin genes**: all 241 genes of the 15 curated sets, shown as one
+  combined oncoplot and one oncoplot per biological module (7 modules). This list
+  is defined a priori and does not depend on the RNA clusters.
+
+Final figures: two oncoplots (leading-edge genes; all curated genes), rows
+ordered by mutation frequency, mutated genes only, columns grouped by RNA NMF
+cluster (WES-only tumors shown as "No RNA") with TP order within each group.
+
+A gene-level audit records, for every requested gene, the first filter that
+removed it (no variant, only silent, VAF not matched, VAF <5%) or that it was plotted.
+
+Inputs and logic:
+
+1. **Genes**: the top leading-edge genes are re-derived from
+   `fgsea_leading_edge_genes_<date>.tsv` using exactly the same ranking as the
+   RNA script (comparison count > cluster count > pathway count > minimum FDR).
+2. **Gene eligibility**: genes must be present in the nonsilent VAF >=5% gene
+   mutation-frequency table.
+3. **Cells**: sample x gene mutation calls come from the MAF (the frequency table
+   is gene-level and cannot define cells). The MAF has no VAF column, so VAF is
+   taken from the PCGR VAF match-audit table written by the upstream
+   TopGenes script (PCGR VAF_TUMOR matched by sample|gene|genomic-variant key).
+   The same nonsilent classes (including Splice_Region) and VAF >=0.05 filter are
+   applied, so cells reproduce the frequency table; concordance is checked.
+4. **Plot style**: identical to the functional-category oncoplot script
+   (Multi_Hit, PCGR oncogenicity symbols, top/right stacked barplots, bottom
+   clinical tracks, TP sample order).
+
+Interpretation: leading-edge genes were selected from RNA expression. This plot
+shows whether they are also mutated; it does not show that mutations cause the
+expression differences.
+
+```{r paths_and_settings}
+# ============================================================
+# Paths
+# ============================================================
+
+# MAF providing sample-level mutation calls.
+# IMPORTANT: this should be the MAF that generated the frequency table below.
+# The concordance table written later confirms whether they agree.
+maf_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Compare_TumorOnly_vs_WithPON/maftools/Tier_1_common/Combined_MAF/Tier_1_common_all_samples.combined.maf"
+
+# Gene-level nonsilent VAF >=5% mutation-frequency table (defines eligible genes).
+gene_freq_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Compare_TumorOnly_vs_WithPON/maftools/Tier_1_common/Combined_MAF/Full_MAF_nonsilent_VAFge5pct_gene_mutation_frequency_2026-09-23.tsv"
+
+# Variant-level PCGR VAF match audit written by the SAME upstream run
+# (same date as the frequency table). Provides VAF_TUMOR_fraction per MAF row.
+vaf_audit_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Compare_TumorOnly_vs_WithPON/maftools/Tier_1_common/Combined_MAF/Full_MAF_nonsilent_variant_PCGR_VAF_match_audit_2026-09-23.tsv"
+
+# Output root of the focused chromatin pathway (RNA-seq) analysis.
+chromatin_out_root <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/Downstream/Focused_Chromatin_Pathway_Analysis"
+
+# NA = automatically use the most recent dated run folder.
+# To use a specific run, set e.g.
+# CHROMATIN_RUN_DIR <- file.path(chromatin_out_root, "pILC_Focused_Chromatin_Pathway_Analysis_2026-09-24")
+CHROMATIN_RUN_DIR <- NA_character_
+
+pcgr_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/With_PON/pcgr_outputs"
+
+clinical_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/Clinical_correlation/pILC_ClinicoPathological_details.csv"
+
+# ============================================================
+# Settings
+# ============================================================
+
+# ------------------------------------------------------------
+# Which gene lists to plot
+# ------------------------------------------------------------
+# Leading-edge genes: RNA-selected (rows of the leading-edge heatmap).
+RUN_LEADING_EDGE <- TRUE
+N_LEADING_EDGE_GENES <- 75L   # same as the RNA script
+
+# Curated chromatin genes: all 241 genes of the 15 curated sets, independent
+# of the RNA clusters. Produces one combined plot plus one plot per module.
+RUN_CURATED <- TRUE
+
+# Also make one oncoplot per curated module (7 extra plots).
+# FALSE = the two final oncoplots only (leading-edge + all curated genes).
+RUN_CURATED_MODULES <- FALSE
+
+# Column order for all oncoplots:
+# TRUE  = grouped by RNA NMF cluster (1, 2, 3, then WES-only "No RNA"),
+#         TP order within each group, with an RNA-cluster bar on top.
+# FALSE = TP order only (original style).
+ORDER_BY_RNA_CLUSTER <- TRUE
+
+# NMF cluster membership used in the RNA analysis (k = 3).
+cluster_gct_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/NMF/GenePattern_NMFConsensus/vst_transformed_data.consensus.k.3.gct"
+
+# Same cluster colors as the RNA heatmaps; grey for tumors without RNA-seq.
+rna_cluster_colors <- c(
+  "Cluster 1" = "#1B9E77",
+  "Cluster 2" = "#D95F02",
+  "Cluster 3" = "#7570B3",
+  "No RNA"    = "#BDBDBD"
+)
+
+# Flag MAF symbols that are older aliases of a gene in the lists
+# (requires AnnotationDbi + org.Hs.eg.db).
+CHECK_SYMBOL_ALIASES <- TRUE
+
+# Same VAF threshold and nonsilent classes as the upstream TopGenes script,
+# so the oncoplot cells reproduce the frequency table exactly.
+MIN_VAF <- 0.05
+MIN_VAF_PERCENT <- 100 * MIN_VAF
+
+nonsilent_classes <- c(
+  "Missense_Mutation",
+  "Nonsense_Mutation",
+  "Nonstop_Mutation",
+  "Frame_Shift_Del",
+  "Frame_Shift_Ins",
+  "In_Frame_Del",
+  "In_Frame_Ins",
+  "Splice_Site",
+  "Splice_Region",
+  "Translation_Start_Site"
+)
+VAF_TAG <- paste0("VAFge", MIN_VAF_PERCENT, "pct")
+VAF_LABEL <- paste0("VAF \u2265", MIN_VAF_PERCENT, "%")
+
+out_dir <- file.path(
+  "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Compare_TumorOnly_vs_WithPON/maftools/Tier_1_common/plots/Chromatin_gene_oncoplots",
+  VAF_TAG
+)
+table_dir <- file.path(out_dir, "tables")
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(table_dir, recursive = TRUE, showWarnings = FALSE)
+
+# If TRUE, unmatched variants can still receive cell-level annotation
+# using Sample + Gene from PCGR (useful for splice-site rows without HGVSp).
+allow_sample_gene_fallback <- TRUE
+
+# PNG rendering can be slow for ComplexHeatmap.
+SAVE_PNG <- TRUE
+
+# Stop early if an input is missing.
+input_files <- c(
+  maf_file = maf_file,
+  gene_freq_file = gene_freq_file,
+  vaf_audit_file = vaf_audit_file,
+  clinical_file = clinical_file
+)
+missing_inputs <- names(input_files)[!file.exists(input_files)]
+if (length(missing_inputs) > 0) {
+  stop("Input file(s) not found:\n",
+       paste0(missing_inputs, ": ", input_files[missing_inputs], collapse = "\n"))
+}
+```
+
+```{r colors}
+# ============================================================
+# Colors (identical to the functional-category oncoplot script)
+# ============================================================
+
+grade_cols <- c(
+  "Grade I" = "#A6CEE3",
+  "Grade II" = "#33A02C",
+  "Grade III" = "#1F78B4",
+  "Cell type not determined" = "#E31A1C",
+  "Unknown" = "#BDBDBD"
+)
+
+binary_receptor_cols <- c(
+  "Negative" = "#1F78B4",
+  "Positive" = "#E31A1C",
+  "Unknown"  = "#BDBDBD"
+)
+
+base_mutation_colors <- c(
+  "Missense_Mutation"       = "#1F77B4",
+  "Nonsense_Mutation"       = "#D62728",
+  "Frame_Shift_Del"         = "#9467BD",
+  "Frame_Shift_Ins"         = "#8C564B",
+  "In_Frame_Del"            = "#2CA02C",
+  "In_Frame_Ins"            = "#17BECF",
+  "Splice_Site"             = "#FF7F0E",
+  "Splice_Region"           = "#FFBB78",   # counted as nonsilent upstream
+  "Translation_Start_Site"  = "#E377C2",
+  "Nonstop_Mutation"        = "#BCBD22",
+  "Multi_Hit"               = "#000000"
+)
+
+get_mutation_colors <- function(types) {
+  types <- unique(types)
+  types <- types[!is.na(types) & types != ""]
+
+  known <- intersect(types, names(base_mutation_colors))
+  missing <- setdiff(types, names(base_mutation_colors))
+
+  cols <- base_mutation_colors[known]
+
+  if (length(missing) > 0) {
+    extra_cols <- hcl.colors(length(missing), palette = "Dark 3")
+    names(extra_cols) <- missing
+    cols <- c(cols, extra_cols)
+  }
+
+  cols[types]
+}
+```
+
+```{r helper_functions}
+# ============================================================
+# Helper functions (same as the functional-category script,
+# plus a VAF helper)
+# ============================================================
+
+clean_key <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+  x[x %in% c("", ".", "NA", "N/A", "nan", "NaN")] <- NA_character_
+  toupper(x)
+}
+
+clean_sample <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+
+  # Clinical file has TP03-117; MAF/PCGR may have TP03-117_T
+  x <- sub("_T$", "", x)
+  x <- sub("-T$", "", x)
+  x <- sub("\\.T$", "", x)
+
+  toupper(x)
+}
+
+natural_sample_order <- function(samples) {
+  samples <- unique(as.character(samples))
+
+  sample_clean <- sub("_T$", "", samples)
+  tp_num <- suppressWarnings(as.integer(sub("^TP([0-9]+).*", "\\1", sample_clean)))
+  tp_num[is.na(tp_num)] <- 9999L
+
+  rest <- sub("^TP[0-9]+[-_]*", "", sample_clean)
+
+  samples[order(tp_num, rest, samples)]
+}
+
+clean_hgv <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+  x[x %in% c("", ".", "NA", "N/A", "nan", "NaN")] <- NA_character_
+  x <- sub(".*:", "", x)
+  toupper(x)
+}
+
+normalize_oncogenicity <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+  x <- gsub("[ -]+", "_", x)
+  x <- toupper(x)
+
+  out <- rep(NA_character_, length(x))
+  out[x == "ONCOGENIC"] <- "Oncogenic"
+  out[x == "LIKELY_ONCOGENIC"] <- "Likely_Oncogenic"
+
+  out
+}
+
+normalize_colname <- function(x) {
+  toupper(gsub("[^A-Za-z0-9]", "", x))
+}
+
+find_col <- function(cols, candidates) {
+  ncols <- normalize_colname(cols)
+  ncand <- normalize_colname(candidates)
+
+  hit <- match(ncand, ncols)
+  hit <- hit[!is.na(hit)]
+
+  if (length(hit) > 0) {
+    return(cols[hit[1]])
+  } else {
+    return(NA_character_)
+  }
+}
+
+get_col_or_na <- function(dt, candidates) {
+  col <- find_col(colnames(dt), candidates)
+
+  if (is.na(col)) {
+    return(rep(NA_character_, nrow(dt)))
+  } else {
+    return(as.character(dt[[col]]))
+  }
+}
+
+safe_file_name <- function(x) {
+  x <- gsub("[^A-Za-z0-9]+", "_", x)
+  x <- gsub("_+", "_", x)
+  x <- gsub("^_|_$", "", x)
+  x
+}
+
+parse_percent_value <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+
+  x[x %in% c("", "NA", "N/A", "NaN", "nan")] <- NA_character_
+
+  is_less_than <- grepl("^<", x)
+
+  val <- suppressWarnings(
+    as.numeric(gsub("[^0-9.]", "", x))
+  )
+
+  val[is_less_than & !is.na(val)] <- val[is_less_than & !is.na(val)] / 2
+
+  return(val)
+}
+
+clean_receptor_status <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+  x <- gsub("\\s+", " ", x)
+
+  out <- rep("Unknown", length(x))
+
+  out[grepl("^Positive", x, ignore.case = TRUE)] <- "Positive"
+  out[grepl("^Negative", x, ignore.case = TRUE)] <- "Negative"
+
+  out[x %in% c("", "NA", "N/A", "NaN", "nan") | is.na(x)] <- "Unknown"
+
+  return(out)
+}
+
+clean_grade_status <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+  x <- gsub("\\s+", " ", x)
+
+  out <- x
+  out[x %in% c("", "NA", "N/A", "NaN", "nan") | is.na(x)] <- "Unknown"
+
+  return(out)
+}
+
+# ------------------------------------------------------------
+# Variant-key helpers COPIED UNCHANGED from the upstream TopGenes script.
+# They must stay identical so Match_key agrees with the VAF audit table.
+# (Separate names avoid clashing with clean_sample() used for clinical matching.)
+# ------------------------------------------------------------
+
+vaf_clean_sample <- function(x) {
+  x <- toupper(trimws(as.character(x)))
+  x <- sub("(_T|-T|\\.T)$", "", x)
+  x[x %in% c("", ".", "NA", "N/A")] <- NA_character_
+  x
+}
+
+vaf_clean_gene <- function(x) {
+  x <- toupper(trimws(as.character(x)))
+  x[x %in% c("", ".", "NA", "N/A")] <- NA_character_
+  x
+}
+
+# Consistent genomic-allele key. MAF insertions with REF="-" use the left-flank
+# coordinate, so the inserted sequence begins at Start_Position + 1.
+edit_key <- function(chr, pos, ref, alt, maf_format = FALSE) {
+  chr <- sub("^CHR", "", toupper(trimws(as.character(chr))))
+  pos <- suppressWarnings(as.integer(pos))
+  ref <- toupper(trimws(as.character(ref)))
+  alt <- toupper(trimws(as.character(alt)))
+
+  if (anyNA(c(chr, pos, ref, alt)) ||
+      !nzchar(chr) || pos < 1L ||
+      !grepl("^([ACGTN]+|-)$", ref) ||
+      !grepl("^([ACGTN]+|-)$", alt)) {
+    return(NA_character_)
+  }
+
+  if (maf_format && ref == "-") {
+    pos <- pos + 1L
+  }
+
+  if (ref == "-") ref <- ""
+  if (alt == "-") alt <- ""
+
+  # Remove identical suffixes.
+  while (nzchar(ref) && nzchar(alt) &&
+         substr(ref, nchar(ref), nchar(ref)) ==
+           substr(alt, nchar(alt), nchar(alt))) {
+    ref <- substr(ref, 1, nchar(ref) - 1L)
+    alt <- substr(alt, 1, nchar(alt) - 1L)
+  }
+
+  # Remove identical prefixes and shift the position.
+  while (nzchar(ref) && nzchar(alt) &&
+         substr(ref, 1, 1) == substr(alt, 1, 1)) {
+    ref <- substring(ref, 2)
+    alt <- substring(alt, 2)
+    pos <- pos + 1L
+  }
+
+  if (!nzchar(ref) && !nzchar(alt)) {
+    return(NA_character_)
+  }
+
+  paste(
+    chr,
+    pos,
+    ifelse(nzchar(ref), ref, "-"),
+    ifelse(nzchar(alt), alt, "-"),
+    sep = ":"
+  )
+}
+```
+
+```{r leading_edge_genes}
+# ============================================================
+# Gene list 1: genes shown in the RNA leading-edge heatmap
+# ============================================================
+
+heatmap_genes <- character()
+leading_edge_file <- NA_character_
+
+if (isTRUE(RUN_LEADING_EDGE)) {
+
+  # Locate the chromatin analysis run folder.
+  if (is.na(CHROMATIN_RUN_DIR)) {
+    run_dirs <- list.dirs(chromatin_out_root, recursive = FALSE, full.names = TRUE)
+    run_dirs <- run_dirs[grepl(
+      "pILC_Focused_Chromatin_Pathway_Analysis_[0-9]{4}-[0-9]{2}-[0-9]{2}$", run_dirs
+    )]
+    if (length(run_dirs) == 0) stop("No chromatin analysis run folder found in: ", chromatin_out_root)
+    CHROMATIN_RUN_DIR <- sort(run_dirs, decreasing = TRUE)[1]
+  }
+
+  leading_edge_files <- list.files(
+    file.path(CHROMATIN_RUN_DIR, "tables"),
+    pattern = "^fgsea_leading_edge_genes_.*\\.tsv$",
+    full.names = TRUE
+  )
+  if (length(leading_edge_files) != 1) {
+    stop("Expected one fgsea_leading_edge_genes_*.tsv in ", CHROMATIN_RUN_DIR,
+         "/tables; found ", length(leading_edge_files))
+  }
+  leading_edge_file <- leading_edge_files[1]
+  cat("Leading-edge table:\n", leading_edge_file, "\n\n")
+
+  leading_edge_long <- fread(leading_edge_file, sep = "\t", data.table = TRUE)
+
+  required_le_cols <- c("Gene", "Pathway", "Target_cluster", "Comparison", "FDR")
+  missing_le_cols <- setdiff(required_le_cols, colnames(leading_edge_long))
+  if (length(missing_le_cols) > 0) {
+    stop("Leading-edge table is missing column(s): ", paste(missing_le_cols, collapse = ", "))
+  }
+
+  # Same ranking as the RNA script: genes recurring across more comparisons,
+  # clusters and pathways first, then by the smallest FDR.
+  leading_rank <- leading_edge_long[
+    ,
+    .(
+      Pathway_count = uniqueN(Pathway),
+      Cluster_count = uniqueN(Target_cluster),
+      Comparison_count = uniqueN(Comparison),
+      Minimum_FDR = min(FDR, na.rm = TRUE)
+    ),
+    by = Gene
+  ]
+  setorder(leading_rank, -Comparison_count, -Cluster_count, -Pathway_count, Minimum_FDR)
+
+  heatmap_genes <- head(leading_rank$Gene, N_LEADING_EDGE_GENES)
+  cat("Leading-edge genes shown in the RNA heatmap:", length(heatmap_genes), "\n\n")
+}
+```
+
+```{r curated_gene_sets}
+# ============================================================
+# Gene list 2: all curated chromatin genes (copied from the RNA script)
+# ============================================================
+
+curated_sets <- list(
+  SWI_SNF_BAF_CORE = c(
+    "ARID1A", "ARID1B", "ARID2", "SMARCA2", "SMARCA4", "SMARCB1",
+    "SMARCC1", "SMARCC2", "SMARCD1", "SMARCD2", "SMARCD3", "SMARCE1",
+    "ACTL6A", "ACTL6B", "DPF1", "DPF2", "DPF3", "BCL7A", "BCL7B",
+    "BCL7C", "BRD7", "BRD9", "PBRM1"
+  ),
+  PRC2_CORE = c(
+    "EZH1", "EZH2", "EED", "SUZ12", "RBBP4", "RBBP7", "JARID2",
+    "AEBP2", "MTF2", "PHF1", "PHF19", "EPOP"
+  ),
+  PRC1_CORE = c(
+    "RING1", "RNF2", "BMI1", "PCGF1", "PCGF2", "PCGF3", "PCGF4",
+    "PCGF5", "PCGF6", "CBX2", "CBX4", "CBX6", "CBX7", "CBX8",
+    "PHC1", "PHC2", "PHC3"
+  ),
+  HDAC_PROGRAM = c(
+    "HDAC1", "HDAC2", "HDAC3", "HDAC4", "HDAC5", "HDAC6", "HDAC7",
+    "HDAC8", "HDAC9", "HDAC10", "HDAC11", "SIRT1", "SIRT2", "SIRT3",
+    "SIRT4", "SIRT5", "SIRT6", "SIRT7", "NCOR1", "NCOR2", "SIN3A",
+    "SIN3B", "MTA1", "MTA2", "MTA3", "CHD3", "CHD4"
+  ),
+  HISTONE_ACETYLTRANSFERASE_HAT_PROGRAM = c(
+    "CREBBP", "EP300", "KAT2A", "KAT2B", "KAT5", "KAT6A", "KAT6B",
+    "KAT7", "KAT8", "ELP3", "NCOA1", "NCOA2", "NCOA3", "CLOCK"
+  ),
+  DNA_METHYLATION_WRITERS_READERS = c(
+    "DNMT1", "DNMT3A", "DNMT3B", "DNMT3L", "UHRF1", "UHRF2",
+    "MECP2", "MBD1", "MBD2", "MBD3", "MBD4", "ZBTB33", "ZBTB38",
+    "ZBTB4"
+  ),
+  DNA_DEMETHYLATION_PROGRAM = c(
+    "TET1", "TET2", "TET3", "TDG", "GADD45A", "GADD45B", "GADD45G",
+    "AICDA", "APOBEC1"
+  ),
+  HISTONE_LYSINE_METHYLTRANSFERASES = c(
+    "KMT2A", "KMT2B", "KMT2C", "KMT2D", "KMT2E", "KMT5A", "KMT5B",
+    "KMT5C", "SETD1A", "SETD1B", "SETD2", "SETD3", "SETD5", "SETD6",
+    "SETD7", "SETD8", "SETDB1", "SETDB2", "EHMT1", "EHMT2", "SUV39H1",
+    "SUV39H2", "EZH1", "EZH2", "DOT1L", "NSD1", "NSD2", "NSD3"
+  ),
+  HISTONE_LYSINE_DEMETHYLASES = c(
+    "KDM1A", "KDM1B", "KDM2A", "KDM2B", "KDM3A", "KDM3B", "KDM4A",
+    "KDM4B", "KDM4C", "KDM4D", "KDM4E", "KDM5A", "KDM5B", "KDM5C",
+    "KDM5D", "KDM6A", "KDM6B", "KDM7A", "KDM8", "JMJD6", "PHF2",
+    "PHF8"
+  ),
+  HISTONE_UBIQUITINATION_MACHINERY = c(
+    "RNF20", "RNF40", "WAC", "UBE2A", "UBE2B", "BRCA1", "BARD1",
+    "RNF2", "RING1", "BMI1", "PCGF1", "PCGF2", "PCGF3", "PCGF4",
+    "PCGF5", "PCGF6", "UHRF1", "UHRF2", "CUL4A", "CUL4B", "DDB1"
+  ),
+  HISTONE_DEUBIQUITINATION_MACHINERY = c(
+    "BAP1", "ASXL1", "ASXL2", "ASXL3", "USP3", "USP7", "USP11",
+    "USP16", "USP21", "USP22", "USP27X", "USP28", "MYSM1", "BRCC3",
+    "OTUD5", "ATXN7L3", "ENY2"
+  ),
+  HISTONE_PHOSPHORYLATION_DNA_DAMAGE = c(
+    "H2AX", "ATM", "ATR", "PRKDC", "CHEK1", "CHEK2", "AURKA", "AURKB",
+    "VRK1", "VRK2", "RPS6KA3", "RPS6KA4", "RPS6KA5", "PPM1D", "MDC1"
+  ),
+  HETEROCHROMATIN_FORMATION = c(
+    "CBX1", "CBX3", "CBX5", "SUV39H1", "SUV39H2", "SETDB1", "SETDB2",
+    "EHMT1", "EHMT2", "TRIM28", "HP1BP3", "DNMT1", "UHRF1", "ATRX",
+    "DAXX"
+  ),
+  NUCLEOSOME_ASSEMBLY_CHAPERONES = c(
+    "HIRA", "ASF1A", "ASF1B", "CHAF1A", "CHAF1B", "NASP", "NAP1L1",
+    "NAP1L4", "DAXX", "ATRX", "HJURP", "ANP32E", "DEK", "SUPT16H",
+    "SSRP1"
+  ),
+  CHROMATIN_REMODELING_EXPANDED = c(
+    "ARID1A", "ARID1B", "ARID2", "SMARCA2", "SMARCA4", "SMARCB1",
+    "SMARCC1", "SMARCC2", "PBRM1", "CHD1", "CHD2", "CHD3", "CHD4",
+    "CHD5", "CHD6", "CHD7", "CHD8", "CHD9", "ATRX", "DAXX", "SRCAP",
+    "EP400", "INO80", "INO80B", "INO80C", "INO80D", "INO80E", "HELLS"
+  )
+)
+
+# The 7 biological modules used on the summary slide.
+curated_modules <- list(
+  Chromatin_remodeling = c("SWI_SNF_BAF_CORE", "CHROMATIN_REMODELING_EXPANDED",
+                           "NUCLEOSOME_ASSEMBLY_CHAPERONES"),
+  Polycomb_repression = c("PRC2_CORE", "PRC1_CORE"),
+  Histone_acetylation = c("HISTONE_ACETYLTRANSFERASE_HAT_PROGRAM", "HDAC_PROGRAM"),
+  Histone_methylation = c("HISTONE_LYSINE_METHYLTRANSFERASES", "HISTONE_LYSINE_DEMETHYLASES"),
+  Histone_ubiquitination = c("HISTONE_UBIQUITINATION_MACHINERY",
+                             "HISTONE_DEUBIQUITINATION_MACHINERY"),
+  DNA_methylation = c("DNA_METHYLATION_WRITERS_READERS", "DNA_DEMETHYLATION_PROGRAM"),
+  Heterochromatin_DNA_damage_marks = c("HETEROCHROMATIN_FORMATION",
+                                       "HISTONE_PHOSPHORYLATION_DNA_DAMAGE")
+)
+stopifnot(setequal(unlist(curated_modules), names(curated_sets)))
+
+curated_module_genes <- lapply(curated_modules, function(set_names) {
+  unique(unlist(curated_sets[set_names], use.names = FALSE))
+})
+curated_all_genes <- unique(unlist(curated_sets, use.names = FALSE))
+cat("Curated chromatin genes (unique):", length(curated_all_genes), "\n\n")
+
+# ------------------------------------------------------------
+# Named list of gene lists; each becomes one oncoplot.
+# A gene can appear in more than one module plot.
+# ------------------------------------------------------------
+oncoplot_sets <- list()
+if (isTRUE(RUN_LEADING_EDGE) && length(heatmap_genes) > 0) {
+  oncoplot_sets[["Chromatin_leading_edge_genes"]] <- heatmap_genes
+}
+if (isTRUE(RUN_CURATED)) {
+  # Oncoplot 2: all curated chromatin genes in one plot
+  oncoplot_sets[["Curated_chromatin_all_genes"]] <- curated_all_genes
+
+  # Optional: one plot per module
+  if (isTRUE(RUN_CURATED_MODULES)) {
+    for (m in names(curated_module_genes)) {
+      oncoplot_sets[[paste0("Curated_", m)]] <- curated_module_genes[[m]]
+    }
+  }
+}
+if (length(oncoplot_sets) == 0) stop("No gene lists selected (RUN_LEADING_EDGE / RUN_CURATED).")
+print(data.table(Gene_list = names(oncoplot_sets), Genes = lengths(oncoplot_sets)))
+```
+
+```{r read_clinical}
+# ============================================================
+# Read clinical file (same as the functional-category script)
+# ============================================================
+
+cat("Reading clinical annotation file:\n", clinical_file, "\n\n")
+
+clinical_dt <- fread(
+  clinical_file,
+  sep = ",",
+  header = TRUE,
+  data.table = TRUE,
+  fill = TRUE,
+  na.strings = c("", "NA", "NaN", "N/A")
+)
+
+clinical_dt[, Sample_key := clean_sample(Sample)]
+
+clinical_dt[, tumor_cellularity_pct := parse_percent_value(`tumor_cellularity (%)`)]
+
+clinical_dt[, pleomorphic_component_cellularity_pct := parse_percent_value(
+  `pleomorphic_invasive_compoent_cellularity (%)`
+)]
+
+clinical_dt[, TILs_pct := parse_percent_value(`TILs (%)`)]
+
+clinical_dt[, Grade_clean := clean_grade_status(`Grade/Differentiation-Desc`)]
+
+clinical_dt[, HER2_status := clean_receptor_status(`BREAST: Her-2/Neu-Desc`)]
+
+clinical_dt[, ER_status := clean_receptor_status(`Tumor Marker #1 (ER)`)]
+
+clinical_dt[, PR_status := clean_receptor_status(`Tumor Marker #2 (PR)`)]
+
+clinical_plot_dt <- unique(
+  clinical_dt[
+    ,
+    .(
+      Sample_key,
+      tumor_cellularity_pct,
+      pleomorphic_component_cellularity_pct,
+      TILs_pct,
+      Grade_clean,
+      HER2_status,
+      ER_status,
+      PR_status
+    )
+  ],
+  by = "Sample_key"
+)
+
+cat("Clinical samples:", nrow(clinical_plot_dt), "\n\n")
+```
+
+```{r read_maf_and_frequency}
+# ============================================================
+# Read the MAF exactly as the upstream TopGenes script does (fread),
+# attach PCGR VAF from the match-audit table, and apply the same filter.
+# read.maf() is NOT used: it moves Splice_Region rows out of @data,
+# while the upstream frequency table counts Splice_Region as nonsilent.
+# ============================================================
+
+cat("Reading MAF:\n", maf_file, "\n\n")
+
+maf_full <- fread(
+  maf_file,
+  sep = "\t",
+  header = TRUE,
+  data.table = TRUE,
+  na.strings = c("", ".", "NA", "N/A")
+)
+
+required_maf_cols <- c(
+  "Hugo_Symbol", "Tumor_Sample_Barcode", "Variant_Classification",
+  "Chromosome", "Start_Position", "Reference_Allele", "Tumor_Seq_Allele2"
+)
+missing_required <- setdiff(required_maf_cols, colnames(maf_full))
+if (length(missing_required) > 0) {
+  stop("Missing required MAF columns: ", paste(missing_required, collapse = ", "))
+}
+
+# Cohort = every sample in the full MAF (same denominator as the upstream
+# frequency table). TP order as in the original oncoplot script.
+all_samples <- natural_sample_order(unique(as.character(maf_full$Tumor_Sample_Barcode)))
+cat("Cohort samples:", length(all_samples), "\n")
+
+# Rebuild the upstream sample|gene|variant key for every MAF row.
+maf_full[, Variant_key := mapply(
+  edit_key,
+  Chromosome, Start_Position, Reference_Allele, Tumor_Seq_Allele2,
+  MoreArgs = list(maf_format = TRUE),
+  USE.NAMES = FALSE
+)]
+maf_full[, Match_key := paste(
+  vaf_clean_sample(Tumor_Sample_Barcode),
+  vaf_clean_gene(Hugo_Symbol),
+  Variant_key,
+  sep = "|"
+)]
+
+# VAF per key from the upstream audit (one value per key).
+vaf_audit <- fread(vaf_audit_file, sep = "\t", header = TRUE, data.table = TRUE)
+if (!all(c("Match_key", "VAF_TUMOR_fraction") %in% colnames(vaf_audit))) {
+  stop("VAF audit file must contain Match_key and VAF_TUMOR_fraction columns.")
+}
+vaf_by_key <- unique(
+  vaf_audit[, .(Match_key, VAF_TUMOR_fraction = suppressWarnings(as.numeric(VAF_TUMOR_fraction)))],
+  by = "Match_key"
+)
+
+maf_full <- merge(maf_full, vaf_by_key, by = "Match_key", all.x = TRUE, sort = FALSE)
+
+# Same retention rule as upstream: nonsilent class + gene present + VAF >= 0.05.
+# Rows without a matched PCGR VAF are excluded, as upstream.
+maf_dt <- maf_full[
+  Variant_Classification %in% nonsilent_classes &
+    !is.na(vaf_clean_gene(Hugo_Symbol)) &
+    !is.na(VAF_TUMOR_fraction) &
+    VAF_TUMOR_fraction >= MIN_VAF
+]
+maf_dt[, Variant_Classification := as.character(Variant_Classification)]
+maf_dt[, VAF_percent := round(100 * VAF_TUMOR_fraction, 2)]
+
+cat("Full MAF rows:", nrow(maf_full), "\n")
+cat("Rows without matched PCGR VAF:", sum(is.na(maf_full$VAF_TUMOR_fraction)), "\n")
+cat("Nonsilent rows retained at ", VAF_LABEL, ": ", nrow(maf_dt), "\n\n", sep = "")
+
+maf_dt[, maf_row_id := .I]
+maf_dt[, Sample_key := clean_sample(Tumor_Sample_Barcode)]
+maf_dt[, Gene_key := clean_key(Hugo_Symbol)]
+
+if (!"HGVSp" %in% colnames(maf_dt)) maf_dt[, HGVSp := NA_character_]
+if (!"HGVSp_Short" %in% colnames(maf_dt)) maf_dt[, HGVSp_Short := NA_character_]
+if (!"HGVSc" %in% colnames(maf_dt)) maf_dt[, HGVSc := NA_character_]
+
+maf_dt[, HGVSp_key := clean_hgv(HGVSp)]
+maf_dt[, HGVSp_Short_key := clean_hgv(HGVSp_Short)]
+maf_dt[, HGVSc_key := clean_hgv(HGVSc)]
+
+# ============================================================
+# Gene-level frequency table: defines eligible genes
+# ============================================================
+
+freq_dt <- fread(gene_freq_file, sep = "\t", header = TRUE, data.table = TRUE)
+
+freq_gene_col <- find_col(colnames(freq_dt), c("Hugo_Symbol", "Gene", "Gene_Symbol", "SYMBOL"))
+if (is.na(freq_gene_col)) {
+  stop("Frequency table needs a gene column (Hugo_Symbol / Gene). Columns found: ",
+       paste(colnames(freq_dt), collapse = ", "))
+}
+
+# Optional: number of mutated samples, used for the concordance check.
+freq_count_col <- find_col(colnames(freq_dt), c(
+  "Mutated_samples", "N_mutated_samples", "n_mutated_samples", "Samples_mutated",
+  "MutatedSamples", "Altered_samples", "AlteredSamples", "N_samples", "n_samples"
+))
+
+freq_dt[, Gene_key := clean_key(get(freq_gene_col))]
+freq_genes <- unique(na.omit(freq_dt$Gene_key))
+cat("Genes in frequency table:", length(freq_genes), "\n")
+cat("Mutated-sample count column: ",
+    ifelse(is.na(freq_count_col), "not found (concordance check skipped)", freq_count_col),
+    "\n\n", sep = "")
+
+# ============================================================
+# Gene audit across ALL requested genes: where each gene drops out
+# ============================================================
+
+# One row per gene, with the lists it belongs to.
+gene_membership <- rbindlist(lapply(names(oncoplot_sets), function(nm) {
+  data.table(Gene = oncoplot_sets[[nm]], Gene_list = nm)
+}))
+gene_membership[, Gene_key := clean_key(Gene)]
+gene_audit <- gene_membership[
+  , .(Gene = Gene[1], Gene_lists = paste(unique(Gene_list), collapse = ";")),
+  by = Gene_key
+]
+if (length(heatmap_genes) > 0) {
+  gene_audit[, Leading_edge_rank := match(Gene_key, clean_key(heatmap_genes))]
+}
+
+# Variant counts at each filter stage (full MAF, before any filtering).
+maf_full[, Gene_key := vaf_clean_gene(Hugo_Symbol)]
+maf_full[, Is_nonsilent := Variant_Classification %in% nonsilent_classes]
+maf_full[, Passes_VAF := !is.na(VAF_TUMOR_fraction) & VAF_TUMOR_fraction >= MIN_VAF]
+
+stage_counts <- maf_full[
+  Gene_key %in% gene_audit$Gene_key,
+  .(
+    All_variants          = .N,
+    Nonsilent             = sum(Is_nonsilent),
+    Nonsilent_VAF_missing = sum(Is_nonsilent & is.na(VAF_TUMOR_fraction)),
+    Nonsilent_VAF_lt5     = sum(Is_nonsilent & !is.na(VAF_TUMOR_fraction) & VAF_TUMOR_fraction < MIN_VAF),
+    Nonsilent_VAF_ge5     = sum(Is_nonsilent & Passes_VAF),
+    MAF_mutated_samples   = uniqueN(Tumor_Sample_Barcode[Is_nonsilent & Passes_VAF])
+  ),
+  by = Gene_key
+]
+gene_audit <- merge(gene_audit, stage_counts, by = "Gene_key", all.x = TRUE, sort = FALSE)
+count_cols <- c("All_variants", "Nonsilent", "Nonsilent_VAF_missing",
+                "Nonsilent_VAF_lt5", "Nonsilent_VAF_ge5", "MAF_mutated_samples")
+for (cc in count_cols) gene_audit[is.na(get(cc)), (cc) := 0L]
+
+# Frequency-table membership and count concordance.
+gene_audit[, In_frequency_table := Gene_key %in% freq_genes]
+if (!is.na(freq_count_col)) {
+  freq_counts <- freq_dt[, .(Freq_table_mutated_samples = suppressWarnings(
+    as.numeric(get(freq_count_col))[1])), by = Gene_key]
+  gene_audit <- merge(gene_audit, freq_counts, by = "Gene_key", all.x = TRUE, sort = FALSE)
+  gene_audit[, Counts_agree := fifelse(
+    In_frequency_table,
+    MAF_mutated_samples == Freq_table_mutated_samples,
+    MAF_mutated_samples == 0
+  )]
+}
+
+# First filter that removed each gene.
+gene_audit[, Drop_reason := fcase(
+  All_variants == 0,       "1_No_variant_in_MAF",
+  Nonsilent == 0,          "2_Only_silent_variants",
+  Nonsilent_VAF_ge5 > 0,   "Plotted",
+  Nonsilent_VAF_lt5 == 0,  "3_Nonsilent_VAF_not_matched",
+  default =                "4_Nonsilent_VAF_lt5pct"
+)]
+
+# Symbol check: is a "no variant" gene present in the MAF under an older alias?
+gene_audit[, Possible_MAF_alias := NA_character_]
+if (isTRUE(CHECK_SYMBOL_ALIASES) &&
+    requireNamespace("AnnotationDbi", quietly = TRUE) &&
+    requireNamespace("org.Hs.eg.db", quietly = TRUE)) {
+
+  alias_map <- suppressMessages(tryCatch(
+    AnnotationDbi::select(
+      org.Hs.eg.db::org.Hs.eg.db,
+      keys = unique(na.omit(maf_full$Gene_key)),
+      keytype = "ALIAS",
+      columns = "SYMBOL"
+    ),
+    error = function(e) NULL
+  ))
+
+  if (!is.null(alias_map)) {
+    alias_map <- as.data.table(alias_map)[!is.na(SYMBOL)]
+    alias_map[, `:=`(ALIAS = toupper(ALIAS), SYMBOL = toupper(SYMBOL))]
+    alias_hits <- alias_map[
+      ALIAS != SYMBOL & SYMBOL %in% gene_audit[Drop_reason == "1_No_variant_in_MAF", Gene_key],
+      .(Possible_MAF_alias = paste(unique(ALIAS), collapse = ";")),
+      by = .(Gene_key = SYMBOL)
+    ]
+    gene_audit[alias_hits, on = "Gene_key", Possible_MAF_alias := i.Possible_MAF_alias]
+  }
+} else if (isTRUE(CHECK_SYMBOL_ALIASES)) {
+  message("AnnotationDbi/org.Hs.eg.db not available; symbol-alias check skipped.")
+}
+
+gene_audit[, Plotted := In_frequency_table & MAF_mutated_samples > 0]
+setorder(gene_audit, -Plotted, -MAF_mutated_samples, Gene)
+
+fwrite(
+  gene_audit,
+  file.path(table_dir, paste0("chromatin_gene_mutation_audit_", VAF_TAG, ".tsv")),
+  sep = "\t", quote = FALSE, na = ""
+)
+
+# Per-list summary: how many genes survive each stage.
+list_summary <- rbindlist(lapply(names(oncoplot_sets), function(nm) {
+  a <- gene_audit[Gene_key %in% clean_key(oncoplot_sets[[nm]])]
+  data.table(
+    Gene_list = nm,
+    Genes_requested = nrow(a),
+    No_variant_in_MAF = sum(a$Drop_reason == "1_No_variant_in_MAF"),
+    Only_silent = sum(a$Drop_reason == "2_Only_silent_variants"),
+    Nonsilent_VAF_not_matched = sum(a$Drop_reason == "3_Nonsilent_VAF_not_matched"),
+    Nonsilent_VAF_lt5pct = sum(a$Drop_reason == "4_Nonsilent_VAF_lt5pct"),
+    Plotted = sum(a$Plotted),
+    Possible_alias_flags = sum(!is.na(a$Possible_MAF_alias))
+  )
+}))
+fwrite(
+  list_summary,
+  file.path(table_dir, paste0("chromatin_gene_list_filter_summary_", VAF_TAG, ".tsv")),
+  sep = "\t", quote = FALSE, na = ""
+)
+print(list_summary)
+
+if ("Counts_agree" %in% colnames(gene_audit)) {
+  n_disagree <- gene_audit[Counts_agree == FALSE, .N]
+  cat("\nGenes where MAF and frequency-table counts disagree:", n_disagree, "\n")
+  if (n_disagree > 0) {
+    warning("MAF and frequency table disagree for ", n_disagree,
+            " gene(s); check that the MAF, VAF audit and frequency table come from the same run.")
+  }
+}
+if (any(!is.na(gene_audit$Possible_MAF_alias))) {
+  warning("Some genes may be present in the MAF under an older symbol; see Possible_MAF_alias.")
+}
+cat("\n")
+
+# Genes passed to the plotting function, per list (original order kept).
+plot_gene_keys <- gene_audit[Plotted == TRUE, Gene_key]
+plot_sets <- lapply(oncoplot_sets, function(g) g[clean_key(g) %in% plot_gene_keys])
+
+# Clinical match check (same as the original script).
+cat("Clinical samples matching MAF samples:",
+    sum(clean_sample(all_samples) %in% clinical_plot_dt$Sample_key), "of",
+    length(all_samples), "\n\n")
+```
+
+```{r rna_cluster_sample_order}
+# ============================================================
+# Sample (column) order: by RNA NMF cluster, then TP order
+# ============================================================
+
+# Join key between WES barcodes and RNA sample names:
+# upper case, drop GenePattern "_S#" and tumor "_T"/"-T"/".T" suffixes,
+# then remove separators so "TP03-117", "TP03.117" and "TP03_117_T" match.
+sample_match_key <- function(x) {
+  x <- toupper(trimws(as.character(x)))
+  x <- sub("_S[0-9]+$", "", x)
+  x <- sub("[-_.]T$", "", x)
+  gsub("[^A-Z0-9]", "", x)
+}
+
+plot_sample_order <- all_samples   # default: TP order
+plot_sample_group <- NULL          # NULL = no cluster bar / no column split
+
+if (isTRUE(ORDER_BY_RNA_CLUSTER)) {
+
+  if (!file.exists(cluster_gct_file)) stop("Cluster GCT not found: ", cluster_gct_file)
+
+  cluster_raw <- fread(cluster_gct_file, skip = 2, data.table = TRUE)
+  membership_col <- grep("^membership", names(cluster_raw), value = TRUE)
+  if (!"Name" %in% names(cluster_raw) || length(membership_col) != 1) {
+    stop("Cluster GCT must contain Name and exactly one membership column.")
+  }
+
+  rna_clusters <- cluster_raw[, .(
+    RNA_sample = as.character(Name),
+    Cluster_number = as.integer(get(membership_col))
+  )]
+  rna_clusters[, Sample_match_key := sample_match_key(RNA_sample)]
+  if (anyDuplicated(rna_clusters$Sample_match_key)) {
+    stop("Two RNA samples share the same match key; check RNA sample IDs.")
+  }
+
+  # One row per WES sample, in TP order.
+  wes_order_dt <- data.table(
+    Tumor_Sample_Barcode = all_samples,
+    Sample_match_key = sample_match_key(all_samples),
+    TP_order = seq_along(all_samples)
+  )
+  if (anyDuplicated(wes_order_dt$Sample_match_key)) {
+    stop("Two WES samples share the same match key; check Tumor_Sample_Barcode IDs.")
+  }
+
+  wes_order_dt <- merge(wes_order_dt, rna_clusters, by = "Sample_match_key",
+                        all.x = TRUE, sort = FALSE)
+  wes_order_dt[, RNA_cluster := fifelse(
+    is.na(Cluster_number), "No RNA", paste0("Cluster ", Cluster_number)
+  )]
+  wes_order_dt[, RNA_cluster := factor(RNA_cluster, levels = names(rna_cluster_colors))]
+  if (anyNA(wes_order_dt$RNA_cluster)) stop("Unexpected cluster number in GCT.")
+
+  # Cluster 1 -> 2 -> 3 -> No RNA; TP order within each group.
+  setorder(wes_order_dt, RNA_cluster, TP_order)
+  wes_order_dt[, Column_order := seq_len(.N)]
+
+  plot_sample_order <- wes_order_dt$Tumor_Sample_Barcode
+  plot_sample_group <- as.character(wes_order_dt$RNA_cluster)
+
+  # RNA samples without WES (not shown in the oncoplots).
+  rna_without_wes <- setdiff(rna_clusters$Sample_match_key, wes_order_dt$Sample_match_key)
+
+  cat("WES samples per RNA group:\n")
+  print(wes_order_dt[, .N, by = RNA_cluster])
+  cat("RNA samples without WES (not in oncoplots):", length(rna_without_wes), "\n")
+  if (length(rna_without_wes) > 0) {
+    print(rna_clusters[Sample_match_key %in% rna_without_wes, .(RNA_sample, Cluster_number)])
+  }
+  cat("\n")
+
+  fwrite(
+    wes_order_dt[, .(Column_order, Tumor_Sample_Barcode, RNA_sample, RNA_cluster, TP_order)],
+    file.path(table_dir, "WES_sample_RNA_cluster_order.tsv"),
+    sep = "\t", quote = FALSE, na = ""
+  )
+}
+```
+
+```{r read_pcgr}
+# ============================================================
+# Read PCGR xlsx files and extract ONCOGENICITY (unchanged)
+# ============================================================
+
+pcgr_files <- list.files(
+  pcgr_dir,
+  pattern = "\\.pcgr\\.grch38\\.xlsx$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+if (length(pcgr_files) == 0) {
+  pcgr_files <- list.files(
+    pcgr_dir,
+    pattern = "\\.xlsx$",
+    recursive = TRUE,
+    full.names = TRUE
+  )
+}
+
+cat("PCGR xlsx files found:", length(pcgr_files), "\n\n")
+
+pcgr_list <- list()
+
+for (f in pcgr_files) {
+
+  sample_name <- basename(dirname(f))
+
+  sheets <- tryCatch(
+    excel_sheets(f),
+    error = function(e) character()
+  )
+
+  if (!"SOMATIC_SNV_INDEL" %in% sheets) {
+    message("[SKIP] SOMATIC_SNV_INDEL sheet not found: ", f)
+    next
+  }
+
+  dt <- tryCatch(
+    as.data.table(read_excel(f, sheet = "SOMATIC_SNV_INDEL")),
+    error = function(e) {
+      message("[SKIP] Could not read: ", f)
+      message("       ", e$message)
+      return(NULL)
+    }
+  )
+
+  if (is.null(dt) || nrow(dt) == 0) {
+    next
+  }
+
+  gene_col <- find_col(
+    colnames(dt),
+    c("Hugo_Symbol", "HUGO_SYMBOL", "Gene", "Gene_Symbol", "SYMBOL", "GENE_NAME")
+  )
+
+  onc_col <- find_col(
+    colnames(dt),
+    c("ONCOGENICITY", "Oncogenicity")
+  )
+
+  if (is.na(gene_col) || is.na(onc_col)) {
+    message("[SKIP] Could not find Gene or ONCOGENICITY column in: ", f)
+    next
+  }
+
+  pcgr_tmp <- data.table(
+    Tumor_Sample_Barcode_PCGR = sample_name,
+    Sample_key = clean_sample(sample_name),
+    Hugo_Symbol_PCGR = as.character(dt[[gene_col]]),
+    Gene_key = clean_key(dt[[gene_col]]),
+    ONCOGENICITY_RAW = as.character(dt[[onc_col]]),
+    HGVSp_key = clean_hgv(get_col_or_na(dt, c("HGVSp", "HGVSP", "Protein_Change", "ProteinChange"))),
+    HGVSp_Short_key = clean_hgv(get_col_or_na(dt, c("HGVSp_Short", "HGVSP_SHORT"))),
+    HGVSc_key = clean_hgv(get_col_or_na(dt, c("HGVSc", "HGVSC", "Coding_Change", "CodingChange"))),
+    PCGR_file = f
+  )
+
+  pcgr_tmp[, ONCOGENICITY := normalize_oncogenicity(ONCOGENICITY_RAW)]
+
+  # Keep only Oncogenic and Likely_Oncogenic
+  pcgr_tmp <- pcgr_tmp[!is.na(ONCOGENICITY)]
+
+  if (nrow(pcgr_tmp) > 0) {
+    pcgr_list[[length(pcgr_list) + 1]] <- pcgr_tmp
+  }
+}
+
+if (length(pcgr_list) == 0) {
+  warning("No Oncogenic/Likely_Oncogenic PCGR records found.")
+  pcgr_dt <- data.table()
+} else {
+  pcgr_dt <- rbindlist(pcgr_list, fill = TRUE)
+}
+
+if (nrow(pcgr_dt) > 0) {
+  pcgr_dt[, onc_priority := fifelse(ONCOGENICITY == "Oncogenic", 2L, 1L)]
+
+  cat("PCGR Oncogenic/Likely_Oncogenic rows:", nrow(pcgr_dt), "\n")
+  print(pcgr_dt[, .N, by = ONCOGENICITY][order(-N)])
+  cat("\n")
+}
+```
+
+```{r match_pcgr_to_maf}
+# ============================================================
+# Match PCGR oncogenicity back to MAF variant rows (unchanged)
+# ============================================================
+
+maf_annot <- maf_dt[
+  ,
+  .(
+    maf_row_id,
+    Tumor_Sample_Barcode,
+    Hugo_Symbol,
+    Sample_key,
+    Gene_key,
+    HGVSp_key,
+    HGVSp_Short_key,
+    HGVSc_key
+  )
+]
+
+maf_annot[, ONCOGENICITY := NA_character_]
+maf_annot[, oncogenicity_match_method := NA_character_]
+
+add_pcgr_match <- function(maf_annot, pcgr_dt, keys, method_name) {
+
+  if (nrow(pcgr_dt) == 0) {
+    return(maf_annot)
+  }
+
+  pcgr_sub <- copy(pcgr_dt)
+
+  for (k in keys) {
+    pcgr_sub <- pcgr_sub[!is.na(get(k)) & get(k) != ""]
+  }
+
+  if (nrow(pcgr_sub) == 0) {
+    return(maf_annot)
+  }
+
+  pcgr_best <- pcgr_sub[
+    order(-onc_priority),
+    .(
+      ONCOGENICITY_MATCH = first(ONCOGENICITY),
+      PCGR_match_priority = first(onc_priority),
+      PCGR_n_matching_records = .N
+    ),
+    by = keys
+  ]
+
+  maf_unmatched <- maf_annot[is.na(ONCOGENICITY)]
+
+  for (k in keys) {
+    maf_unmatched <- maf_unmatched[!is.na(get(k)) & get(k) != ""]
+  }
+
+  if (nrow(maf_unmatched) == 0) {
+    return(maf_annot)
+  }
+
+  tmp <- merge(
+    maf_unmatched[, c("maf_row_id", keys), with = FALSE],
+    pcgr_best,
+    by = keys,
+    all.x = FALSE,
+    all.y = FALSE,
+    allow.cartesian = TRUE
+  )
+
+  if (nrow(tmp) == 0) {
+    return(maf_annot)
+  }
+
+  tmp <- tmp[
+    order(-PCGR_match_priority),
+    .SD[1],
+    by = maf_row_id
+  ]
+
+  maf_annot[
+    tmp,
+    on = "maf_row_id",
+    `:=`(
+      ONCOGENICITY = i.ONCOGENICITY_MATCH,
+      oncogenicity_match_method = method_name
+    )
+  ]
+
+  return(maf_annot)
+}
+
+if (nrow(pcgr_dt) > 0) {
+
+  maf_annot <- add_pcgr_match(
+    maf_annot, pcgr_dt,
+    keys = c("Sample_key", "Gene_key", "HGVSp_key"),
+    method_name = "Sample+Gene+HGVSp"
+  )
+
+  maf_annot <- add_pcgr_match(
+    maf_annot, pcgr_dt,
+    keys = c("Sample_key", "Gene_key", "HGVSp_Short_key"),
+    method_name = "Sample+Gene+HGVSp_Short"
+  )
+
+  maf_annot <- add_pcgr_match(
+    maf_annot, pcgr_dt,
+    keys = c("Sample_key", "Gene_key", "HGVSc_key"),
+    method_name = "Sample+Gene+HGVSc"
+  )
+
+  if (allow_sample_gene_fallback) {
+    maf_annot <- add_pcgr_match(
+      maf_annot, pcgr_dt,
+      keys = c("Sample_key", "Gene_key"),
+      method_name = "Sample+Gene_fallback"
+    )
+  }
+}
+
+maf_dt <- merge(
+  maf_dt,
+  maf_annot[, .(maf_row_id, ONCOGENICITY, oncogenicity_match_method)],
+  by = "maf_row_id",
+  all.x = TRUE
+)
+
+cat("MAF rows matched to PCGR Oncogenic/Likely_Oncogenic:\n")
+print(
+  maf_dt[
+    !is.na(ONCOGENICITY),
+    .N,
+    by = .(ONCOGENICITY, oncogenicity_match_method)
+  ][order(ONCOGENICITY, oncogenicity_match_method)]
+)
+cat("\n")
+
+fwrite(
+  maf_dt[
+    Gene_key %in% plot_gene_keys,
+    .(
+      Tumor_Sample_Barcode,
+      Hugo_Symbol,
+      Variant_Classification,
+      VAF_percent,
+      HGVSp,
+      HGVSp_Short,
+      HGVSc,
+      ONCOGENICITY,
+      oncogenicity_match_method
+    )
+  ],
+  file = file.path(table_dir, paste0("chromatin_variant_level_pcgr_match_", VAF_TAG, ".tsv")),
+  sep = "\t",
+  quote = FALSE,
+  na = ""
+)
+```
+
+```{r define_plot_function}
+# ============================================================
+# Main plotting function (identical to the functional-category script)
+# ============================================================
+
+# sample_order: column order; sample_group: RNA cluster per column (same order),
+# or NULL for the original TP-order style without a cluster bar.
+make_category_oncoplot <- function(category_name, genes,
+                                   sample_order = all_samples,
+                                   sample_group = NULL) {
+
+  cat("============================================================\n")
+  cat("Category:", category_name, "\n")
+  cat("============================================================\n")
+
+  genes <- unique(genes)
+  genes_key <- clean_key(genes)
+
+  cat_maf <- maf_dt[Gene_key %in% genes_key]
+
+  if (nrow(cat_maf) == 0) {
+    cat("No mutated genes from this category found in MAF. Skipping.\n\n")
+    return(NULL)
+  }
+
+  # Column order supplied by the caller (RNA-cluster order or TP order)
+  plot_samples <- sample_order
+
+  # ------------------------------------------------------------
+  # Cell-level summary
+  # Multi_Hit = >1 MAF variant row in same Sample + Gene
+  # Oncogenicity priority = Oncogenic > Likely_Oncogenic
+  # ------------------------------------------------------------
+
+  cell_dt <- cat_maf[
+    ,
+    {
+      onc_vals <- ONCOGENICITY[!is.na(ONCOGENICITY)]
+
+      cell_onc <- ""
+
+      if ("Oncogenic" %in% onc_vals) {
+        cell_onc <- "Oncogenic"
+      } else if ("Likely_Oncogenic" %in% onc_vals) {
+        cell_onc <- "Likely_Oncogenic"
+      }
+
+      list(
+        n_variants = .N,
+        Display = ifelse(.N > 1, "Multi_Hit", as.character(Variant_Classification[1])),
+        Variant_Classification_List = paste(unique(Variant_Classification), collapse = ";"),
+        HGVSp_List = paste(unique(na.omit(HGVSp)), collapse = ";"),
+        HGVSc_List = paste(unique(na.omit(HGVSc)), collapse = ";"),
+        Cell_ONCOGENICITY = cell_onc,
+        ONCOGENICITY_List = paste(unique(na.omit(ONCOGENICITY)), collapse = ";"),
+        ONCOGENICITY_match_methods = paste(unique(na.omit(oncogenicity_match_method)), collapse = ";")
+      )
+    },
+    by = .(Tumor_Sample_Barcode, Hugo_Symbol, Gene_key)
+  ]
+
+  # ------------------------------------------------------------
+  # Order genes by alteration frequency: high to low
+  # Tie-breaker 1 = total MAF variant rows in that gene
+  # Tie-breaker 2 = original gene-list order (here: heatmap rank)
+  # ------------------------------------------------------------
+
+  gene_order_dt <- cell_dt[
+    ,
+    .(
+      n_altered_samples = uniqueN(Tumor_Sample_Barcode),
+      n_variant_rows = sum(n_variants),
+      category_order = match(Gene_key[1], genes_key)
+    ),
+    by = .(Gene_key, Hugo_Symbol)
+  ]
+
+  setorder(
+    gene_order_dt,
+    -n_altered_samples,
+    -n_variant_rows,
+    category_order,
+    Hugo_Symbol
+  )
+
+  plot_genes <- gene_order_dt$Hugo_Symbol
+  names(plot_genes) <- NULL
+
+  category_safe <- safe_file_name(category_name)
+
+  fwrite(
+    cell_dt,
+    file = file.path(table_dir, paste0(category_safe, "_cell_level_oncoplot_table.tsv")),
+    sep = "\t",
+    quote = FALSE,
+    na = ""
+  )
+
+  # ------------------------------------------------------------
+  # Build mutation matrix and oncogenicity matrix
+  # ------------------------------------------------------------
+
+  mut_mat <- matrix(
+    "",
+    nrow = length(plot_genes),
+    ncol = length(plot_samples),
+    dimnames = list(plot_genes, plot_samples)
+  )
+
+  onc_mat <- matrix(
+    "",
+    nrow = length(plot_genes),
+    ncol = length(plot_samples),
+    dimnames = list(plot_genes, plot_samples)
+  )
+
+  for (ii in seq_len(nrow(cell_dt))) {
+    g <- cell_dt$Hugo_Symbol[ii]
+    s <- cell_dt$Tumor_Sample_Barcode[ii]
+
+    if (g %in% rownames(mut_mat) && s %in% colnames(mut_mat)) {
+      mut_mat[g, s] <- cell_dt$Display[ii]
+      onc_mat[g, s] <- cell_dt$Cell_ONCOGENICITY[ii]
+    }
+  }
+
+  plot_mat <- mut_mat
+  plot_mat[plot_mat == ""] <- NA_character_
+
+  # ------------------------------------------------------------
+  # Top stacked barplot: number of mutation rows per sample
+  # ------------------------------------------------------------
+
+  sample_class_dt <- cat_maf[
+    ,
+    .N,
+    by = .(Tumor_Sample_Barcode, Variant_Classification)
+  ]
+
+  sample_class_mat_dt <- dcast(
+    sample_class_dt,
+    Tumor_Sample_Barcode ~ Variant_Classification,
+    value.var = "N",
+    fill = 0
+  )
+
+  sample_class_mat_dt <- merge(
+    data.table(Tumor_Sample_Barcode = plot_samples),
+    sample_class_mat_dt,
+    by = "Tumor_Sample_Barcode",
+    all.x = TRUE,
+    sort = FALSE
+  )
+
+  sample_class_mat_dt <- sample_class_mat_dt[
+    match(plot_samples, Tumor_Sample_Barcode)
+  ]
+
+  sample_class_cols <- setdiff(colnames(sample_class_mat_dt), "Tumor_Sample_Barcode")
+
+  if (length(sample_class_cols) == 0) {
+
+    sample_class_mat <- matrix(
+      0,
+      nrow = length(plot_samples),
+      ncol = 1,
+      dimnames = list(plot_samples, "No_mutation")
+    )
+
+  } else {
+
+    for (cc in sample_class_cols) {
+      sample_class_mat_dt[is.na(get(cc)), (cc) := 0]
+    }
+
+    sample_class_mat <- as.matrix(sample_class_mat_dt[, ..sample_class_cols])
+    rownames(sample_class_mat) <- sample_class_mat_dt$Tumor_Sample_Barcode
+  }
+
+  # ------------------------------------------------------------
+  # Bottom clinical annotations
+  # ------------------------------------------------------------
+
+  plot_sample_keys <- clean_sample(plot_samples)
+
+  sample_clin_dt <- data.table(
+    Tumor_Sample_Barcode = plot_samples,
+    Sample_key = plot_sample_keys
+  )
+
+  sample_clin_dt <- merge(
+    sample_clin_dt,
+    clinical_plot_dt,
+    by = "Sample_key",
+    all.x = TRUE,
+    sort = FALSE
+  )
+
+  sample_clin_dt <- sample_clin_dt[
+    match(plot_samples, Tumor_Sample_Barcode)
+  ]
+
+  sample_clin_dt[, Column_Index := seq_len(.N)]
+  if (!is.null(sample_group)) sample_clin_dt[, RNA_cluster := sample_group]
+
+  setcolorder(
+    sample_clin_dt,
+    c(
+      "Column_Index",
+      "Tumor_Sample_Barcode",
+      "Sample_key",
+      setdiff(
+        colnames(sample_clin_dt),
+        c("Column_Index", "Tumor_Sample_Barcode", "Sample_key")
+      )
+    )
+  )
+
+  fwrite(
+    sample_clin_dt,
+    file = file.path(table_dir, paste0(category_safe, "_sample_order_and_clinical_annotation.tsv")),
+    sep = "\t",
+    quote = FALSE,
+    na = ""
+  )
+
+  clinical_anno_df <- data.frame(
+    `Tumor cell. (%)` = sample_clin_dt$tumor_cellularity_pct,
+    `Pleomorphic (%)` = sample_clin_dt$pleomorphic_component_cellularity_pct,
+    `TILs (%)` = sample_clin_dt$TILs_pct,
+    Grade = sample_clin_dt$Grade_clean,
+    HER2 = sample_clin_dt$HER2_status,
+    ER = sample_clin_dt$ER_status,
+    PR = sample_clin_dt$PR_status,
+    check.names = FALSE
+  )
+
+  rownames(clinical_anno_df) <- plot_samples
+
+  observed_grade_levels <- unique(na.omit(clinical_anno_df$Grade))
+  observed_grade_levels <- observed_grade_levels[observed_grade_levels != ""]
+
+  missing_grade_levels <- setdiff(observed_grade_levels, names(grade_cols))
+
+  grade_cols_local <- grade_cols
+
+  if (length(missing_grade_levels) > 0) {
+    extra_grade_cols <- hcl.colors(length(missing_grade_levels), palette = "Dark 3")
+    names(extra_grade_cols) <- missing_grade_levels
+    grade_cols_local <- c(grade_cols_local, extra_grade_cols)
+  }
+
+  clinical_anno_cols <- list(
+    `Tumor cell. (%)` = colorRamp2(
+      c(0, 50, 100),
+      c("#F7FBFF", "#6BAED6", "#08306B")
+    ),
+    `Pleomorphic (%)` = colorRamp2(
+      c(0, 50, 100),
+      c("#F7FCF5", "#74C476", "#00441B")
+    ),
+    `TILs (%)` = colorRamp2(
+      c(0, 30, 100),
+      c("#FFF5F0", "#FB6A4A", "#67000D")
+    ),
+    Grade = grade_cols_local,
+    HER2 = binary_receptor_cols,
+    ER = binary_receptor_cols,
+    PR = binary_receptor_cols
+  )
+
+  if (length(setdiff(colnames(clinical_anno_df), names(clinical_anno_cols))) > 0) {
+    stop("Clinical annotation dataframe and color list names do not match.")
+  }
+
+  bottom_clin_ha <- HeatmapAnnotation(
+    ` ` = anno_empty(
+      height = unit(1, "mm"),
+      border = FALSE
+    ),
+    df = clinical_anno_df,
+    col = clinical_anno_cols,
+    na_col = "grey90",
+    which = "column",
+    annotation_name_side = "left",
+    annotation_name_rot = 0,
+    annotation_name_gp = gpar(fontsize = 8),
+    simple_anno_size = unit(0.30, "cm"),
+    gap = unit(c(3.5, rep(1.1, ncol(clinical_anno_df) - 1)), "mm"),
+    show_annotation_name = c(
+      ` ` = FALSE,
+      `Tumor cell. (%)` = TRUE,
+      `Pleomorphic (%)` = TRUE,
+      `TILs (%)` = TRUE,
+      Grade = TRUE,
+      HER2 = TRUE,
+      ER = TRUE,
+      PR = TRUE
+    ),
+    annotation_legend_param = list(
+      `Tumor cell. (%)` = list(title = "Tumor cell. (%)"),
+      `Pleomorphic (%)` = list(title = "Pleomorphic (%)"),
+      `TILs (%)` = list(title = "TILs (%)"),
+      Grade = list(title = "Grade"),
+      HER2 = list(title = "HER2"),
+      ER = list(title = "ER"),
+      PR = list(title = "PR")
+    )
+  )
+
+  # ------------------------------------------------------------
+  # Right-side stacked barplot: altered samples per gene by class
+  # ------------------------------------------------------------
+
+  gene_class_dt <- cell_dt[
+    ,
+    .N,
+    by = .(Hugo_Symbol, Display)
+  ]
+
+  gene_class_mat_dt <- dcast(
+    gene_class_dt,
+    Hugo_Symbol ~ Display,
+    value.var = "N",
+    fill = 0
+  )
+
+  gene_class_mat_dt <- merge(
+    data.table(Hugo_Symbol = plot_genes),
+    gene_class_mat_dt,
+    by = "Hugo_Symbol",
+    all.x = TRUE,
+    sort = FALSE
+  )
+
+  gene_class_mat_dt <- gene_class_mat_dt[
+    match(plot_genes, Hugo_Symbol)
+  ]
+
+  gene_class_cols <- setdiff(colnames(gene_class_mat_dt), "Hugo_Symbol")
+
+  if (length(gene_class_cols) == 0) {
+
+    gene_class_mat <- matrix(
+      0,
+      nrow = length(plot_genes),
+      ncol = 1,
+      dimnames = list(plot_genes, "No_mutation")
+    )
+
+  } else {
+
+    for (cc in gene_class_cols) {
+      gene_class_mat_dt[is.na(get(cc)), (cc) := 0]
+    }
+
+    gene_class_mat <- as.matrix(gene_class_mat_dt[, ..gene_class_cols])
+    rownames(gene_class_mat) <- gene_class_mat_dt$Hugo_Symbol
+  }
+
+  gene_mutated_sample_counts <- rowSums(mut_mat != "")
+  gene_mutated_sample_pct <- round(100 * gene_mutated_sample_counts / ncol(mut_mat))
+
+  # ------------------------------------------------------------
+  # Mutation colors for heatmap and stacked barplots
+  # ------------------------------------------------------------
+
+  mut_types_heatmap <- sort(unique(na.omit(as.vector(plot_mat))))
+  sample_bar_classes <- colnames(sample_class_mat)
+  row_bar_classes <- colnames(gene_class_mat)
+
+  all_mutation_types_for_plot <- sort(unique(c(
+    mut_types_heatmap,
+    sample_bar_classes,
+    row_bar_classes
+  )))
+
+  all_mutation_types_for_plot <- setdiff(all_mutation_types_for_plot, "No_mutation")
+
+  mutation_colors <- get_mutation_colors(all_mutation_types_for_plot)
+
+  sample_bar_colors <- mutation_colors[sample_bar_classes]
+  sample_bar_colors[is.na(sample_bar_colors)] <- "grey50"
+
+  row_bar_colors <- mutation_colors[row_bar_classes]
+  row_bar_colors[is.na(row_bar_colors)] <- "grey50"
+
+  mutation_barplot <- anno_barplot(
+    sample_class_mat,
+    gp = gpar(fill = sample_bar_colors, col = NA),
+    border = FALSE,
+    bar_width = 0.97,
+    height = unit(2.2, "cm"),
+    axis_param = list(gp = gpar(fontsize = 8))
+  )
+
+  if (is.null(sample_group)) {
+    # Original style: barplot only, no column split.
+    top_bar_ha <- HeatmapAnnotation(
+      `Mutations per sample` = mutation_barplot,
+      annotation_name_gp = gpar(fontsize = 10)
+    )
+    column_split_vec <- NULL
+    column_gap_unit <- unit(0.05, "mm")
+  } else {
+    # Cluster bar directly above the matrix; columns split by RNA group.
+    present_groups <- intersect(names(rna_cluster_colors), unique(sample_group))
+    top_bar_ha <- HeatmapAnnotation(
+      `Mutations per sample` = mutation_barplot,
+      `RNA cluster` = sample_group,
+      col = list(`RNA cluster` = rna_cluster_colors[present_groups]),
+      simple_anno_size = unit(4, "mm"),
+      gap = unit(1.5, "mm"),
+      annotation_name_gp = gpar(fontsize = 10),
+      annotation_legend_param = list(`RNA cluster` = list(title = "RNA cluster"))
+    )
+    column_split_vec <- factor(sample_group, levels = present_groups)
+    column_gap_unit <- unit(1.5, "mm")
+  }
+
+  right_bar_ha <- rowAnnotation(
+    `Altered samples by class` = anno_barplot(
+      gene_class_mat,
+      gp = gpar(fill = row_bar_colors, col = NA),
+      border = FALSE,
+      bar_width = 0.90,
+      axis = TRUE,
+      axis_param = list(
+        gp = gpar(fontsize = 7),
+        side = "bottom"
+      )
+    ),
+    `% altered` = anno_text(
+      paste0(gene_mutated_sample_pct, "%"),
+      gp = gpar(fontsize = 10),
+      just = "left",
+      location = 0
+    ),
+    width = unit(4.2, "cm"),
+    show_annotation_name = FALSE
+  )
+
+  # ------------------------------------------------------------
+  # Square cell size
+  # ------------------------------------------------------------
+
+  cell_size_mm <- 4.0
+
+  heatmap_body_width_mm <- max(55, cell_size_mm * ncol(mut_mat))
+  heatmap_body_height_mm <- max(38, cell_size_mm * nrow(mut_mat))
+
+  plot_width <- max(13, min(26, heatmap_body_width_mm / 25.4 + 9.5))
+  plot_height <- max(8, min(24, heatmap_body_height_mm / 25.4 + 5.5))
+
+  # ------------------------------------------------------------
+  # PCGR oncogenicity symbol legend
+  # ------------------------------------------------------------
+
+  onc_lgd <- Legend(
+    title = "PCGR oncogenicity",
+    type = "points",
+    labels = c("Oncogenic", "Likely_Oncogenic"),
+    pch = c(8, 24),
+    size = unit(c(2.0, 2.0), "mm"),
+    legend_gp = gpar(col = "black", fill = "black")
+  )
+
+  # ------------------------------------------------------------
+  # Heatmap / oncoplot-like plot
+  # ------------------------------------------------------------
+
+  ht <- Heatmap(
+    plot_mat,
+    name = "Mutation type",
+    col = mutation_colors,
+    na_col = "grey80",
+    cluster_rows = FALSE,
+    cluster_columns = FALSE,
+    row_order = plot_genes,
+    column_order = plot_samples,
+    column_split = column_split_vec,
+    show_row_names = TRUE,
+    show_column_names = FALSE,
+    row_names_side = "left",
+    row_names_gp = gpar(fontsize = 10),
+    column_title = paste0(
+      category_name,
+      " | genes: ", nrow(mut_mat),
+      " | samples: ", ncol(mut_mat)
+    ),
+    column_title_gp = gpar(fontsize = 11, fontface = "bold"),
+    width = unit(heatmap_body_width_mm, "mm"),
+    height = unit(heatmap_body_height_mm, "mm"),
+    rect_gp = gpar(type = "none"),
+    top_annotation = top_bar_ha,
+    bottom_annotation = bottom_clin_ha,
+    right_annotation = right_bar_ha,
+    column_gap = column_gap_unit,
+    row_gap = unit(0.05, "mm"),
+    heatmap_legend_param = list(
+      title = "Mutation type",
+      title_gp = gpar(fontsize = 9, fontface = "bold"),
+      labels_gp = gpar(fontsize = 8)
+    ),
+    layer_fun = function(j, i, x, y, width, height, fill) {
+
+      grid.rect(
+        x = x,
+        y = y,
+        width = width * 0.995,
+        height = height * 0.995,
+        gp = gpar(fill = "grey80", col = "white", lwd = 0.10)
+      )
+
+      for (kk in seq_along(x)) {
+
+        this_mut <- mut_mat[i[kk], j[kk]]
+
+        if (!is.na(this_mut) && this_mut != "") {
+          grid.rect(
+            x = x[kk],
+            y = y[kk],
+            width = width[kk] * 0.96,
+            height = height[kk] * 0.96,
+            gp = gpar(fill = mutation_colors[this_mut], col = NA)
+          )
+        }
+      }
+
+      for (kk in seq_along(x)) {
+
+        this_mut <- mut_mat[i[kk], j[kk]]
+        this_onc <- onc_mat[i[kk], j[kk]]
+
+        symbol_col <- "black"
+
+        if (!is.na(this_mut) && this_mut == "Multi_Hit") {
+          symbol_col <- "white"
+        }
+
+        if (!is.na(this_onc) && this_onc == "Oncogenic") {
+
+          grid.points(
+            x = x[kk],
+            y = y[kk],
+            pch = 8,
+            size = unit(1.8, "mm"),
+            gp = gpar(col = symbol_col, fill = symbol_col, lwd = 1.0)
+          )
+
+        } else if (!is.na(this_onc) && this_onc == "Likely_Oncogenic") {
+
+          grid.points(
+            x = x[kk],
+            y = y[kk],
+            pch = 24,
+            size = unit(1.8, "mm"),
+            gp = gpar(col = symbol_col, fill = symbol_col, lwd = 1.0)
+          )
+        }
+      }
+    }
+  )
+
+  # ------------------------------------------------------------
+  # Save PDF and PNG
+  # ------------------------------------------------------------
+
+  pdf_file <- file.path(
+    out_dir,
+    paste0(category_safe, "_oncoplot_PCGR_oncogenicity_", VAF_TAG, ".pdf")
+  )
+
+  png_file <- file.path(
+    out_dir,
+    paste0(category_safe, "_oncoplot_PCGR_oncogenicity_", VAF_TAG, ".png")
+  )
+
+  pdf(pdf_file, width = plot_width, height = plot_height)
+
+  draw(
+    ht,
+    heatmap_legend_side = "right",
+    annotation_legend_side = "right",
+    heatmap_legend_list = list(onc_lgd),
+    merge_legends = FALSE,
+    padding = unit(c(4, 28, 6, 4), "mm")
+  )
+
+  dev.off()
+
+  if (isTRUE(SAVE_PNG)) {
+
+    png(
+      filename = png_file,
+      width = plot_width,
+      height = plot_height,
+      units = "in",
+      res = 300
+    )
+
+    draw(
+      ht,
+      heatmap_legend_side = "right",
+      annotation_legend_side = "right",
+      heatmap_legend_list = list(onc_lgd),
+      merge_legends = FALSE,
+      padding = unit(c(4, 28, 6, 4), "mm")
+    )
+
+    dev.off()
+
+  } else {
+    png_file <- NA_character_
+  }
+
+  cat("Saved:\n")
+  cat("  ", pdf_file, "\n")
+  if (!is.na(png_file)) {
+    cat("  ", png_file, "\n")
+  }
+  cat("  ", file.path(table_dir, paste0(category_safe, "_sample_order_and_clinical_annotation.tsv")), "\n\n")
+
+  summary_dt <- data.table(
+    Category = category_name,
+    Genes_requested = length(genes),
+    Mutated_genes_plotted = nrow(mut_mat),
+    Samples_shown = ncol(mut_mat),
+    Sample_order = ifelse(is.null(sample_group), "TP order", "RNA cluster, then TP order"),
+    Cells_with_mutation = sum(mut_mat != ""),
+    Cells_with_Oncogenic_symbol = sum(onc_mat == "Oncogenic"),
+    Cells_with_Likely_Oncogenic_symbol = sum(onc_mat == "Likely_Oncogenic"),
+    PDF = pdf_file,
+    PNG = png_file,
+    Sample_order_TSV = file.path(
+      table_dir,
+      paste0(category_safe, "_sample_order_and_clinical_annotation.tsv")
+    ),
+    Cell_level_TSV = file.path(
+      table_dir,
+      paste0(category_safe, "_cell_level_oncoplot_table.tsv")
+    )
+  )
+
+  graphics.off()
+  gc()
+
+  return(summary_dt)
+}
+```
+
+```{r run_oncoplots}
+# ============================================================
+# Generate one oncoplot per gene list
+# ============================================================
+
+graphics.off()
+gc()
+
+oncoplot_summaries <- list()
+
+for (list_name in names(plot_sets)) {
+
+  cat("\n\n############################################################\n")
+  cat("Running gene list:", list_name, "\n")
+  cat("############################################################\n\n")
+
+  if (length(plot_sets[[list_name]]) == 0) {
+    cat("No genes with qualifying mutations in this list. Skipping.\n")
+    next
+  }
+
+  res <- tryCatch(
+    make_category_oncoplot(
+      category_name = list_name,
+      genes = plot_sets[[list_name]],
+      sample_order = plot_sample_order,   # same column order for every oncoplot
+      sample_group = plot_sample_group
+    ),
+    error = function(e) {
+      message("[ERROR] Failed gene list: ", list_name)
+      message("Reason: ", e$message)
+      return(NULL)
+    }
+  )
+
+  if (!is.null(res)) {
+    res[, Genes_in_list := length(oncoplot_sets[[list_name]])]
+    oncoplot_summaries[[length(oncoplot_summaries) + 1]] <- res
+  }
+
+  graphics.off()
+  gc()
+}
+
+if (length(oncoplot_summaries) > 0) {
+  oncoplot_summary_dt <- rbindlist(oncoplot_summaries, fill = TRUE)
+  oncoplot_summary_dt[, `:=`(
+    MAF_VAF_filter = VAF_LABEL,
+    VAF_source = "PCGR VAF_TUMOR via upstream match audit",
+    VAF_audit_table = vaf_audit_file,
+    Leading_edge_table = leading_edge_file,
+    MAF = maf_file,
+    Frequency_table = gene_freq_file
+  )]
+
+  fwrite(
+    oncoplot_summary_dt,
+    file.path(table_dir, paste0("chromatin_oncoplot_summary_", VAF_TAG, ".tsv")),
+    sep = "\t", quote = FALSE, na = ""
+  )
+  print(oncoplot_summary_dt[, .(Category, Genes_in_list, Mutated_genes_plotted, Cells_with_mutation)])
+}
+
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(out_dir, paste0("sessionInfo_chromatin_oncoplots_", VAF_TAG, ".txt"))
+)
+
+cat("\nAll done.\n")
+cat("Plots saved in:\n", out_dir, "\n")
+cat("Tables saved in:\n", table_dir, "\n")
+```
