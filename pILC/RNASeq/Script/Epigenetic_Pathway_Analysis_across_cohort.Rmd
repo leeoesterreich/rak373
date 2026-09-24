@@ -1,0 +1,1096 @@
+---
+title: "Epigenetic_Pathway_Analysis_across_cohort"
+output: html_document
+date: "2026-09-23"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r}
+# ==============================================================================
+# pILC cohort-wide epigenetic-program analysis (no predefined clusters)
+# Date: 2026-09-23
+# Seed: 42
+#
+# Scientific questions
+#   1. Which epigenetic programs show relatively high RNA activity across pILC?
+#   2. Which programs vary most between tumors?
+#   3. Which tumors show unusually high activity for individual programs?
+#   4. Do samples form unsupervised groups based on epigenetic programs alone?
+#
+# Important interpretation
+#   ssGSEA/GSVA scores are relative expression-enrichment scores. They do not
+#   prove absolute biochemical pathway activation. “High activity” below means
+#   high relative to the other tumors or to the other included epigenetic gene
+#   sets, depending on the reported metric.
+# ==============================================================================
+
+set.seed(42)
+options(stringsAsFactors = FALSE)
+
+# ------------------------------------------------------------------------------
+# 1. Packages
+# ------------------------------------------------------------------------------
+
+required_packages <- c(
+  "data.table", "ggplot2", "GSVA", "BiocParallel", "pheatmap",
+  "RColorBrewer", "scales"
+)
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0L) {
+  stop(
+    "Missing required packages: ", paste(missing_packages, collapse = ", "),
+    "\nInstall CRAN packages with install.packages() and Bioconductor packages ",
+    "with BiocManager::install()."
+  )
+}
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+  library(GSVA)
+  library(BiocParallel)
+  library(pheatmap)
+  library(RColorBrewer)
+  library(scales)
+})
+
+# ------------------------------------------------------------------------------
+# 2. Inputs and output directory
+# ------------------------------------------------------------------------------
+
+vst_file <- paste0(
+  "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/4_Count_file_pILC/",
+  "VST_data/htseq_VST_gene_names_all_expression_filtered_genes.csv"
+)
+
+c5_gmt_file <- paste0(
+  "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/GSEA/Dataset/",
+  "c5.all.v2025.1.Hs.symbols.gmt"
+)
+
+clinical_file <- paste0(
+  "/ix1/alee/LO_LAB/Personal/Rahul/pILC/Clinical_correlation/",
+  "pILC_ClinicoPathological_details.csv"
+)
+
+out_dir <- paste0(
+  "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/Downstream/",
+  "Epigenetic_Pathway_Analysis/Cohort_Wide_2026-09-23"
+)
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+plot_dir <- file.path(out_dir, "plots")
+table_dir <- file.path(out_dir, "tables")
+dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(table_dir, recursive = TRUE, showWarnings = FALSE)
+
+if (!file.exists(vst_file)) stop("VST file not found: ", vst_file)
+if (!file.exists(c5_gmt_file)) stop("C5 GMT file not found: ", c5_gmt_file)
+if (!file.exists(clinical_file)) stop("Clinical file not found: ", clinical_file)
+
+date_tag <- "2026-09-23"
+min_gene_set_size <- 5L
+max_gene_set_size <- 500L
+high_z_threshold <- 1.5
+n_bootstrap <- 2000L
+top_n_heatmap <- 40L
+top_n_plot <- 25L
+
+# ------------------------------------------------------------------------------
+# 3. Helper functions
+# ------------------------------------------------------------------------------
+
+clean_gene_symbol <- function(x) {
+  x <- toupper(trimws(as.character(x)))
+  x[x %in% c("", "NA", "N/A", ".")] <- NA_character_
+  x
+}
+
+normalize_sample_id <- function(x) {
+  # TP03.117, TP03_117 and TP03-117 all become TP03-117.
+  x <- toupper(trimws(as.character(x)))
+  x <- gsub("[._]+", "-", x)
+  x <- gsub("-+", "-", x)
+  x <- sub("-T$", "", x)
+  x <- sub("-S[0-9]+$", "", x)
+  x
+}
+
+parse_percent_value <- function(x) {
+  # For interval-censored values such as <5, use the midpoint 2.5 for plotting.
+  raw <- trimws(as.character(x))
+  raw[raw %in% c("", "NA", "N/A", ".")] <- NA_character_
+  value <- suppressWarnings(as.numeric(gsub("[^0-9.]", "", raw)))
+  is_below <- !is.na(raw) & grepl("^<", raw)
+  value[is_below] <- value[is_below] / 2
+  value
+}
+
+clean_receptor_status <- function(x) {
+  y <- trimws(as.character(x))
+  y <- gsub("\\s+", " ", y)
+  out <- rep("Unknown", length(y))
+  out[grepl("^Positive", y, ignore.case = TRUE)] <- "Positive"
+  out[grepl("^Negative", y, ignore.case = TRUE)] <- "Negative"
+  out[y %in% c("", "NA", "N/A", "NaN", "nan") | is.na(y)] <- "Unknown"
+  out
+}
+
+clean_grade <- function(x) {
+  y <- trimws(as.character(x))
+  y <- gsub("\\s+", " ", y)
+  out <- y
+  out[y %in% c("", "NA", "N/A", "NaN", "nan") | is.na(y)] <- "Unknown"
+  out
+}
+
+read_gmt <- function(path) {
+  lines <- readLines(path, warn = FALSE)
+  parsed <- strsplit(lines, "\t", fixed = TRUE)
+
+  gene_sets <- lapply(parsed, function(x) {
+    if (length(x) < 3L) return(character())
+    unique(clean_gene_symbol(x[-c(1L, 2L)]))
+  })
+
+  set_names <- vapply(parsed, function(x) x[1L], character(1))
+  names(gene_sets) <- make.unique(set_names)
+  gene_sets <- gene_sets[lengths(gene_sets) > 0L]
+  gene_sets
+}
+
+median_bootstrap_ci <- function(x, n_boot = 2000L, seed = 42L) {
+  x <- x[is.finite(x)]
+  if (length(x) < 2L) return(c(NA_real_, NA_real_))
+  set.seed(seed)
+  medians <- replicate(
+    n_boot,
+    median(sample(x, size = length(x), replace = TRUE), na.rm = TRUE)
+  )
+  as.numeric(stats::quantile(medians, probs = c(0.025, 0.975), na.rm = TRUE))
+}
+
+robust_z <- function(x) {
+  center <- median(x, na.rm = TRUE)
+  spread <- mad(x, center = center, constant = 1.4826, na.rm = TRUE)
+  if (!is.finite(spread) || spread == 0) spread <- sd(x, na.rm = TRUE)
+  if (!is.finite(spread) || spread == 0) return(rep(0, length(x)))
+  (x - center) / spread
+}
+
+row_zscore <- function(mat) {
+  z <- t(scale(t(mat)))
+  z[!is.finite(z)] <- 0
+  z
+}
+
+sample_percentile_matrix <- function(score_matrix) {
+  apply(score_matrix, 2L, function(x) {
+    if (sum(is.finite(x)) <= 1L) return(rep(NA_real_, length(x)))
+    (rank(x, na.last = "keep", ties.method = "average") - 1) /
+      (sum(is.finite(x)) - 1)
+  })
+}
+
+classify_pathway <- function(pathway_name) {
+  x <- toupper(pathway_name)
+  if (grepl("SWI_SNF|BAF|SMARCA|SMARCB", x)) return("SWI/SNF-BAF")
+  if (grepl("PRC1|POLYCOMB_REPRESSIVE_COMPLEX_1", x)) return("PRC1")
+  if (grepl("PRC2|POLYCOMB_REPRESSIVE_COMPLEX_2", x)) return("PRC2")
+  if (grepl("DNA_DEMETHYL|TET_DIOXYGENASE", x)) return("DNA demethylation")
+  if (grepl("DNA_METHYL|METHYLCYTOSINE|CPG", x)) return("DNA methylation")
+  if (grepl("HDAC|HISTONE_DEACETYL", x)) return("Histone deacetylation")
+  if (grepl("HAT|HISTONE_ACETYL|ACETYLTRANSFERASE", x)) return("Histone acetylation")
+  if (grepl("HISTONE.*DEMETHYL|DEMETHYLASE", x)) return("Histone demethylation")
+  if (grepl("HISTONE.*METHYL|METHYLTRANSFERASE", x)) return("Histone methylation")
+  if (grepl("HETEROCHROMATIN", x)) return("Heterochromatin")
+  if (grepl("NUCLEOSOME", x)) return("Nucleosome organization")
+  if (grepl("CHROMATIN", x)) return("Chromatin regulation")
+  if (grepl("EPIGEN", x)) return("Other epigenetic")
+  "Other epigenetic"
+}
+
+run_ssgsea <- function(expr_matrix, gene_sets) {
+  # GSVA >= 1.50 uses a parameter object. Older versions use gsva() arguments.
+  if (exists("ssgseaParam", where = asNamespace("GSVA"), inherits = FALSE)) {
+    param <- GSVA::ssgseaParam(
+      exprData = expr_matrix,
+      geneSets = gene_sets,
+      minSize = min_gene_set_size,
+      maxSize = max_gene_set_size,
+      alpha = 0.25,
+      normalize = TRUE
+    )
+    GSVA::gsva(
+      param,
+      verbose = TRUE,
+      BPPARAM = BiocParallel::SerialParam(progressbar = TRUE)
+    )
+  } else {
+    GSVA::gsva(
+      expr = expr_matrix,
+      gset.idx.list = gene_sets,
+      method = "ssgsea",
+      kcdf = "Gaussian",
+      min.sz = min_gene_set_size,
+      max.sz = max_gene_set_size,
+      mx.diff = TRUE,
+      ssgsea.norm = TRUE,
+      parallel.sz = 1L,
+      verbose = TRUE
+    )
+  }
+}
+
+save_plot_pair <- function(plot_object, stem, width, height) {
+  ggsave(
+    file.path(plot_dir, paste0(stem, "_", date_tag, ".png")),
+    plot_object, width = width, height = height, dpi = 300, bg = "white"
+  )
+  ggsave(
+    file.path(plot_dir, paste0(stem, "_", date_tag, ".pdf")),
+    plot_object, width = width, height = height, bg = "white"
+  )
+}
+
+# ------------------------------------------------------------------------------
+# 4. Read and validate the VST expression matrix
+# ------------------------------------------------------------------------------
+
+message("Reading VST expression matrix...")
+vst_dt <- fread(vst_file, check.names = FALSE)
+
+if (ncol(vst_dt) < 3L) {
+  stop("The VST file must contain one gene column and at least two samples.")
+}
+
+gene_col <- names(vst_dt)[1L]
+setnames(vst_dt, gene_col, "Gene")
+vst_dt[, Gene := clean_gene_symbol(Gene)]
+vst_dt <- vst_dt[!is.na(Gene)]
+
+sample_columns <- setdiff(names(vst_dt), "Gene")
+vst_dt[, (sample_columns) := lapply(.SD, as.numeric), .SDcols = sample_columns]
+
+if (anyNA(vst_dt[, ..sample_columns])) {
+  na_by_sample <- vapply(vst_dt[, ..sample_columns], function(x) sum(is.na(x)), integer(1))
+  stop(
+    "Missing or nonnumeric VST values detected. Counts by sample: ",
+    paste(names(na_by_sample)[na_by_sample > 0], na_by_sample[na_by_sample > 0],
+          sep = "=", collapse = "; ")
+  )
+}
+
+# Average duplicated gene symbols so that each gene occurs once.
+vst_dt <- vst_dt[, lapply(.SD, mean, na.rm = TRUE), by = Gene, .SDcols = sample_columns]
+
+expr <- as.matrix(vst_dt[, ..sample_columns])
+rownames(expr) <- vst_dt$Gene
+storage.mode(expr) <- "double"
+
+zero_variance_genes <- apply(expr, 1L, function(x) sd(x, na.rm = TRUE) == 0)
+expr <- expr[!zero_variance_genes, , drop = FALSE]
+
+message("Genes retained: ", nrow(expr))
+message("Samples retained: ", ncol(expr))
+
+# ------------------------------------------------------------------------------
+# 5. Read, clean and match clinical annotations to RNA samples
+# ------------------------------------------------------------------------------
+
+message("Reading and matching clinical annotations...")
+clinical_raw <- fread(clinical_file, check.names = FALSE, na.strings = c("NA", "N/A", ""))
+
+required_clinical_cols <- c(
+  "Sample",
+  "tumor_cellularity (%)",
+  "pleomorphic_invasive_compoent_cellularity (%)",
+  "TILs (%)",
+  "Grade/Differentiation-Desc",
+  "BREAST: Her-2/Neu-Desc",
+  "Tumor Marker #1 (ER)",
+  "Tumor Marker #2 (PR)"
+)
+
+missing_clinical_cols <- setdiff(required_clinical_cols, names(clinical_raw))
+if (length(missing_clinical_cols) > 0L) {
+  stop(
+    "Missing required clinical columns: ",
+    paste(missing_clinical_cols, collapse = ", ")
+  )
+}
+
+clinical_dt <- clinical_raw[, .(
+  Clinical_sample_original = as.character(Sample),
+  Sample_key = normalize_sample_id(Sample),
+  Tumor_cellularity_raw = as.character(`tumor_cellularity (%)`),
+  Pleomorphic_percent_raw = as.character(`pleomorphic_invasive_compoent_cellularity (%)`),
+  TILs_percent_raw = as.character(`TILs (%)`),
+  Grade_raw = as.character(`Grade/Differentiation-Desc`),
+  HER2_raw = as.character(`BREAST: Her-2/Neu-Desc`),
+  ER_raw = as.character(`Tumor Marker #1 (ER)`),
+  PR_raw = as.character(`Tumor Marker #2 (PR)`)
+)]
+
+clinical_dt[, `:=`(
+  Tumor_cellularity_percent = parse_percent_value(Tumor_cellularity_raw),
+  Pleomorphic_percent = parse_percent_value(Pleomorphic_percent_raw),
+  TILs_percent = parse_percent_value(TILs_percent_raw),
+  Grade = clean_grade(Grade_raw),
+  HER2 = clean_receptor_status(HER2_raw),
+  ER = clean_receptor_status(ER_raw),
+  PR = clean_receptor_status(PR_raw)
+)]
+
+if (anyDuplicated(clinical_dt$Sample_key)) {
+  duplicate_keys <- unique(clinical_dt$Sample_key[duplicated(clinical_dt$Sample_key)])
+  stop(
+    "Duplicated clinical sample IDs after normalization: ",
+    paste(duplicate_keys, collapse = ", ")
+  )
+}
+
+expression_samples <- data.table(
+  RNA_sample_original = colnames(expr),
+  Sample_key = normalize_sample_id(colnames(expr))
+)
+
+if (anyDuplicated(expression_samples$Sample_key)) {
+  duplicate_keys <- unique(
+    expression_samples$Sample_key[duplicated(expression_samples$Sample_key)]
+  )
+  stop(
+    "Duplicated RNA sample IDs after normalization: ",
+    paste(duplicate_keys, collapse = ", ")
+  )
+}
+
+clinical_match <- merge(
+  expression_samples,
+  clinical_dt,
+  by = "Sample_key",
+  all.x = TRUE,
+  sort = FALSE
+)
+clinical_match[, RNA_order__ := match(RNA_sample_original, colnames(expr))]
+setorder(clinical_match, RNA_order__)
+clinical_match[, RNA_order__ := NULL]
+clinical_match[, Match_status := ifelse(
+  is.na(Clinical_sample_original), "RNA sample unmatched", "Matched"
+)]
+
+clinical_only <- clinical_dt[!Sample_key %in% expression_samples$Sample_key]
+if (nrow(clinical_only) > 0L) {
+  clinical_only_audit <- copy(clinical_only)
+  clinical_only_audit[, `:=`(
+    RNA_sample_original = NA_character_,
+    Match_status = "Clinical sample absent from RNA matrix"
+  )]
+  setcolorder(clinical_only_audit, names(clinical_match))
+  clinical_audit <- rbind(clinical_match, clinical_only_audit, fill = TRUE)
+} else {
+  clinical_audit <- copy(clinical_match)
+}
+
+fwrite(
+  clinical_audit,
+  file.path(table_dir, paste0("RNA_clinical_sample_matching_audit_", date_tag, ".tsv")),
+  sep = "\t", quote = FALSE, na = ""
+)
+
+if (any(clinical_match$Match_status != "Matched")) {
+  warning(
+    "Unmatched RNA samples: ",
+    paste(clinical_match[Match_status != "Matched", RNA_sample_original], collapse = ", ")
+  )
+}
+
+# pheatmap requires row names of annotation_col to match matrix column names.
+clinical_annotation_dt <- clinical_match[, .(
+  Sample = RNA_sample_original,
+  `Tumor cell. (%)` = Tumor_cellularity_percent,
+  `Pleomorphic (%)` = Pleomorphic_percent,
+  `TILs (%)` = TILs_percent,
+  Grade,
+  HER2,
+  ER,
+  PR
+)]
+
+clinical_annotation <- as.data.frame(clinical_annotation_dt)
+rownames(clinical_annotation) <- clinical_annotation$Sample
+clinical_annotation$Sample <- NULL
+
+clinical_annotation$Grade <- factor(clinical_annotation$Grade)
+for (receptor in c("HER2", "ER", "PR")) {
+  clinical_annotation[[receptor]] <- factor(
+    clinical_annotation[[receptor]],
+    levels = c("Negative", "Positive", "Unknown")
+  )
+}
+
+grade_cols <- c(
+  "Grade I" = "#A6CEE3",
+  "Grade II" = "#33A02C",
+  "Grade III" = "#1F78B4",
+  "Cell type not determined" = "#E31A1C",
+  "Unknown" = "#BDBDBD"
+)
+
+observed_grade_levels <- unique(na.omit(as.character(clinical_annotation$Grade)))
+missing_grade_levels <- setdiff(observed_grade_levels, names(grade_cols))
+if (length(missing_grade_levels) > 0L) {
+  extra_grade_cols <- hcl.colors(length(missing_grade_levels), palette = "Dark 3")
+  names(extra_grade_cols) <- missing_grade_levels
+  grade_cols <- c(grade_cols, extra_grade_cols)
+}
+
+binary_receptor_cols <- c(
+  "Negative" = "#1F78B4",
+  "Positive" = "#E31A1C",
+  "Unknown" = "#BDBDBD"
+)
+
+annotation_colors <- list(
+  `Tumor cell. (%)` = colorRampPalette(c("#F7FBFF", "#6BAED6", "#08306B"))(100),
+  `Pleomorphic (%)` = colorRampPalette(c("#F7FCF5", "#74C476", "#00441B"))(100),
+  # Preserve the original oncoplot anchors: 0 = pale, 30 = red, 100 = dark red.
+  `TILs (%)` = c(
+    colorRampPalette(c("#FFF5F0", "#FB6A4A"))(31),
+    colorRampPalette(c("#FB6A4A", "#67000D"))(71)[-1]
+  ),
+  Grade = grade_cols,
+  HER2 = binary_receptor_cols,
+  ER = binary_receptor_cols,
+  PR = binary_receptor_cols
+)
+
+fwrite(
+  clinical_annotation_dt,
+  file.path(table_dir, paste0("heatmap_clinical_annotations_", date_tag, ".tsv")),
+  sep = "\t", quote = FALSE, na = ""
+)
+
+# ------------------------------------------------------------------------------
+# 6. Define focused epigenetic gene sets
+# ------------------------------------------------------------------------------
+
+message("Reading C5 gene sets...")
+c5_sets_all <- read_gmt(c5_gmt_file)
+
+# Focused name filter. This deliberately avoids generic RNA methylation terms.
+epigenetic_name_pattern <- paste(
+  c(
+    "CHROMATIN", "HISTONE", "EPIGEN", "DNA_METHYL", "DNA_DEMETHYL",
+    "METHYLCYTOSINE", "SWI_SNF", "BAF_COMPLEX", "POLYCOMB",
+    "PRC1", "PRC2", "HDAC", "HISTONE_ACETYL", "NUCLEOSOME",
+    "HETEROCHROMATIN"
+  ),
+  collapse = "|"
+)
+
+c5_sets <- c5_sets_all[grepl(epigenetic_name_pattern, names(c5_sets_all), ignore.case = TRUE)]
+names(c5_sets) <- paste0("C5__", names(c5_sets))
+
+# Curated pathway modules provide interpretable coverage of major programs.
+curated_sets <- list(
+  CURATED__SWI_SNF_BAF_CORE = c(
+    "ARID1A", "ARID1B", "ARID2", "SMARCA2", "SMARCA4", "SMARCB1",
+    "SMARCC1", "SMARCC2", "SMARCD1", "SMARCD2", "SMARCD3", "SMARCE1",
+    "ACTL6A", "BRD7", "BRD9", "DPF1", "DPF2", "DPF3", "PBRM1",
+    "BCL7A", "BCL7B", "BCL7C", "SS18"
+  ),
+  CURATED__PRC1 = c(
+    "BMI1", "PCGF1", "PCGF2", "PCGF3", "PCGF4", "PCGF5", "PCGF6",
+    "RING1", "RNF2", "CBX2", "CBX4", "CBX6", "CBX7", "CBX8",
+    "PHC1", "PHC2", "PHC3", "SCMH1"
+  ),
+  CURATED__PRC2 = c(
+    "EZH1", "EZH2", "EED", "SUZ12", "RBBP4", "RBBP7", "JARID2",
+    "AEBP2", "PHF1", "MTF2", "PHF19"
+  ),
+  CURATED__HDAC_DEACETYLATION = c(
+    paste0("HDAC", 1:11), paste0("SIRT", 1:7), "SIN3A", "SIN3B", "NCOR1", "NCOR2"
+  ),
+  CURATED__HAT_ACETYLATION = c(
+    "KAT2A", "KAT2B", "KAT5", "KAT6A", "KAT6B", "KAT7", "KAT8",
+    "EP300", "CREBBP", "NCOA1", "NCOA2", "NCOA3", "CLOCK", "TAF1", "HAT1"
+  ),
+  CURATED__DNA_METHYLATION_WRITERS_READERS = c(
+    "DNMT1", "DNMT3A", "DNMT3B", "DNMT3L", "UHRF1", "UHRF2",
+    "MBD1", "MBD2", "MBD3", "MBD4", "MBD5", "MBD6", "MECP2",
+    "ZBTB33", "ZBTB38", "ZBTB4"
+  ),
+  CURATED__DNA_DEMETHYLATION = c(
+    "TET1", "TET2", "TET3", "TDG", "GADD45A", "GADD45B", "GADD45G",
+    "AICDA", "APOBEC1"
+  ),
+  CURATED__HISTONE_LYSINE_METHYLTRANSFERASES = c(
+    "KMT2A", "KMT2B", "KMT2C", "KMT2D", "SETD1A", "SETD1B", "SETD2",
+    "EHMT1", "EHMT2", "SUV39H1", "SUV39H2", "SETDB1", "SETDB2",
+    "NSD1", "NSD2", "NSD3", "DOT1L", "EZH1", "EZH2", "SETD6", "SETD7"
+  ),
+  CURATED__HISTONE_DEMETHYLASES = c(
+    "KDM1A", "KDM1B", "KDM2A", "KDM2B", "KDM3A", "KDM3B", "KDM3C",
+    "KDM4A", "KDM4B", "KDM4C", "KDM4D", "KDM5A", "KDM5B", "KDM5C",
+    "KDM5D", "KDM6A", "KDM6B", "KDM7A", "KDM8", "JMJD6"
+  ),
+  CURATED__CHROMATIN_REMODELING_EXPANDED = c(
+    paste0("CHD", 1:9), "INO80", "INO80B", "INO80C", "INO80D", "INO80E",
+    "SRCAP", "EP400", "ATRX", "DAXX", "HELLS", "RSF1", "CECR2",
+    "ARID1A", "ARID1B", "ARID2", "SMARCA2", "SMARCA4", "SMARCB1",
+    "SMARCC1", "SMARCC2", "PBRM1"
+  )
+)
+
+curated_sets <- lapply(curated_sets, clean_gene_symbol)
+all_sets_unfiltered <- c(c5_sets, curated_sets)
+
+# Retain only genes present in the expression matrix and enforce set-size limits.
+gene_set_audit <- rbindlist(lapply(names(all_sets_unfiltered), function(nm) {
+  original <- unique(all_sets_unfiltered[[nm]])
+  expressed <- intersect(original, rownames(expr))
+  data.table(
+    Pathway = nm,
+    Source = ifelse(grepl("^CURATED__", nm), "Curated", "C5"),
+    Original_gene_count = length(original),
+    Expressed_gene_count = length(expressed),
+    Coverage_percent = round(100 * length(expressed) / max(1L, length(original)), 2),
+    Retained_for_scoring = length(expressed) >= min_gene_set_size &&
+      length(expressed) <= max_gene_set_size,
+    Expressed_genes = paste(sort(expressed), collapse = ";")
+  )
+}))
+
+fwrite(
+  gene_set_audit,
+  file.path(table_dir, paste0("epigenetic_gene_set_audit_", date_tag, ".tsv")),
+  sep = "\t", quote = FALSE, na = ""
+)
+
+gene_sets <- lapply(all_sets_unfiltered, function(x) intersect(unique(x), rownames(expr)))
+gene_sets <- gene_sets[
+  lengths(gene_sets) >= min_gene_set_size & lengths(gene_sets) <= max_gene_set_size
+]
+
+if (length(gene_sets) < 2L) {
+  stop("Fewer than two epigenetic gene sets passed the expressed-gene filters.")
+}
+
+message("Epigenetic gene sets retained: ", length(gene_sets))
+
+# ------------------------------------------------------------------------------
+# 7. Calculate sample-level ssGSEA scores
+# ------------------------------------------------------------------------------
+
+message("Running ssGSEA across all samples (no cluster labels)...")
+ssgsea_scores <- run_ssgsea(expr, gene_sets)
+ssgsea_scores <- as.matrix(ssgsea_scores)
+
+if (nrow(ssgsea_scores) < 2L || ncol(ssgsea_scores) != ncol(expr)) {
+  stop("Unexpected ssGSEA output dimensions.")
+}
+
+score_wide <- data.table(Pathway = rownames(ssgsea_scores), ssgsea_scores)
+fwrite(
+  score_wide,
+  file.path(table_dir, paste0("cohortwide_epigenetic_ssGSEA_scores_wide_", date_tag, ".tsv")),
+  sep = "\t", quote = FALSE, na = ""
+)
+
+score_long <- melt(
+  score_wide,
+  id.vars = "Pathway",
+  variable.name = "Sample",
+  value.name = "ssGSEA_score"
+)
+score_long[, Category := vapply(Pathway, classify_pathway, character(1))]
+
+fwrite(
+  score_long,
+  file.path(table_dir, paste0("cohortwide_epigenetic_ssGSEA_scores_long_", date_tag, ".tsv")),
+  sep = "\t", quote = FALSE, na = ""
+)
+
+# ------------------------------------------------------------------------------
+# 8. Derive activity, variability and pathway-high metrics
+# ------------------------------------------------------------------------------
+
+# Relative pathway activity: percentile rank among the included epigenetic
+# pathways within each sample. This is preferable to directly comparing raw
+# ssGSEA magnitudes across different gene sets.
+activity_percentiles <- sample_percentile_matrix(ssgsea_scores)
+rownames(activity_percentiles) <- rownames(ssgsea_scores)
+colnames(activity_percentiles) <- colnames(ssgsea_scores)
+
+# Pathway-specific robust Z scores across samples identify unusually high tumors.
+robust_z_matrix <- t(apply(ssgsea_scores, 1L, robust_z))
+rownames(robust_z_matrix) <- rownames(ssgsea_scores)
+colnames(robust_z_matrix) <- colnames(ssgsea_scores)
+
+activity_wide <- data.table(Pathway = rownames(activity_percentiles), activity_percentiles)
+z_wide <- data.table(Pathway = rownames(robust_z_matrix), robust_z_matrix)
+
+fwrite(
+  activity_wide,
+  file.path(table_dir, paste0("cohortwide_epigenetic_activity_percentiles_", date_tag, ".tsv")),
+  sep = "\t", quote = FALSE, na = ""
+)
+fwrite(
+  z_wide,
+  file.path(table_dir, paste0("cohortwide_epigenetic_robust_z_scores_", date_tag, ".tsv")),
+  sep = "\t", quote = FALSE, na = ""
+)
+
+summary_list <- lapply(seq_len(nrow(ssgsea_scores)), function(i) {
+  pathway <- rownames(ssgsea_scores)[i]
+  x <- as.numeric(ssgsea_scores[i, ])
+  pctl <- as.numeric(activity_percentiles[i, ])
+  z <- as.numeric(robust_z_matrix[i, ])
+  ci <- median_bootstrap_ci(x, n_bootstrap, seed = 42L + i)
+
+  high_samples <- colnames(ssgsea_scores)[z >= high_z_threshold]
+  low_samples <- colnames(ssgsea_scores)[z <= -high_z_threshold]
+
+  data.table(
+    Pathway = pathway,
+    Source = ifelse(grepl("^CURATED__", pathway), "Curated", "C5"),
+    Category = classify_pathway(pathway),
+    Expressed_gene_count = length(gene_sets[[pathway]]),
+    Samples = length(x),
+    Mean_ssGSEA = mean(x, na.rm = TRUE),
+    Median_ssGSEA = median(x, na.rm = TRUE),
+    Median_95CI_low = ci[1L],
+    Median_95CI_high = ci[2L],
+    SD_ssGSEA = sd(x, na.rm = TRUE),
+    IQR_ssGSEA = IQR(x, na.rm = TRUE),
+    MAD_ssGSEA = mad(x, constant = 1.4826, na.rm = TRUE),
+    Min_ssGSEA = min(x, na.rm = TRUE),
+    Max_ssGSEA = max(x, na.rm = TRUE),
+    Median_activity_percentile = median(pctl, na.rm = TRUE),
+    Mean_activity_percentile = mean(pctl, na.rm = TRUE),
+    Pathway_high_threshold_robust_z = high_z_threshold,
+    Pathway_high_samples_n = length(high_samples),
+    Pathway_high_samples_percent = 100 * length(high_samples) / length(x),
+    Pathway_low_samples_n = length(low_samples),
+    Pathway_low_samples_percent = 100 * length(low_samples) / length(x),
+    Pathway_high_samples = paste(high_samples, collapse = ";"),
+    Pathway_low_samples = paste(low_samples, collapse = ";")
+  )
+})
+
+pathway_summary <- rbindlist(summary_list)
+pathway_summary[, Relative_activity_rank := frank(-Median_activity_percentile, ties.method = "min")]
+pathway_summary[, Variability_rank_MAD := frank(-MAD_ssGSEA, ties.method = "min")]
+setorder(pathway_summary, Relative_activity_rank, Variability_rank_MAD)
+
+fwrite(
+  pathway_summary,
+  file.path(table_dir, paste0("cohortwide_epigenetic_pathway_summary_", date_tag, ".tsv")),
+  sep = "\t", quote = FALSE, na = ""
+)
+
+fwrite(
+  pathway_summary[order(Variability_rank_MAD)],
+  file.path(table_dir, paste0("cohortwide_epigenetic_pathways_ranked_by_variability_", date_tag, ".tsv")),
+  sep = "\t", quote = FALSE, na = ""
+)
+
+# One table per sample: top relative pathways and number of pathway-high calls.
+sample_summary <- rbindlist(lapply(colnames(ssgsea_scores), function(sample_id) {
+  pctl <- activity_percentiles[, sample_id]
+  z <- robust_z_matrix[, sample_id]
+  ord <- order(pctl, decreasing = TRUE, na.last = NA)
+  top_pathways <- rownames(activity_percentiles)[head(ord, 5L)]
+  high_pathways <- rownames(robust_z_matrix)[which(z >= high_z_threshold)]
+  data.table(
+    Sample = sample_id,
+    Number_pathway_high_calls = length(high_pathways),
+    Top_5_relative_epigenetic_pathways = paste(top_pathways, collapse = ";"),
+    Pathway_high_programs = paste(high_pathways, collapse = ";")
+  )
+}))
+
+fwrite(
+  sample_summary,
+  file.path(table_dir, paste0("cohortwide_epigenetic_sample_summary_", date_tag, ".tsv")),
+  sep = "\t", quote = FALSE, na = ""
+)
+
+# ------------------------------------------------------------------------------
+# 9. Heatmaps: unsupervised sample and pathway clustering
+# ------------------------------------------------------------------------------
+
+top_variable_names <- pathway_summary[
+  order(Variability_rank_MAD), head(Pathway, min(top_n_heatmap, .N))
+]
+heatmap_matrix <- row_zscore(ssgsea_scores[top_variable_names, , drop = FALSE])
+
+heatmap_colors <- colorRampPalette(c("#2166AC", "#F7F7F7", "#B2182B"))(101)
+
+png(
+  file.path(plot_dir, paste0("Top_variable_epigenetic_programs_heatmap_", date_tag, ".png")),
+  width = 3600, height = 3000, res = 300
+)
+pheatmap(
+  heatmap_matrix,
+  annotation_col = clinical_annotation[colnames(heatmap_matrix), , drop = FALSE],
+  annotation_colors = annotation_colors,
+  annotation_names_col = TRUE,
+  color = heatmap_colors,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  clustering_distance_rows = "euclidean",
+  clustering_distance_cols = "euclidean",
+  clustering_method = "complete",
+  border_color = NA,
+  na_col = "#E5E5E5",
+  fontsize_row = 7,
+  fontsize_col = 8,
+  main = "Most variable epigenetic programs across pILC tumors\nRow-scaled ssGSEA scores; unsupervised clustering",
+  angle_col = 45
+)
+dev.off()
+
+pdf(
+  file.path(plot_dir, paste0("Top_variable_epigenetic_programs_heatmap_", date_tag, ".pdf")),
+  width = 12, height = 11
+)
+pheatmap(
+  heatmap_matrix,
+  annotation_col = clinical_annotation[colnames(heatmap_matrix), , drop = FALSE],
+  annotation_colors = annotation_colors,
+  annotation_names_col = TRUE,
+  color = heatmap_colors,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  clustering_distance_rows = "euclidean",
+  clustering_distance_cols = "euclidean",
+  clustering_method = "complete",
+  border_color = NA,
+  na_col = "#E5E5E5",
+  fontsize_row = 7,
+  fontsize_col = 8,
+  main = "Most variable epigenetic programs across pILC tumors\nRow-scaled ssGSEA scores; unsupervised clustering",
+  angle_col = 45
+)
+dev.off()
+
+curated_names <- intersect(names(curated_sets), rownames(ssgsea_scores))
+if (length(curated_names) >= 2L) {
+  curated_heatmap <- row_zscore(ssgsea_scores[curated_names, , drop = FALSE])
+
+  png(
+    file.path(plot_dir, paste0("Curated_epigenetic_programs_heatmap_", date_tag, ".png")),
+    width = 3300, height = 1900, res = 300
+  )
+  pheatmap(
+    curated_heatmap,
+    annotation_col = clinical_annotation[colnames(curated_heatmap), , drop = FALSE],
+    annotation_colors = annotation_colors,
+    annotation_names_col = TRUE,
+    color = heatmap_colors,
+    cluster_rows = TRUE,
+    cluster_cols = TRUE,
+    border_color = NA,
+    na_col = "#E5E5E5",
+    fontsize_row = 9,
+    fontsize_col = 8,
+    main = "Core epigenetic programs across pILC tumors\nRow-scaled ssGSEA scores; unsupervised clustering",
+    angle_col = 45
+  )
+  dev.off()
+
+  pdf(
+    file.path(plot_dir, paste0("Curated_epigenetic_programs_heatmap_", date_tag, ".pdf")),
+    width = 12, height = 7
+  )
+  pheatmap(
+    curated_heatmap,
+    annotation_col = clinical_annotation[colnames(curated_heatmap), , drop = FALSE],
+    annotation_colors = annotation_colors,
+    annotation_names_col = TRUE,
+    color = heatmap_colors,
+    cluster_rows = TRUE,
+    cluster_cols = TRUE,
+    border_color = NA,
+    na_col = "#E5E5E5",
+    fontsize_row = 9,
+    fontsize_col = 8,
+    main = "Core epigenetic programs across pILC tumors\nRow-scaled ssGSEA scores; unsupervised clustering",
+    angle_col = 45
+  )
+  dev.off()
+}
+
+# ------------------------------------------------------------------------------
+# 10. Ranked activity and variability plots
+# ------------------------------------------------------------------------------
+
+activity_plot_dt <- copy(pathway_summary[order(Relative_activity_rank)][1:min(top_n_plot, .N)])
+activity_plot_dt[, Pathway_label := factor(Pathway, levels = rev(Pathway))]
+
+p_activity <- ggplot(
+  activity_plot_dt,
+  aes(x = Pathway_label, y = Median_activity_percentile, fill = Category)
+) +
+  geom_col(width = 0.75) +
+  coord_flip() +
+  scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, 1)) +
+  labs(
+    title = "Epigenetic programs with highest relative activity across pILC",
+    subtitle = "Median within-sample percentile among included epigenetic programs",
+    x = NULL,
+    y = "Median relative activity percentile",
+    fill = "Program class"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.major.y = element_blank(),
+    axis.text.y = element_text(size = 7),
+    legend.position = "bottom"
+  )
+
+save_plot_pair(p_activity, "Top_relative_activity_epigenetic_programs", 11, 9)
+
+variability_plot_dt <- copy(pathway_summary[order(Variability_rank_MAD)][1:min(top_n_plot, .N)])
+variability_plot_dt[, Pathway_label := factor(Pathway, levels = rev(Pathway))]
+
+p_variability <- ggplot(
+  variability_plot_dt,
+  aes(x = Pathway_label, y = MAD_ssGSEA, fill = Category)
+) +
+  geom_col(width = 0.75) +
+  coord_flip() +
+  labs(
+    title = "Most variable epigenetic programs across pILC tumors",
+    subtitle = "Variability measured by median absolute deviation of raw ssGSEA scores",
+    x = NULL,
+    y = "MAD of ssGSEA score",
+    fill = "Program class"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.major.y = element_blank(),
+    axis.text.y = element_text(size = 7),
+    legend.position = "bottom"
+  )
+
+save_plot_pair(p_variability, "Top_variable_epigenetic_programs", 11, 9)
+
+# Activity-versus-variability overview.
+p_overview <- ggplot(
+  pathway_summary,
+  aes(
+    x = Median_activity_percentile,
+    y = MAD_ssGSEA,
+    size = Expressed_gene_count,
+    color = Category
+  )
+) +
+  geom_point(alpha = 0.75) +
+  scale_x_continuous(labels = percent_format(accuracy = 1), limits = c(0, 1)) +
+  scale_size_continuous(range = c(2, 9)) +
+  labs(
+    title = "Relative activity and intertumoral variability of epigenetic programs",
+    subtitle = "Each point represents one pathway",
+    x = "Median relative activity percentile",
+    y = "MAD of raw ssGSEA score",
+    size = "Expressed genes",
+    color = "Program class"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "right")
+
+save_plot_pair(p_overview, "Epigenetic_activity_vs_variability_overview", 11, 8)
+
+# ------------------------------------------------------------------------------
+# 11. Pathway-high fractions
+# ------------------------------------------------------------------------------
+
+high_plot_dt <- pathway_summary[
+  Pathway_high_samples_n > 0
+][order(-Pathway_high_samples_percent)][1:min(top_n_plot, .N)]
+
+if (nrow(high_plot_dt) > 0L) {
+  high_plot_dt <- copy(high_plot_dt)
+  high_plot_dt[, Pathway_label := factor(Pathway, levels = rev(Pathway))]
+
+  p_high <- ggplot(
+    high_plot_dt,
+    aes(x = Pathway_label, y = Pathway_high_samples_percent, fill = Category)
+  ) +
+    geom_col(width = 0.75) +
+    geom_text(
+      aes(label = paste0(Pathway_high_samples_n, "/", Samples)),
+      hjust = -0.08, size = 3
+    ) +
+    coord_flip() +
+    scale_y_continuous(
+      limits = c(0, max(high_plot_dt$Pathway_high_samples_percent) * 1.20),
+      labels = function(x) paste0(round(x), "%")
+    ) +
+    labs(
+      title = "Epigenetic programs elevated in subsets of pILC tumors",
+      subtitle = paste0("Pathway-high: robust Z score >= ", high_z_threshold,
+                        " relative to the cohort"),
+      x = NULL,
+      y = "Pathway-high tumors",
+      fill = "Program class"
+    ) +
+    theme_bw(base_size = 11) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      panel.grid.major.y = element_blank(),
+      axis.text.y = element_text(size = 7),
+      legend.position = "bottom"
+    )
+
+  save_plot_pair(p_high, "Pathway_high_tumor_fractions", 11, 9)
+}
+
+# ------------------------------------------------------------------------------
+# 12. Unsupervised PCA based on epigenetic pathway scores
+# ------------------------------------------------------------------------------
+
+pca_input <- t(row_zscore(ssgsea_scores))
+pca_fit <- prcomp(pca_input, center = TRUE, scale. = FALSE)
+pca_var <- 100 * (pca_fit$sdev^2 / sum(pca_fit$sdev^2))
+
+pca_dt <- data.table(
+  Sample = rownames(pca_fit$x),
+  PC1 = pca_fit$x[, 1L],
+  PC2 = pca_fit$x[, 2L]
+)
+
+fwrite(
+  pca_dt,
+  file.path(table_dir, paste0("cohortwide_epigenetic_pathway_PCA_scores_", date_tag, ".tsv")),
+  sep = "\t", quote = FALSE, na = ""
+)
+
+p_pca <- ggplot(pca_dt, aes(x = PC1, y = PC2, label = Sample)) +
+  geom_hline(yintercept = 0, color = "grey85", linewidth = 0.4) +
+  geom_vline(xintercept = 0, color = "grey85", linewidth = 0.4) +
+  geom_point(size = 3, color = "#2C7FB8") +
+  geom_text(check_overlap = TRUE, nudge_y = 0.15, size = 3) +
+  labs(
+    title = "Unsupervised pILC sample structure from epigenetic programs",
+    subtitle = "PCA of row-scaled ssGSEA scores; no predefined cluster labels",
+    x = paste0("PC1 (", round(pca_var[1L], 1), "% variance)"),
+    y = paste0("PC2 (", round(pca_var[2L], 1), "% variance)")
+  ) +
+  theme_bw(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+save_plot_pair(p_pca, "Unsupervised_epigenetic_pathway_PCA", 10, 8)
+
+# ------------------------------------------------------------------------------
+# 13. Correlation heatmap for curated and highly variable pathways
+# ------------------------------------------------------------------------------
+
+corr_names <- unique(c(curated_names, head(top_variable_names, 20L)))
+corr_names <- intersect(corr_names, rownames(ssgsea_scores))
+
+if (length(corr_names) >= 3L) {
+  pathway_cor <- cor(t(ssgsea_scores[corr_names, , drop = FALSE]),
+                     method = "spearman", use = "pairwise.complete.obs")
+  fwrite(
+    data.table(Pathway = rownames(pathway_cor), pathway_cor),
+    file.path(table_dir, paste0("epigenetic_pathway_spearman_correlations_", date_tag, ".tsv")),
+    sep = "\t", quote = FALSE, na = ""
+  )
+
+  corr_colors <- colorRampPalette(c("#2166AC", "#F7F7F7", "#B2182B"))(101)
+  png(
+    file.path(plot_dir, paste0("Epigenetic_pathway_correlation_heatmap_", date_tag, ".png")),
+    width = 3000, height = 2700, res = 300
+  )
+  pheatmap(
+    pathway_cor,
+    color = corr_colors,
+    breaks = seq(-1, 1, length.out = 102),
+    cluster_rows = TRUE,
+    cluster_cols = TRUE,
+    border_color = NA,
+    fontsize_row = 6,
+    fontsize_col = 6,
+    main = "Co-variation among epigenetic programs across pILC tumors"
+  )
+  dev.off()
+
+  pdf(
+    file.path(plot_dir, paste0("Epigenetic_pathway_correlation_heatmap_", date_tag, ".pdf")),
+    width = 11, height = 10
+  )
+  pheatmap(
+    pathway_cor,
+    color = corr_colors,
+    breaks = seq(-1, 1, length.out = 102),
+    cluster_rows = TRUE,
+    cluster_cols = TRUE,
+    border_color = NA,
+    fontsize_row = 6,
+    fontsize_col = 6,
+    main = "Co-variation among epigenetic programs across pILC tumors"
+  )
+  dev.off()
+}
+
+# ------------------------------------------------------------------------------
+# 14. Analysis audit and completion messages
+# ------------------------------------------------------------------------------
+
+audit <- data.table(
+  Item = c(
+    "Analysis_date", "Random_seed", "VST_file", "C5_GMT_file", "Clinical_file",
+    "Output_directory",
+    "Genes_used", "Samples_used", "C5_sets_selected_before_expression_filter",
+    "Curated_sets_defined", "Total_sets_scored", "Minimum_gene_set_size",
+    "Maximum_gene_set_size", "Pathway_high_robust_Z_threshold",
+    "Bootstrap_replicates", "Predefined_clusters_used", "Matched_clinical_samples",
+    "Unmatched_RNA_samples", "Clinical_only_samples", "TIL_below_5_plotting_value"
+  ),
+  Value = c(
+    date_tag, "42", vst_file, c5_gmt_file, clinical_file, out_dir,
+    as.character(nrow(expr)), as.character(ncol(expr)), as.character(length(c5_sets)),
+    as.character(length(curated_sets)), as.character(nrow(ssgsea_scores)),
+    as.character(min_gene_set_size), as.character(max_gene_set_size),
+    as.character(high_z_threshold), as.character(n_bootstrap), "No",
+    as.character(sum(clinical_match$Match_status == "Matched")),
+    as.character(sum(clinical_match$Match_status != "Matched")),
+    as.character(nrow(clinical_only)), "2.5"
+  )
+)
+
+fwrite(
+  audit,
+  file.path(table_dir, paste0("cohortwide_epigenetic_analysis_audit_", date_tag, ".tsv")),
+  sep = "\t", quote = FALSE, na = ""
+)
+
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(out_dir, paste0("R_sessionInfo_", date_tag, ".txt"))
+)
+
+message("\nCohort-wide epigenetic analysis completed successfully.")
+message("No predefined RNA cluster labels were used.")
+message("Results saved under: ", out_dir)
+message("Primary summary table: ", file.path(
+  table_dir, paste0("cohortwide_epigenetic_pathway_summary_", date_tag, ".tsv")
+))
+message("Primary heatmap: ", file.path(
+  plot_dir, paste0("Top_variable_epigenetic_programs_heatmap_", date_tag, ".png")
+))
+
+```
+

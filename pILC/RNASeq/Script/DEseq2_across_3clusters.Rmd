@@ -1,0 +1,529 @@
+---
+title: "DEseq2_across_3clusters"
+output: html_document
+date: "2026-09-23"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+set.seed(42)
+
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(data.table)
+  library(ggplot2)
+  library(pheatmap)
+  library(RColorBrewer)
+})
+
+# ============================================================
+# pILC RNA-seq differential expression across three clusters
+#
+# Usage:
+# Rscript pILC_DESeq2_3clusters_2026-09-23.R \
+#   /path/to/htseq_raw_counts_with_gene_names.csv \
+#   /path/to/output_directory
+#
+# Analyses:
+# 1. Global LRT: any expression difference among Clusters 1, 2, 3
+# 2. Wald tests:
+#    - Cluster 1 vs Cluster 2
+#    - Cluster 1 vs Cluster 3
+#    - Cluster 2 vs Cluster 3
+#
+# Positive log2FC means higher expression in the first cluster named.
+# ============================================================
+
+args <- commandArgs(trailingOnly = TRUE)
+
+count_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/4_Count_file_pILC/VST_data/htseq_raw_counts_with_gene_names.csv"
+
+out_root <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/DESeq2/DESeq2_3clusters"
+
+run_date <- format(Sys.Date(), "%Y-%m-%d")
+out_dir <- file.path(out_root, paste0("pILC_DESeq2_3clusters_", run_date))
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+if (!file.exists(count_file)) stop("Count file not found: ", count_file)
+
+# ----------------------------
+# Cluster assignments
+# ----------------------------
+cluster_map <- c(
+  "TP13.1150" = "Cluster 1",
+  "TP07.626" = "Cluster 1",
+  "TP17.M11" = "Cluster 1",
+  "TP03.117" = "Cluster 1",
+  "TP05.668" = "Cluster 1",
+  "TP05.1063" = "Cluster 1",
+  "TP08.1319" = "Cluster 1",
+  "TP13.820" = "Cluster 1",
+  "TP09.746" = "Cluster 1",
+  "TP11.1516" = "Cluster 1",
+
+  "TP08.2202" = "Cluster 2",
+  "TP04.104" = "Cluster 2",
+  "TP05.791" = "Cluster 2",
+  "TP11.372" = "Cluster 2",
+  "TP15.M509" = "Cluster 2",
+  "TP14.490" = "Cluster 2",
+  "TP05.232" = "Cluster 2",
+  "TP08.356" = "Cluster 2",
+  "TP09.9" = "Cluster 2",
+  "TP12.2045" = "Cluster 2",
+
+  "TP12.1864" = "Cluster 3",
+  "TP11.1780" = "Cluster 3",
+  "TP08.370" = "Cluster 3",
+  "TP08.517" = "Cluster 3",
+  "TP10.705" = "Cluster 3",
+  "TP05.726" = "Cluster 3",
+  "TP07.197" = "Cluster 3",
+  "TP13.862" = "Cluster 3",
+  "TP14.586" = "Cluster 3",
+  "TP11.1127" = "Cluster 3",
+  "TP12.880" = "Cluster 3"
+)
+
+cluster_colors <- c(
+  "Cluster 1" = "#1B9E77",
+  "Cluster 2" = "#D95F02",
+  "Cluster 3" = "#7570B3"
+)
+
+# ----------------------------
+# Read and validate counts
+# ----------------------------
+count_dt <- fread(count_file, data.table = TRUE)
+
+if (!("Gene" %in% names(count_dt))) stop("Input must contain a column named 'Gene'.")
+if (anyDuplicated(count_dt$Gene)) stop("Duplicate gene names detected. Resolve before DESeq2.")
+if (anyNA(count_dt$Gene) || any(count_dt$Gene == "")) stop("Missing gene names detected.")
+
+sample_cols <- setdiff(names(count_dt), "Gene")
+missing_samples <- setdiff(names(cluster_map), sample_cols)
+extra_samples <- setdiff(sample_cols, names(cluster_map))
+
+if (length(missing_samples)) {
+  stop("Cluster samples missing from count matrix: ", paste(missing_samples, collapse = ", "))
+}
+if (length(extra_samples)) {
+  stop("Count samples without cluster assignment: ", paste(extra_samples, collapse = ", "))
+}
+
+# Match count columns exactly to the declared metadata order.
+count_dt <- count_dt[, c("Gene", names(cluster_map)), with = FALSE]
+count_matrix <- as.matrix(count_dt[, -"Gene"])
+rownames(count_matrix) <- count_dt$Gene
+storage.mode(count_matrix) <- "numeric"
+
+if (anyNA(count_matrix)) stop("Missing count values detected.")
+if (any(count_matrix < 0)) stop("Negative count values detected.")
+if (any(count_matrix != round(count_matrix))) stop("Non-integer count values detected.")
+storage.mode(count_matrix) <- "integer"
+
+# Remove HTSeq summary rows if present.
+summary_rows <- grepl("^__", rownames(count_matrix))
+if (any(summary_rows)) count_matrix <- count_matrix[!summary_rows, , drop = FALSE]
+
+metadata <- data.frame(
+  Sample = names(cluster_map),
+  Cluster = factor(
+    unname(cluster_map),
+    levels = c("Cluster 1", "Cluster 2", "Cluster 3")
+  ),
+  row.names = names(cluster_map),
+  check.names = FALSE
+)
+
+fwrite(
+  as.data.table(metadata, keep.rownames = FALSE),
+  file.path(out_dir, paste0("pILC_cluster_metadata_", run_date, ".tsv")),
+  sep = "\t"
+)
+
+# ----------------------------
+# DESeq2 object and prefiltering
+# ----------------------------
+dds0 <- DESeqDataSetFromMatrix(
+  countData = count_matrix,
+  colData = metadata,
+  design = ~ Cluster
+)
+
+# Retain genes with >=10 reads in at least 3 tumors.
+keep <- rowSums(counts(dds0) >= 10) >= 3
+filter_audit <- data.table(
+  Gene = rownames(dds0),
+  Total_count = rowSums(counts(dds0)),
+  Samples_with_count_ge_10 = rowSums(counts(dds0) >= 10),
+  Retained_for_DESeq2 = keep
+)
+fwrite(
+  filter_audit,
+  file.path(out_dir, paste0("pILC_DESeq2_gene_filter_audit_", run_date, ".tsv")),
+  sep = "\t"
+)
+
+dds <- dds0[keep, ]
+message("Genes before filtering: ", nrow(dds0))
+message("Genes retained: ", nrow(dds))
+
+# ----------------------------
+# Global likelihood-ratio test
+# ----------------------------
+dds_lrt <- DESeq(
+  dds,
+  test = "LRT",
+  reduced = ~ 1,
+  parallel = FALSE,
+  quiet = FALSE
+)
+
+lrt <- as.data.table(as.data.frame(results(dds_lrt)), keep.rownames = "Gene")
+setorder(lrt, padj, pvalue, -baseMean, na.last = TRUE)
+lrt[, Significant_FDR05 := !is.na(padj) & padj < 0.05]
+
+fwrite(
+  lrt,
+  file.path(out_dir, paste0("pILC_DESeq2_global_LRT_any_cluster_", run_date, ".tsv")),
+  sep = "\t", quote = FALSE, na = ""
+)
+
+# ----------------------------
+# Pairwise Wald tests
+# ----------------------------
+dds_wald <- DESeq(
+  dds,
+  test = "Wald",
+  parallel = FALSE,
+  quiet = FALSE
+)
+
+comparisons <- list(
+  Cluster1_vs_Cluster2 = c("Cluster", "Cluster 1", "Cluster 2"),
+  Cluster1_vs_Cluster3 = c("Cluster", "Cluster 1", "Cluster 3"),
+  Cluster2_vs_Cluster3 = c("Cluster", "Cluster 2", "Cluster 3")
+)
+
+result_list <- list()
+
+for (comparison_name in names(comparisons)) {
+  contrast_vector <- comparisons[[comparison_name]]
+
+  raw_result <- results(
+    dds_wald,
+    contrast = contrast_vector,
+    alpha = 0.05,
+    independentFiltering = TRUE
+  )
+
+  # Built-in normal shrinkage avoids requiring an additional Bioconductor package.
+  shrunk_result <- tryCatch(
+    lfcShrink(
+      dds_wald,
+      contrast = contrast_vector,
+      res = raw_result,
+      type = "normal"
+    ),
+    error = function(e) {
+      warning("LFC shrinkage failed for ", comparison_name, ": ", conditionMessage(e))
+      raw_result
+    }
+  )
+
+  result_dt <- as.data.table(as.data.frame(shrunk_result), keep.rownames = "Gene")
+  result_dt[, Comparison := comparison_name]
+  result_dt[, Significant_FDR05 := !is.na(padj) & padj < 0.05]
+  result_dt[, Significant_FDR05_LFC1 :=
+    !is.na(padj) & padj < 0.05 & abs(log2FoldChange) >= 1]
+  result_dt[, Direction := fifelse(
+    Significant_FDR05_LFC1 & log2FoldChange > 0,
+    paste0("Higher_in_", contrast_vector[2]),
+    fifelse(
+      Significant_FDR05_LFC1 & log2FoldChange < 0,
+      paste0("Higher_in_", contrast_vector[3]),
+      "Not_significant"
+    )
+  )]
+  result_dt[, Abs_log2FC_for_sorting := abs(log2FoldChange)]
+
+	setorder(
+	  result_dt,
+	  padj,
+	  pvalue,
+	  -Abs_log2FC_for_sorting,
+	  na.last = TRUE
+	)
+
+	result_dt[, Abs_log2FC_for_sorting := NULL]
+
+  result_list[[comparison_name]] <- result_dt
+
+  fwrite(
+    result_dt,
+    file.path(out_dir, paste0("pILC_DESeq2_", comparison_name, "_", run_date, ".tsv")),
+    sep = "\t", quote = FALSE, na = ""
+  )
+}
+
+all_pairwise <- rbindlist(result_list, use.names = TRUE, fill = TRUE)
+fwrite(
+  all_pairwise,
+  file.path(out_dir, paste0("pILC_DESeq2_all_pairwise_results_", run_date, ".tsv")),
+  sep = "\t", quote = FALSE, na = ""
+)
+
+# ----------------------------
+# Normalized counts and VST
+# ----------------------------
+normalized_counts <- counts(dds_wald, normalized = TRUE)
+normalized_dt <- as.data.table(normalized_counts, keep.rownames = "Gene")
+fwrite(
+  normalized_dt,
+  file.path(out_dir, paste0("pILC_DESeq2_normalized_counts_", run_date, ".tsv")),
+  sep = "\t", quote = FALSE
+)
+
+cluster_means <- data.table(Gene = rownames(normalized_counts))
+for (cluster_name in levels(metadata$Cluster)) {
+  samples <- rownames(metadata)[metadata$Cluster == cluster_name]
+  safe_name <- gsub(" ", "_", cluster_name)
+  cluster_means[, (paste0(safe_name, "_mean_normalized_count")) :=
+    rowMeans(normalized_counts[, samples, drop = FALSE])]
+}
+fwrite(
+  cluster_means,
+  file.path(out_dir, paste0("pILC_DESeq2_cluster_mean_normalized_counts_", run_date, ".tsv")),
+  sep = "\t", quote = FALSE
+)
+
+vst_object <- vst(dds_wald, blind = FALSE)
+vst_matrix <- assay(vst_object)
+fwrite(
+  as.data.table(vst_matrix, keep.rownames = "Gene"),
+  file.path(out_dir, paste0("pILC_DESeq2_VST_from_raw_counts_", run_date, ".tsv")),
+  sep = "\t", quote = FALSE
+)
+
+# ----------------------------
+# PCA
+# ----------------------------
+pca_data <- plotPCA(vst_object, intgroup = "Cluster", returnData = TRUE)
+percent_var <- round(100 * attr(pca_data, "percentVar"), 1)
+
+pca_plot <- ggplot(pca_data, aes(PC1, PC2, color = Cluster, label = name)) +
+  geom_point(size = 4) +
+  geom_text(size = 2.7, vjust = -0.8, show.legend = FALSE) +
+  scale_color_manual(values = cluster_colors, drop = FALSE) +
+  labs(
+    title = "pILC RNA-seq PCA by expression cluster",
+    subtitle = "DESeq2 VST generated from raw HTSeq counts",
+    x = paste0("PC1: ", percent_var[1], "% variance"),
+    y = paste0("PC2: ", percent_var[2], "% variance")
+  ) +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank(),
+    legend.title = element_blank()
+  )
+
+ggsave(
+  file.path(out_dir, paste0("pILC_DESeq2_PCA_clusters_", run_date, ".png")),
+  pca_plot, width = 9, height = 7, dpi = 300
+)
+ggsave(
+  file.path(out_dir, paste0("pILC_DESeq2_PCA_clusters_", run_date, ".pdf")),
+  pca_plot, width = 9, height = 7
+)
+
+# ----------------------------
+# Volcano plots
+# ----------------------------
+for (comparison_name in names(result_list)) {
+  x <- copy(result_list[[comparison_name]])
+  x[, minus_log10_padj := -log10(pmax(padj, .Machine$double.xmin))]
+  x[is.na(minus_log10_padj), minus_log10_padj := 0]
+
+  contrast_vector <- comparisons[[comparison_name]]
+  up_label <- paste0("Higher in ", contrast_vector[2])
+  down_label <- paste0("Higher in ", contrast_vector[3])
+  x[, Plot_group := "Not significant"]
+  x[Significant_FDR05_LFC1 & log2FoldChange > 0, Plot_group := up_label]
+  x[Significant_FDR05_LFC1 & log2FoldChange < 0, Plot_group := down_label]
+
+  plot_colors <- c(
+    "Not significant" = "#BDBDBD",
+    setNames(cluster_colors[contrast_vector[2]], up_label),
+    setNames(cluster_colors[contrast_vector[3]], down_label)
+  )
+
+  volcano <- ggplot(x, aes(log2FoldChange, minus_log10_padj, color = Plot_group)) +
+    geom_point(alpha = 0.65, size = 1.3) +
+    geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "grey35") +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey35") +
+    scale_color_manual(values = plot_colors, drop = FALSE) +
+    labs(
+      title = gsub("_", " ", comparison_name),
+      subtitle = "DESeq2; FDR <0.05 and |shrunken log2FC| >=1",
+      x = paste0("Log2 fold change: ", contrast_vector[2], " / ", contrast_vector[3]),
+      y = "-log10 adjusted P-value",
+      color = NULL
+    ) +
+    theme_bw(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      panel.grid.minor = element_blank(),
+      legend.position = "bottom"
+    )
+
+  ggsave(
+    file.path(out_dir, paste0("pILC_DESeq2_volcano_", comparison_name, "_", run_date, ".png")),
+    volcano, width = 8.5, height = 7, dpi = 300
+  )
+  ggsave(
+    file.path(out_dir, paste0("pILC_DESeq2_volcano_", comparison_name, "_", run_date, ".pdf")),
+    volcano, width = 8.5, height = 7
+  )
+}
+
+# ----------------------------
+# Global LRT heatmap: top 100 genes by adjusted P-value
+# ----------------------------
+top_lrt_genes <- head(lrt[!is.na(padj), Gene], 100)
+if (length(top_lrt_genes) >= 2) {
+  heatmap_matrix <- vst_matrix[top_lrt_genes, , drop = FALSE]
+  heatmap_matrix <- t(scale(t(heatmap_matrix)))
+  heatmap_matrix[heatmap_matrix > 2.5] <- 2.5
+  heatmap_matrix[heatmap_matrix < -2.5] <- -2.5
+
+  annotation_col <- data.frame(Cluster = metadata$Cluster)
+  rownames(annotation_col) <- rownames(metadata)
+  annotation_colors <- list(Cluster = cluster_colors)
+
+  png(
+    file.path(out_dir, paste0("pILC_DESeq2_global_LRT_top100_heatmap_", run_date, ".png")),
+    width = 3000, height = 3600, res = 300
+  )
+  pheatmap(
+    heatmap_matrix,
+    color = colorRampPalette(c("#2166AC", "white", "#B2182B"))(101),
+    annotation_col = annotation_col,
+    annotation_colors = annotation_colors,
+    cluster_rows = TRUE,
+    cluster_cols = TRUE,
+    show_colnames = TRUE,
+    show_rownames = TRUE,
+    fontsize_row = 5,
+    fontsize_col = 7,
+    border_color = NA,
+    main = "Top 100 genes differing across the three RNA clusters"
+  )
+  dev.off()
+
+  pdf(
+    file.path(out_dir, paste0("pILC_DESeq2_global_LRT_top100_heatmap_", run_date, ".pdf")),
+    width = 12, height = 14
+  )
+  pheatmap(
+    heatmap_matrix,
+    color = colorRampPalette(c("#2166AC", "white", "#B2182B"))(101),
+    annotation_col = annotation_col,
+    annotation_colors = annotation_colors,
+    cluster_rows = TRUE,
+    cluster_cols = TRUE,
+    show_colnames = TRUE,
+    show_rownames = TRUE,
+    fontsize_row = 5,
+    fontsize_col = 7,
+    border_color = NA,
+    main = "Top 100 genes differing across the three RNA clusters"
+  )
+  dev.off()
+}
+
+# ----------------------------
+# Summary table
+# ----------------------------
+summary_dt <- rbindlist(lapply(names(result_list), function(comparison_name) {
+  x <- result_list[[comparison_name]]
+  contrast_vector <- comparisons[[comparison_name]]
+  data.table(
+    Analysis = comparison_name,
+    Cluster_A = contrast_vector[2],
+    Cluster_B = contrast_vector[3],
+    Tested_genes = nrow(x),
+    FDR05_genes = sum(x$Significant_FDR05, na.rm = TRUE),
+    FDR05_LFC1_genes = sum(x$Significant_FDR05_LFC1, na.rm = TRUE),
+    Higher_in_Cluster_A = sum(
+      x$Significant_FDR05_LFC1 & x$log2FoldChange > 0,
+      na.rm = TRUE
+    ),
+    Higher_in_Cluster_B = sum(
+      x$Significant_FDR05_LFC1 & x$log2FoldChange < 0,
+      na.rm = TRUE
+    )
+  )
+}))
+
+global_row <- data.table(
+  Analysis = "Global_LRT_any_cluster",
+  Cluster_A = "All",
+  Cluster_B = "All",
+  Tested_genes = nrow(lrt),
+  FDR05_genes = sum(lrt$Significant_FDR05, na.rm = TRUE),
+  FDR05_LFC1_genes = NA_integer_,
+  Higher_in_Cluster_A = NA_integer_,
+  Higher_in_Cluster_B = NA_integer_
+)
+
+summary_dt <- rbind(global_row, summary_dt, fill = TRUE)
+fwrite(
+  summary_dt,
+  file.path(out_dir, paste0("pILC_DESeq2_analysis_summary_", run_date, ".tsv")),
+  sep = "\t", quote = FALSE, na = ""
+)
+
+writeLines(
+  c(
+    paste0("pILC three-cluster DESeq2 analysis generated: ", run_date),
+    "Seed: 42",
+    "Input: raw HTSeq integer counts",
+    "Design: ~ Cluster",
+    "Prefilter: count >=10 in at least 3 samples",
+    "Global test: likelihood-ratio test, reduced model ~1",
+    "Pairwise tests: Wald tests with normal LFC shrinkage",
+    "Primary significance definition: adjusted P <0.05 and |shrunken log2FC| >=1",
+    "Important: clusters were derived from these expression data. Results describe cluster-characterizing genes and are not independent validation."
+  ),
+  file.path(out_dir, paste0("README_pILC_DESeq2_", run_date, ".txt"))
+)
+
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(out_dir, paste0("sessionInfo_", run_date, ".txt"))
+)
+
+# Create one archive for upload/review.
+archive_file <- file.path(out_root, paste0("pILC_DESeq2_3clusters_", run_date, ".tar.gz"))
+old_wd <- getwd()
+setwd(out_root)
+on.exit(setwd(old_wd), add = TRUE)
+utils::tar(
+  archive_file,
+  files = basename(out_dir),
+  compression = "gzip",
+  tar = "internal"
+)
+
+message("DESeq2 analysis completed.")
+message("Output directory: ", out_dir)
+message("Archive to upload: ", archive_file)
+print(summary_dt)
+
+```
+

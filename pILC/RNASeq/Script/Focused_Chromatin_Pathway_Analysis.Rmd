@@ -1,0 +1,1904 @@
+---
+title: "Focused_Chromatin_Pathway_Analysis"
+output: html_document
+date: "2026-09-24"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r}
+set.seed(42)
+
+# ============================================================
+# pILC RNA-seq: hypothesis-driven chromatin pathway analysis
+# Date: 2026-09-24
+#
+# Analyses
+#   1. DESeq2 VST from raw HTSeq counts
+#   2. ENSG-to-HGNC mapping audit (unresolved ENSG IDs are retained)
+#   3. Focused pathway extraction from MSigDB C5
+#   4. Curated chromatin-remodeling and chromatin-protein-modification sets
+#   5. Sample-level ssGSEA pathway scores and cluster comparisons
+#   6. Cluster-versus-rest and pairwise DESeq2 ranking with fgseaMultilevel
+#   7. Pathway, GSEA and leading-edge visualizations
+#
+# Display labels  # [LABELS]
+#   Original pathway IDs (e.g. C5__GOCC_GBAF_COMPLEX) are kept unchanged in
+#   all data objects. Figures show cleaned labels (e.g. "GBAF complex [GO-CC]"),
+#   and result tables carry both the ID and a Pathway_label column.
+#
+# Clinical annotation  # [CLINICAL]
+#   Sample-level heatmaps hide sample names and show clinical tracks
+#   (tumor cellularity, pleomorphic cellularity, TILs, grade, HER2, ER, PR)
+#   below the matrix, using the same parsing rules and colors as the
+#   functional-category oncoplot script.
+#
+# Important interpretation
+#   The three clusters were derived from these expression data. Results
+#   characterize the clusters and do not constitute independent validation.
+# ============================================================
+
+suppressPackageStartupMessages({
+  required_packages <- c(
+    "DESeq2", "data.table", "fgsea", "GSVA", "ggplot2",
+    "ComplexHeatmap", "circlize", "grid", "AnnotationDbi", "org.Hs.eg.db"
+  )
+
+  missing_packages <- required_packages[
+    !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+  ]
+
+  if (length(missing_packages) > 0) {
+    stop(
+      "Missing required packages: ", paste(missing_packages, collapse = ", "),
+      "\nInstall Bioconductor packages with:\n",
+      "if (!requireNamespace('BiocManager', quietly=TRUE)) install.packages('BiocManager')\n",
+      "BiocManager::install(c(",
+      paste(sprintf("'%s'", missing_packages), collapse = ", "),
+      "))"
+    )
+  }
+
+  library(DESeq2)
+  library(data.table)
+  library(fgsea)
+  library(GSVA)
+  library(ggplot2)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(grid)
+  library(AnnotationDbi)
+  library(org.Hs.eg.db)
+})
+
+graphics.off()
+
+# ============================================================
+# Input and output paths
+# ============================================================
+
+count_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/4_Count_file_pILC/VST_data/htseq_raw_counts_with_gene_names.csv"
+
+cluster_gct_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/NMF/GenePattern_NMFConsensus/vst_transformed_data.consensus.k.3.gct"
+
+c5_gmt_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/GSEA/Dataset/c5.all.v2025.1.Hs.symbols.gmt"
+
+# [CLINICAL] Same clinical file used by the functional-category oncoplot script
+clinical_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/Clinical_correlation/pILC_ClinicoPathological_details.csv"
+
+out_root <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/Downstream/Focused_Chromatin_Pathway_Analysis"
+
+run_date <- format(Sys.Date(), "%Y-%m-%d")
+out_dir <- file.path(
+  out_root,
+  paste0("pILC_Focused_Chromatin_Pathway_Analysis_", run_date)
+)
+table_dir <- file.path(out_dir, "tables")
+plot_dir <- file.path(out_dir, "plots")
+
+dir.create(table_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+
+input_files <- c(
+  count_file = count_file,
+  cluster_gct_file = cluster_gct_file,
+  c5_gmt_file = c5_gmt_file,
+  clinical_file = clinical_file          # [CLINICAL]
+)
+
+missing_inputs <- names(input_files)[!file.exists(input_files)]
+if (length(missing_inputs) > 0) {
+  stop(
+    "Required input file(s) not found:\n",
+    paste0(missing_inputs, ": ", input_files[missing_inputs], collapse = "\n")
+  )
+}
+
+fwrite(
+  data.table(Input = names(input_files), Path = unname(input_files)),
+  file.path(table_dir, paste0("input_file_audit_", run_date, ".tsv")),
+  sep = "\t"
+)
+
+# ============================================================
+# Helper functions
+# ============================================================
+
+clean_gene <- function(x) {
+  x <- toupper(trimws(as.character(x)))
+  x[is.na(x)] <- ""
+  x
+}
+
+clean_sample <- function(x) {
+  x <- trimws(as.character(x))
+  sub("_S[0-9]+$", "", x)
+}
+
+safe_name <- function(x) {
+  gsub("[^A-Za-z0-9]+", "_", x)
+}
+
+zscore_rows <- function(mat, cap = 2.5) {
+  z <- t(scale(t(mat)))
+  z[!is.finite(z)] <- 0
+  z[z > cap] <- cap
+  z[z < -cap] <- -cap
+  z
+}
+
+prefix_pathways <- function(pathways, prefix) {
+  if (!length(pathways)) return(list())
+  pathways <- lapply(pathways, function(g) unique(clean_gene(g)))
+  pathways <- lapply(pathways, function(g) g[g != ""])
+  names(pathways) <- paste0(prefix, "__", make.unique(names(pathways)))
+  pathways
+}
+
+write_matrix_tsv <- function(mat, row_name, file) {
+  dt <- as.data.table(mat, keep.rownames = row_name)
+  fwrite(dt, file, sep = "\t", quote = FALSE, na = "")
+}
+
+# ------------------------------------------------------------
+# [LABELS] Pathway display-label helpers
+#
+# These functions convert a pathway ID such as
+#   C5__GOMF_HISTONE_H3K27_METHYLTRANSFERASE_ACTIVITY
+# into a readable figure label such as
+#   Histone H3K27 methyltransferase activity [GO-MF]
+# The IDs themselves are never modified.
+# ------------------------------------------------------------
+
+# Words that must stay fully upper case after sentence-casing.
+label_acronyms <- c(
+  "DNA", "RNA", "ATP", "SWI/SNF", "BAF", "GBAF", "BBAF", "NBAF", "NPBAF",
+  "PBAF", "NURF", "INO80", "SWR1", "PRC1", "PRC2", "HAT", "HDAC", "SUMO",
+  "TET", "DNMT", "SAGA", "ATAC", "NUA4", "ISWI", "CENP", "MLL", "COMPASS",
+  "SIN3"
+)
+
+# Words with a fixed mixed-case spelling.
+label_special_case <- c(
+  RDNA = "rDNA", NURD = "NuRD", MRNA = "mRNA", TRNA = "tRNA", RRNA = "rRNA"
+)
+
+# Phrase-level fixes applied after the label is assembled
+# (hyphens, parentheses and small wording improvements).
+label_phrase_fixes <- c(
+  "ATP dependent" = "ATP-dependent",
+  "elongation coupled" = "elongation-coupled",
+  "superfamily type" = "superfamily-type",
+  "activity hydrolytic mechanism" = "activity (hydrolytic mechanism)",
+  "SWI/SNF BAF" = "SWI/SNF-BAF",
+  "acetyltransferase HAT" = "acetyltransferase (HAT)",
+  "writers readers" = "writers and readers",
+  "phosphorylation DNA damage" = "phosphorylation (DNA damage)",
+  "remodeling expanded" = "remodeling (expanded)"
+)
+
+# Format a single word: keep acronyms and histone marks, lower-case the rest.
+format_label_word <- function(word) {
+  if (word %in% names(label_special_case)) return(label_special_case[[word]])
+  if (word %in% label_acronyms) return(word)
+  # Histone names and marks: H3, H4, H2A, H2AX, H2AZ, H3K27, H4K16, ...
+  if (grepl("^H[1-4](A|B)?(X|Z)?[0-9]*(K[0-9]+)?$", word)) return(word)
+  tolower(word)
+}
+
+# Convert one pathway ID into a display label.
+clean_one_label <- function(pathway_id) {
+  # Step 1: source prefix (C5, CURATED) and the term without it.
+  source_code <- sub("__.*$", "", pathway_id)
+  term <- sub("^[A-Za-z0-9]+__", "", pathway_id)
+
+  # Step 2: remove the ".1", ".2" suffix added by make.unique().
+  term <- sub("\\.[0-9]+$", "", term)
+
+  # Step 3: build the short source tag; for C5, use the GO sub-ontology.
+  source_tag <- switch(
+    source_code,
+    CURATED = "Curated",
+    source_code
+  )
+  if (source_code == "C5") {
+    ontology <- sub("_.*$", "", term)
+    ontology_tags <- c(GOBP = "GO-BP", GOCC = "GO-CC", GOMF = "GO-MF", HP = "HPO")
+    if (ontology %in% names(ontology_tags)) {
+      source_tag <- ontology_tags[[ontology]]
+      term <- sub("^[A-Z]+_", "", term)
+    }
+  }
+
+  # Step 4: split into words; keep SWI/SNF together as one word.
+  term <- toupper(term)
+  term <- gsub("SWI_SNF", "SWI/SNF", term, fixed = TRUE)
+  words <- strsplit(term, "_", fixed = TRUE)[[1]]
+  words <- words[words != ""]
+  if (!length(words)) return(pathway_id)
+
+  # Step 5: sentence case with protected acronyms and histone marks.
+  words <- vapply(words, format_label_word, character(1), USE.NAMES = FALSE)
+  if (words[1] == tolower(words[1])) {
+    substr(words[1], 1, 1) <- toupper(substr(words[1], 1, 1))
+  }
+  label <- paste(words, collapse = " ")
+
+  # Step 6: phrase-level wording fixes.
+  for (phrase in names(label_phrase_fixes)) {
+    label <- gsub(phrase, label_phrase_fixes[[phrase]], label, fixed = TRUE)
+  }
+
+  paste0(label, " [", source_tag, "]")
+}
+
+# Look up display labels for a vector of pathway IDs.
+# pathway_label_map is created after the final pathway list is defined.
+# IDs missing from the map fall back to the original ID.
+pathway_label <- function(ids) {
+  ids <- as.character(ids)
+  labels <- unname(pathway_label_map[ids])
+  ifelse(is.na(labels), ids, labels)
+}
+
+# ------------------------------------------------------------
+# [CLINICAL] Helpers for the clinical annotation
+# ------------------------------------------------------------
+
+# Join key used ONLY to match RNA samples to the clinical table.
+# (clean_sample() above is unchanged and still used for count matching.)
+#   1. upper-case and trim
+#   2. remove the GenePattern "_S#" suffix
+#   3. remove a tumor suffix: "_T", "-T" or ".T"
+#   4. remove all separators so "TP03-117", "TP03.117" and "TP03_117" match
+clinical_key <- function(x) {
+  x <- toupper(trimws(as.character(x)))
+  x <- sub("_S[0-9]+$", "", x)
+  x <- sub("[-_.]T$", "", x)
+  gsub("[^A-Z0-9]", "", x)
+}
+
+# Percent text -> numeric; "<5" is coded as half the bound (2.5),
+# the same rule as in the oncoplot script.
+parse_percent_value <- function(x) {
+  x <- trimws(as.character(x))
+  x[x %in% c("", "NA", "N/A", "NaN", "nan")] <- NA_character_
+  is_less_than <- grepl("^<", x)
+  val <- suppressWarnings(as.numeric(gsub("[^0-9.]", "", x)))
+  val[is_less_than & !is.na(val)] <- val[is_less_than & !is.na(val)] / 2
+  val
+}
+
+# Receptor text -> Positive / Negative / Unknown
+clean_receptor_status <- function(x) {
+  x <- gsub("\\s+", " ", trimws(as.character(x)))
+  out <- rep("Unknown", length(x))
+  out[grepl("^Positive", x, ignore.case = TRUE)] <- "Positive"
+  out[grepl("^Negative", x, ignore.case = TRUE)] <- "Negative"
+  out[is.na(x) | x %in% c("", "NA", "N/A", "NaN", "nan")] <- "Unknown"
+  out
+}
+
+# Grade text -> cleaned text; missing values become "Unknown"
+clean_grade_status <- function(x) {
+  x <- gsub("\\s+", " ", trimws(as.character(x)))
+  x[is.na(x) | x %in% c("", "NA", "N/A", "NaN", "nan")] <- "Unknown"
+  x
+}
+
+# ============================================================
+# Read NMF cluster membership
+# ============================================================
+
+cluster_dt <- fread(cluster_gct_file, skip = 2, data.table = TRUE)
+
+required_cluster_cols <- c("Name", "Description")
+if (!all(required_cluster_cols %in% names(cluster_dt))) {
+  stop("Cluster GCT must contain Name and Description columns.")
+}
+
+membership_cols <- grep("^membership", names(cluster_dt), value = TRUE)
+if (length(membership_cols) != 1) {
+  stop(
+    "Expected exactly one membership column in cluster GCT; found: ",
+    paste(membership_cols, collapse = ", ")
+  )
+}
+
+cluster_dt <- cluster_dt[
+  ,
+  .(
+    Sample_original = Name,
+    Sample = clean_sample(Name),
+    Cluster_number = as.integer(get(membership_cols[1]))
+  )
+]
+
+if (anyNA(cluster_dt$Cluster_number)) {
+  stop("Non-numeric or missing cluster memberships detected.")
+}
+
+if (anyDuplicated(cluster_dt$Sample)) {
+  stop("Duplicate samples after removing GenePattern _S suffixes.")
+}
+
+cluster_dt[, Cluster := factor(
+  paste0("Cluster ", Cluster_number),
+  levels = c("Cluster 1", "Cluster 2", "Cluster 3")
+)]
+
+if (anyNA(cluster_dt$Cluster)) {
+  stop("Cluster membership must be 1, 2 or 3.")
+}
+
+cluster_colors <- c(
+  "Cluster 1" = "#1B9E77",
+  "Cluster 2" = "#D95F02",
+  "Cluster 3" = "#7570B3"
+)
+
+# ============================================================
+# Centralized figure styling
+# ============================================================
+
+figure_text_color <- "#000000"
+
+# ggplot font sizes
+figure_base_size <- 14
+figure_title_size <- 18
+figure_subtitle_size <- 13
+figure_axis_size <- 12
+figure_small_text_size <- 10
+
+# ComplexHeatmap font sizes
+heatmap_row_fontsize <- 9      # [LABELS] used for pathway row labels
+heatmap_column_fontsize <- 10
+
+# [LABELS] Font size for pathway labels on ggplot y-axes
+pathway_label_text_size <- 9
+
+# ------------------------------------------------------------
+# [CLINICAL] Colors (identical to the oncoplot script)
+# ------------------------------------------------------------
+grade_cols <- c(
+  "Grade I"   = "#A6CEE3",
+  "Grade II"  = "#33A02C",
+  "Grade III" = "#1F78B4",
+  "Cell type not determined" = "#E31A1C",
+  "Unknown"   = "#BDBDBD"
+)
+
+binary_receptor_cols <- c(
+  "Negative" = "#1F78B4",
+  "Positive" = "#E31A1C",
+  "Unknown"  = "#BDBDBD"
+)
+
+setorder(cluster_dt, Cluster_number)
+
+fwrite(
+  cluster_dt,
+  file.path(
+    table_dir,
+    paste0("pILC_cluster_metadata_", run_date, ".tsv")
+  ),
+  sep = "\t"
+)
+
+message("Cluster sizes:")
+print(cluster_dt[, .N, by = Cluster])
+
+# ============================================================
+# [CLINICAL] Read clinical annotations and match to RNA samples
+# ============================================================
+
+clinical_raw <- fread(
+  clinical_file,
+  sep = ",", header = TRUE, fill = TRUE,
+  na.strings = c("", "NA", "NaN", "N/A")
+)
+
+# Exact column names from the clinical CSV (same as the oncoplot script).
+required_clinical_cols <- c(
+  "Sample",
+  "tumor_cellularity (%)",
+  "pleomorphic_invasive_compoent_cellularity (%)",
+  "TILs (%)",
+  "Grade/Differentiation-Desc",
+  "BREAST: Her-2/Neu-Desc",
+  "Tumor Marker #1 (ER)",
+  "Tumor Marker #2 (PR)"
+)
+missing_clinical_cols <- setdiff(required_clinical_cols, names(clinical_raw))
+if (length(missing_clinical_cols) > 0) {
+  stop(
+    "Clinical file is missing column(s): ",
+    paste(missing_clinical_cols, collapse = ", ")
+  )
+}
+
+# Parse each clinical feature with the same rules as the oncoplot script.
+clinical_dt <- clinical_raw[, .(
+  Clinical_sample       = as.character(Sample),
+  Sample_key            = clinical_key(Sample),
+  Tumor_cellularity_pct = parse_percent_value(`tumor_cellularity (%)`),
+  Pleomorphic_pct       = parse_percent_value(`pleomorphic_invasive_compoent_cellularity (%)`),
+  TILs_pct              = parse_percent_value(`TILs (%)`),
+  Grade                 = clean_grade_status(`Grade/Differentiation-Desc`),
+  HER2                  = clean_receptor_status(`BREAST: Her-2/Neu-Desc`),
+  ER                    = clean_receptor_status(`Tumor Marker #1 (ER)`),
+  PR                    = clean_receptor_status(`Tumor Marker #2 (PR)`)
+)]
+clinical_dt <- clinical_dt[!is.na(Sample_key) & Sample_key != ""]
+
+if (anyDuplicated(clinical_dt$Sample_key)) {
+  warning("Duplicate clinical sample keys found; keeping the first row for each.")
+  clinical_dt <- unique(clinical_dt, by = "Sample_key")
+}
+
+# RNA samples in plotting order (cluster_dt is already sorted by cluster).
+rna_key_dt <- data.table(
+  Column_index = seq_len(nrow(cluster_dt)),
+  Sample       = cluster_dt$Sample,
+  Sample_key   = clinical_key(cluster_dt$Sample),
+  Cluster      = cluster_dt$Cluster
+)
+if (anyDuplicated(rna_key_dt$Sample_key)) {
+  stop("Two RNA samples collapse to the same clinical key; check sample IDs.")
+}
+
+# Left join: every RNA sample is kept; unmatched samples get NA clinical values.
+sample_clinical_dt <- merge(
+  rna_key_dt, clinical_dt,
+  by = "Sample_key", all.x = TRUE, sort = FALSE
+)
+setorder(sample_clinical_dt, Column_index)
+sample_clinical_dt[, Clinical_matched := !is.na(Clinical_sample)]
+
+# Unmatched samples: categorical tracks show "Unknown";
+# numeric tracks stay NA and are drawn grey.
+for (cc in c("Grade", "HER2", "ER", "PR")) {
+  sample_clinical_dt[is.na(get(cc)), (cc) := "Unknown"]
+}
+
+message(
+  "RNA samples matched to clinical data: ",
+  sum(sample_clinical_dt$Clinical_matched), " / ", nrow(sample_clinical_dt)
+)
+if (any(!sample_clinical_dt$Clinical_matched)) {
+  warning(
+    "RNA samples without clinical match: ",
+    paste(sample_clinical_dt[Clinical_matched == FALSE, Sample], collapse = ", ")
+  )
+}
+
+# Saved in the same column order as the heatmaps (paired table for the figures).
+setcolorder(sample_clinical_dt, c("Column_index", "Sample", "Sample_key", "Cluster"))
+fwrite(
+  sample_clinical_dt,
+  file.path(table_dir, paste0("pILC_RNA_sample_order_and_clinical_annotation_", run_date, ".tsv")),
+  sep = "\t", quote = FALSE, na = ""
+)
+
+# ------------------------------------------------------------
+# [CLINICAL] Bottom clinical annotation builder
+# sample_order must be identical to the heatmap matrix column order.
+# ------------------------------------------------------------
+build_clinical_annotation <- function(sample_order) {
+
+  clin <- sample_clinical_dt[match(sample_order, Sample)]
+
+  anno_df <- data.frame(
+    `Tumor cell. (%)` = clin$Tumor_cellularity_pct,
+    `Pleomorphic (%)` = clin$Pleomorphic_pct,
+    `TILs (%)`        = clin$TILs_pct,
+    Grade             = clin$Grade,
+    HER2              = clin$HER2,
+    ER                = clin$ER,
+    PR                = clin$PR,
+    check.names = FALSE,
+    row.names = sample_order
+  )
+
+  # Any grade label not in the palette gets an automatic color.
+  grade_cols_local <- grade_cols
+  extra_grades <- setdiff(unique(na.omit(anno_df$Grade)), names(grade_cols))
+  if (length(extra_grades) > 0) {
+    extra_cols <- hcl.colors(length(extra_grades), palette = "Dark 3")
+    names(extra_cols) <- extra_grades
+    grade_cols_local <- c(grade_cols_local, extra_cols)
+  }
+
+  anno_cols <- list(
+    `Tumor cell. (%)` = colorRamp2(c(0, 50, 100), c("#F7FBFF", "#6BAED6", "#08306B")),
+    `Pleomorphic (%)` = colorRamp2(c(0, 50, 100), c("#F7FCF5", "#74C476", "#00441B")),
+    `TILs (%)`        = colorRamp2(c(0, 30, 100), c("#FFF5F0", "#FB6A4A", "#67000D")),
+    Grade = grade_cols_local,
+    HER2  = binary_receptor_cols,
+    ER    = binary_receptor_cols,
+    PR    = binary_receptor_cols
+  )
+
+  HeatmapAnnotation(
+    # Small empty spacer separates the heatmap body from the clinical tracks.
+    ` ` = anno_empty(height = unit(1, "mm"), border = FALSE),
+    df = anno_df,
+    col = anno_cols,
+    na_col = "grey90",
+    which = "column",
+    annotation_name_side = "left",
+    annotation_name_rot = 0,
+    annotation_name_gp = gpar(fontsize = 8),
+    simple_anno_size = unit(0.30, "cm"),
+    gap = unit(c(3.5, rep(1.1, ncol(anno_df) - 1)), "mm"),
+    show_annotation_name = c(FALSE, rep(TRUE, ncol(anno_df))),
+    # HER2, ER and PR share colors, so one legend is shown for all three.
+    show_legend = c(
+      `Tumor cell. (%)` = TRUE, `Pleomorphic (%)` = TRUE, `TILs (%)` = TRUE,
+      Grade = TRUE, HER2 = TRUE, ER = FALSE, PR = FALSE
+    ),
+    annotation_legend_param = list(
+      `Tumor cell. (%)` = list(title = "Tumor cell. (%)"),
+      `Pleomorphic (%)` = list(title = "Pleomorphic (%)"),
+      `TILs (%)`        = list(title = "TILs (%)"),
+      Grade = list(title = "Grade"),
+      # Fixed levels so "Positive" stays in the legend even if no tumor is HER2+.
+      HER2  = list(
+        title = "HER2 / ER / PR",
+        at = c("Positive", "Negative", "Unknown")
+      )
+    )
+  )
+}
+
+# ------------------------------------------------------------
+# [CLINICAL] Draw one heatmap to PDF and PNG with identical size (inches)
+# ------------------------------------------------------------
+save_heatmap_pdf_png <- function(ht, file_stem, width_in, height_in) {
+  draw_ht <- function() {
+    draw(
+      ht,
+      heatmap_legend_side = "right",
+      annotation_legend_side = "right",
+      merge_legends = TRUE,                 # one stacked legend column
+      padding = unit(c(4, 4, 6, 4), "mm")
+    )
+  }
+
+  pdf(
+    file.path(plot_dir, paste0(file_stem, "_", run_date, ".pdf")),
+    width = width_in, height = height_in
+  )
+  draw_ht()
+  dev.off()
+
+  png(
+    file.path(plot_dir, paste0(file_stem, "_", run_date, ".png")),
+    width = width_in, height = height_in, units = "in", res = 300
+  )
+  draw_ht()
+  dev.off()
+}
+
+# ============================================================
+# Read and validate raw HTSeq counts
+# ============================================================
+
+count_dt <- fread(count_file, data.table = TRUE)
+if (!("Gene" %in% names(count_dt))) {
+  stop("Count file must contain a column named Gene.")
+}
+
+count_dt[, Gene_input := trimws(as.character(Gene))]
+count_dt[, Gene_clean := clean_gene(Gene_input)]
+count_dt <- count_dt[Gene_clean != "" & !grepl("^__", Gene_clean)]
+
+# DESeq2 does not convert Ensembl IDs to symbols. Map only ENSG identifiers,
+# strip optional version suffixes, and retain unresolved IDs explicitly.
+count_dt[, Is_ENSG := grepl(
+  "^ENSG[0-9]+(?:\\.[0-9]+)?$",
+  Gene_clean,
+  perl = TRUE
+)]
+count_dt[, Ensembl_base := fifelse(
+  Is_ENSG,
+  sub("\\.[0-9]+$", "", Gene_clean),
+  NA_character_
+)]
+
+ensembl_ids <- unique(na.omit(count_dt$Ensembl_base))
+ensembl_to_symbol <- if (length(ensembl_ids)) {
+  AnnotationDbi::mapIds(
+    org.Hs.eg.db,
+    keys = ensembl_ids,
+    keytype = "ENSEMBL",
+    column = "SYMBOL",
+    multiVals = "first"
+  )
+} else {
+  setNames(character(), character())
+}
+
+count_dt[, Mapped_symbol := NA_character_]
+if (length(ensembl_to_symbol)) {
+  count_dt[
+    Is_ENSG == TRUE,
+    Mapped_symbol := unname(ensembl_to_symbol[Ensembl_base])
+  ]
+}
+count_dt[, Gene := fifelse(
+  Is_ENSG & !is.na(Mapped_symbol) & Mapped_symbol != "",
+  toupper(Mapped_symbol),
+  fifelse(Is_ENSG, Ensembl_base, Gene_clean)
+)]
+
+gene_id_audit <- unique(count_dt[, .(
+  Gene_input,
+  Gene_clean,
+  Is_ENSG,
+  Ensembl_base,
+  Mapped_symbol,
+  Analysis_gene = Gene,
+  Mapping_status = fifelse(
+    !Is_ENSG,
+    "Input_not_ENSG",
+    fifelse(!is.na(Mapped_symbol) & Mapped_symbol != "", "ENSG_mapped", "ENSG_unresolved")
+  )
+)])
+
+fwrite(
+  gene_id_audit,
+  file.path(table_dir, paste0("gene_identifier_mapping_audit_", run_date, ".tsv")),
+  sep = "\t", quote = FALSE, na = ""
+)
+
+fwrite(
+  gene_id_audit[, .N, by = Mapping_status][order(Mapping_status)],
+  file.path(table_dir, paste0("gene_identifier_mapping_summary_", run_date, ".tsv")),
+  sep = "\t", quote = FALSE, na = ""
+)
+
+sample_cols <- setdiff(
+  names(count_dt),
+  c(
+    "Gene", "Gene_input", "Gene_clean", "Is_ENSG", "Ensembl_base",
+    "Mapped_symbol"
+  )
+)
+
+missing_samples <- setdiff(cluster_dt$Sample, sample_cols)
+extra_samples <- setdiff(sample_cols, cluster_dt$Sample)
+
+if (length(missing_samples) > 0) {
+  stop(
+    "Cluster samples missing from the count matrix: ",
+    paste(missing_samples, collapse = ", ")
+  )
+}
+if (length(extra_samples) > 0) {
+  stop(
+    "Count-matrix samples without cluster assignments: ",
+    paste(extra_samples, collapse = ", ")
+  )
+}
+
+# Aggregate duplicate symbols if upper-casing or annotation produced duplicates.
+count_dt <- count_dt[
+  ,
+  lapply(.SD, function(x) sum(as.numeric(x), na.rm = TRUE)),
+  by = Gene,
+  .SDcols = sample_cols
+]
+
+count_dt <- count_dt[, c("Gene", cluster_dt$Sample), with = FALSE]
+count_matrix <- as.matrix(count_dt[, -"Gene"])
+rownames(count_matrix) <- count_dt$Gene
+storage.mode(count_matrix) <- "numeric"
+
+if (anyNA(count_matrix)) stop("Missing count values detected.")
+if (any(count_matrix < 0)) stop("Negative count values detected.")
+if (any(count_matrix != round(count_matrix))) {
+  stop("The HTSeq input contains non-integer values; raw counts are required.")
+}
+storage.mode(count_matrix) <- "integer"
+
+metadata <- data.frame(
+  Sample = cluster_dt$Sample,
+  Cluster = cluster_dt$Cluster,
+  row.names = cluster_dt$Sample,
+  check.names = FALSE
+)
+
+# ============================================================
+# DESeq2 normalization and VST
+# ============================================================
+
+dds0 <- DESeqDataSetFromMatrix(
+  countData = count_matrix,
+  colData = metadata,
+  design = ~ Cluster
+)
+
+# Retain genes with at least 10 reads in at least 3 tumors.
+keep_gene <- rowSums(counts(dds0) >= 10) >= 3
+
+filter_audit <- data.table(
+  Gene = rownames(dds0),
+  Total_count = rowSums(counts(dds0)),
+  Samples_with_count_ge_10 = rowSums(counts(dds0) >= 10),
+  Retained = keep_gene
+)
+
+fwrite(
+  filter_audit,
+  file.path(table_dir, paste0("gene_filter_audit_", run_date, ".tsv")),
+  sep = "\t"
+)
+
+dds <- dds0[keep_gene, ]
+dds <- DESeq(dds, test = "Wald", parallel = FALSE, quiet = FALSE)
+
+vst_object <- vst(dds, blind = FALSE)
+vst_matrix <- assay(vst_object)
+
+normalized_counts <- counts(dds, normalized = TRUE)
+
+write_matrix_tsv(
+  normalized_counts,
+  "Gene",
+  file.path(table_dir, paste0("DESeq2_normalized_counts_", run_date, ".tsv"))
+)
+
+write_matrix_tsv(
+  vst_matrix,
+  "Gene",
+  file.path(table_dir, paste0("DESeq2_VST_expression_", run_date, ".tsv"))
+)
+
+# ============================================================
+# Read pathway collections
+# ============================================================
+
+c5_all <- prefix_pathways(fgsea::gmtPathways(c5_gmt_file), "C5")
+
+# Strict, hypothesis-driven pathway selection.
+#
+# IMPORTANT:
+# The earlier broad search included any term containing words such as
+# "METHYLTRANSFERASE" or "DEUBIQUITINATION". That unintentionally admitted
+# RNA methylation, histone-mRNA metabolism, and generic protein-turnover terms.
+# The rules below retain only pathways whose NAMES explicitly refer to
+# chromatin, histones, nucleosomes, DNA methylation/demethylation, or named
+# chromatin-regulatory complexes. Curated gene sets defined below are retained
+# separately and are not removed by this ontology-name filter.
+
+strict_include_pattern <- paste(
+  c(
+    # Direct chromatin/nucleosome biology
+    "CHROMATIN", "HETEROCHROMATIN", "EUCHROMATIN",
+    "NUCLEOSOME", "CHROMOSOME_ORGANIZATION",
+
+    # Histone modification must explicitly mention HISTONE
+    "HISTONE.*(ACETYL|DEACETYL|METHYL|DEMETHYL|UBIQUITIN|DEUBIQUITIN|PHOSPH|SUMO)",
+    "(ACETYL|DEACETYL|METHYL|DEMETHYL|UBIQUITIN|DEUBIQUITIN|PHOSPH|SUMO).*HISTONE",
+
+    # DNA methylation programs
+    "DNA_METHYLATION", "DNA_DEMETHYLATION",
+
+    # Named chromatin-remodeling and Polycomb complexes
+    "SWI.*SNF", "BAF_COMPLEX", "BBAF_COMPLEX", "GBAF_COMPLEX",
+    "PBAF", "NPBAF", "NBAF", "POLYCOMB", "PRC1", "PRC2",
+    "NURD_COMPLEX", "NURF_COMPLEX", "INO80_COMPLEX", "SWR1_COMPLEX",
+    "CHROMATIN_REMODEL", "CHROMATIN_CHAPERONE",
+
+    # Explicit epigenetic regulation (RNA-only terms removed below)
+    "EPIGENETIC_REGULATION", "EPIGENETIC_MODIFICATION",
+    "EPIGENETIC_PROGRAM"
+  ),
+  collapse = "|"
+)
+
+strict_exclude_pattern <- paste(
+  c(
+    # RNA modification/metabolism rather than chromatin-protein modification
+    "(^|_)RNA_", "MRNA", "RRNA", "TRNA", "RIBOSOM", "METHYLADENOSINE",
+    "N6_METHYL", "PSEUDOURID", "RNA_METHYL", "RNA_DEMETHYL",
+
+    # Generic protein modification/catabolism without explicit histone context
+    "PROTEIN_K[0-9]+_LINKED", "UBIQUITIN_DEPENDENT_PROTEIN_CATABOLIC",
+    "PROTEIN_DEUBIQUITINATION", "DEUBIQUITINASE_ACTIVATOR",
+    "AMINO_ACID.*ACETYLTRANSFERASE",
+
+    # Developmental/germ-cell programs not used as core chromatin mechanisms
+    "ZYGOTIC_PRONUCLE", "GERM_CELL", "SPERM", "OOCYTE"
+  ),
+  collapse = "|"
+)
+
+select_strict_chromatin_terms <- function(pathways) {
+  nm <- names(pathways)
+  keep_include <- grepl(strict_include_pattern, nm, ignore.case = TRUE)
+  keep_exclude <- grepl(strict_exclude_pattern, nm, ignore.case = TRUE)
+  pathways[keep_include & !keep_exclude]
+}
+
+c5_epi <- select_strict_chromatin_terms(c5_all)
+
+# Save a transparent inclusion/exclusion audit for all GMT pathway names.
+gmt_selection_audit <- rbindlist(list(
+  data.table(Source = "C5", Pathway = names(c5_all))
+), use.names = TRUE)
+gmt_selection_audit[, Include_match := grepl(
+  strict_include_pattern, Pathway, ignore.case = TRUE
+)]
+gmt_selection_audit[, Exclude_match := grepl(
+  strict_exclude_pattern, Pathway, ignore.case = TRUE
+)]
+gmt_selection_audit[, Retained := Include_match & !Exclude_match]
+gmt_selection_audit[, Selection_reason := fifelse(
+  !Include_match,
+  "No strict chromatin/histone/DNA-methylation term",
+  fifelse(Exclude_match, "Matched off-target exclusion term", "Retained")
+)]
+
+fwrite(
+  gmt_selection_audit,
+  file.path(table_dir, paste0("strict_chromatin_pathway_selection_audit_", run_date, ".tsv")),
+  sep = "\t", quote = FALSE
+)
+
+message("Strict C5 chromatin pathways selected: ", length(c5_epi))
+
+# Curated core programs supplement ontology terms and permit direct inspection
+# of biologically important epigenetic complexes.
+curated_sets <- list(
+  CURATED__SWI_SNF_BAF_CORE = c(
+    "ARID1A", "ARID1B", "ARID2", "SMARCA2", "SMARCA4", "SMARCB1",
+    "SMARCC1", "SMARCC2", "SMARCD1", "SMARCD2", "SMARCD3", "SMARCE1",
+    "ACTL6A", "ACTL6B", "DPF1", "DPF2", "DPF3", "BCL7A", "BCL7B",
+    "BCL7C", "BRD7", "BRD9", "PBRM1"
+  ),
+  CURATED__PRC2_CORE = c(
+    "EZH1", "EZH2", "EED", "SUZ12", "RBBP4", "RBBP7", "JARID2",
+    "AEBP2", "MTF2", "PHF1", "PHF19", "EPOP"
+  ),
+  CURATED__PRC1_CORE = c(
+    "RING1", "RNF2", "BMI1", "PCGF1", "PCGF2", "PCGF3", "PCGF4",
+    "PCGF5", "PCGF6", "CBX2", "CBX4", "CBX6", "CBX7", "CBX8",
+    "PHC1", "PHC2", "PHC3"
+  ),
+  CURATED__HDAC_PROGRAM = c(
+    "HDAC1", "HDAC2", "HDAC3", "HDAC4", "HDAC5", "HDAC6", "HDAC7",
+    "HDAC8", "HDAC9", "HDAC10", "HDAC11", "SIRT1", "SIRT2", "SIRT3",
+    "SIRT4", "SIRT5", "SIRT6", "SIRT7", "NCOR1", "NCOR2", "SIN3A",
+    "SIN3B", "MTA1", "MTA2", "MTA3", "CHD3", "CHD4"
+  ),
+  CURATED__HISTONE_ACETYLTRANSFERASE_HAT_PROGRAM = c(
+    "CREBBP", "EP300", "KAT2A", "KAT2B", "KAT5", "KAT6A", "KAT6B",
+    "KAT7", "KAT8", "ELP3", "NCOA1", "NCOA2", "NCOA3", "CLOCK"
+  ),
+  CURATED__DNA_METHYLATION_WRITERS_READERS = c(
+    "DNMT1", "DNMT3A", "DNMT3B", "DNMT3L", "UHRF1", "UHRF2",
+    "MECP2", "MBD1", "MBD2", "MBD3", "MBD4", "ZBTB33", "ZBTB38",
+    "ZBTB4"
+  ),
+  CURATED__DNA_DEMETHYLATION_PROGRAM = c(
+    "TET1", "TET2", "TET3", "TDG", "GADD45A", "GADD45B", "GADD45G",
+    "AICDA", "APOBEC1"
+  ),
+  CURATED__HISTONE_LYSINE_METHYLTRANSFERASES = c(
+    "KMT2A", "KMT2B", "KMT2C", "KMT2D", "KMT2E", "KMT5A", "KMT5B",
+    "KMT5C", "SETD1A", "SETD1B", "SETD2", "SETD3", "SETD5", "SETD6",
+    "SETD7", "SETD8", "SETDB1", "SETDB2", "EHMT1", "EHMT2", "SUV39H1",
+    "SUV39H2", "EZH1", "EZH2", "DOT1L", "NSD1", "NSD2", "NSD3"
+  ),
+  CURATED__HISTONE_LYSINE_DEMETHYLASES = c(
+    "KDM1A", "KDM1B", "KDM2A", "KDM2B", "KDM3A", "KDM3B", "KDM4A",
+    "KDM4B", "KDM4C", "KDM4D", "KDM4E", "KDM5A", "KDM5B", "KDM5C",
+    "KDM5D", "KDM6A", "KDM6B", "KDM7A", "KDM8", "JMJD6", "PHF2",
+    "PHF8"
+  ),
+  CURATED__HISTONE_UBIQUITINATION_MACHINERY = c(
+    "RNF20", "RNF40", "WAC", "UBE2A", "UBE2B", "BRCA1", "BARD1",
+    "RNF2", "RING1", "BMI1", "PCGF1", "PCGF2", "PCGF3", "PCGF4",
+    "PCGF5", "PCGF6", "UHRF1", "UHRF2", "CUL4A", "CUL4B", "DDB1"
+  ),
+  CURATED__HISTONE_DEUBIQUITINATION_MACHINERY = c(
+    "BAP1", "ASXL1", "ASXL2", "ASXL3", "USP3", "USP7", "USP11",
+    "USP16", "USP21", "USP22", "USP27X", "USP28", "MYSM1", "BRCC3",
+    "OTUD5", "ATXN7L3", "ENY2"
+  ),
+  CURATED__HISTONE_PHOSPHORYLATION_DNA_DAMAGE = c(
+    "H2AX", "ATM", "ATR", "PRKDC", "CHEK1", "CHEK2", "AURKA", "AURKB",
+    "VRK1", "VRK2", "RPS6KA3", "RPS6KA4", "RPS6KA5", "PPM1D", "MDC1"
+  ),
+  CURATED__HETEROCHROMATIN_FORMATION = c(
+    "CBX1", "CBX3", "CBX5", "SUV39H1", "SUV39H2", "SETDB1", "SETDB2",
+    "EHMT1", "EHMT2", "TRIM28", "HP1BP3", "DNMT1", "UHRF1", "ATRX",
+    "DAXX"
+  ),
+  CURATED__NUCLEOSOME_ASSEMBLY_CHAPERONES = c(
+    "HIRA", "ASF1A", "ASF1B", "CHAF1A", "CHAF1B", "NASP", "NAP1L1",
+    "NAP1L4", "DAXX", "ATRX", "HJURP", "ANP32E", "DEK", "SUPT16H",
+    "SSRP1"
+  ),
+  CURATED__CHROMATIN_REMODELING_EXPANDED = c(
+    "ARID1A", "ARID1B", "ARID2", "SMARCA2", "SMARCA4", "SMARCB1",
+    "SMARCC1", "SMARCC2", "PBRM1", "CHD1", "CHD2", "CHD3", "CHD4",
+    "CHD5", "CHD6", "CHD7", "CHD8", "CHD9", "ATRX", "DAXX", "SRCAP",
+    "EP400", "INO80", "INO80B", "INO80C", "INO80D", "INO80E", "HELLS"
+  )
+)
+curated_sets <- lapply(curated_sets, clean_gene)
+
+all_epi_pathways <- c(c5_epi, curated_sets)
+
+# Ensure unique pathway names and retain expressed genes only.
+names(all_epi_pathways) <- make.unique(names(all_epi_pathways))
+expressed_genes <- rownames(vst_matrix)
+
+pathway_audit <- rbindlist(lapply(names(all_epi_pathways), function(nm) {
+  original_genes <- unique(clean_gene(all_epi_pathways[[nm]]))
+  matched_genes <- intersect(original_genes, expressed_genes)
+  source <- sub("__.*$", "", nm)
+  data.table(
+    Pathway = nm,
+    Source = source,
+    Original_gene_count = length(original_genes),
+    Expressed_gene_count = length(matched_genes),
+    Expressed_genes = paste(sort(matched_genes), collapse = ";")
+  )
+}))
+
+fwrite(
+  pathway_audit,
+  file.path(table_dir, paste0("epigenetic_pathway_gene_audit_", run_date, ".tsv")),
+  sep = "\t", quote = FALSE
+)
+
+# Minimum 3 expressed genes permits core protein complexes to be scored.
+# Interpret very small gene sets cautiously.
+epi_pathways <- lapply(all_epi_pathways, intersect, y = expressed_genes)
+epi_pathways <- lapply(epi_pathways, unique)
+epi_pathways <- epi_pathways[lengths(epi_pathways) >= 3 & lengths(epi_pathways) <= 500]
+
+if (length(epi_pathways) == 0) {
+  stop("No epigenetic pathways retained after expression and size filtering.")
+}
+
+message("Epigenetic pathways retained: ", length(epi_pathways))
+
+# ------------------------------------------------------------
+# [LABELS] Build the ID -> display-label map once, for all figures.
+# make.unique() guarantees one distinct label per pathway, which ggplot
+# factors and ComplexHeatmap rows require.
+# ------------------------------------------------------------
+pathway_label_map <- setNames(
+  make.unique(
+    vapply(names(epi_pathways), clean_one_label, character(1), USE.NAMES = FALSE),
+    sep = " #"
+  ),
+  names(epi_pathways)
+)
+
+fwrite(
+  data.table(
+    Pathway = names(epi_pathways),
+    Pathway_label = pathway_label(names(epi_pathways)),   # [LABELS]
+    Expressed_gene_count = lengths(epi_pathways)
+  ),
+  file.path(table_dir, paste0("retained_epigenetic_pathways_", run_date, ".tsv")),
+  sep = "\t"
+)
+
+# ============================================================
+# Sample-level ssGSEA scores
+# ============================================================
+
+message("Running sample-level ssGSEA...")
+
+gsva_exports <- getNamespaceExports("GSVA")
+
+if ("ssgseaParam" %in% gsva_exports) {
+  ssgsea_param <- GSVA::ssgseaParam(
+    exprData = vst_matrix,
+    geneSets = epi_pathways,
+    minSize = 3,
+    maxSize = 500,
+    normalize = TRUE
+  )
+  ssgsea_scores <- GSVA::gsva(ssgsea_param, verbose = FALSE)
+} else {
+  # Compatibility with older GSVA releases.
+  ssgsea_scores <- GSVA::gsva(
+    expr = vst_matrix,
+    gset.idx.list = epi_pathways,
+    method = "ssgsea",
+    kcdf = "Gaussian",
+    min.sz = 3,
+    max.sz = 500,
+    abs.ranking = TRUE,
+    ssgsea.norm = TRUE,
+    verbose = FALSE
+  )
+}
+
+ssgsea_scores <- as.matrix(ssgsea_scores)
+ssgsea_scores <- ssgsea_scores[, cluster_dt$Sample, drop = FALSE]
+
+write_matrix_tsv(
+  ssgsea_scores,
+  "Pathway",
+  file.path(table_dir, paste0("epigenetic_ssGSEA_scores_", run_date, ".tsv"))
+)
+
+# ============================================================
+# Global and pairwise pathway-score comparisons
+# ============================================================
+
+score_long <- melt(
+  as.data.table(ssgsea_scores, keep.rownames = "Pathway"),
+  id.vars = "Pathway",
+  variable.name = "Sample",
+  value.name = "Score"
+)
+
+score_long <- merge(
+  score_long,
+  cluster_dt[, .(Sample, Cluster)],
+  by = "Sample",
+  all.x = TRUE,
+  sort = FALSE
+)
+score_long[, Cluster := factor(Cluster, levels = levels(cluster_dt$Cluster))]
+
+global_tests <- score_long[
+  ,
+  {
+    kw <- kruskal.test(Score ~ Cluster)
+    list(
+      Kruskal_Wallis_statistic = unname(kw$statistic),
+      P_value = kw$p.value,
+      Cluster1_median = median(Score[Cluster == "Cluster 1"], na.rm = TRUE),
+      Cluster2_median = median(Score[Cluster == "Cluster 2"], na.rm = TRUE),
+      Cluster3_median = median(Score[Cluster == "Cluster 3"], na.rm = TRUE)
+    )
+  },
+  by = Pathway
+]
+global_tests[, FDR := p.adjust(P_value, method = "BH")]
+setorder(global_tests, FDR, P_value)
+
+# [LABELS] Add the display label next to the pathway ID.
+global_tests[, Pathway_label := pathway_label(Pathway)]
+setcolorder(global_tests, c("Pathway", "Pathway_label"))
+
+fwrite(
+  global_tests,
+  file.path(table_dir, paste0("epigenetic_ssGSEA_global_cluster_tests_", run_date, ".tsv")),
+  sep = "\t", quote = FALSE, na = ""
+)
+
+pair_defs <- list(
+  Cluster2_vs_Cluster1 = c("Cluster 2", "Cluster 1"),
+  Cluster3_vs_Cluster1 = c("Cluster 3", "Cluster 1"),
+  Cluster3_vs_Cluster2 = c("Cluster 3", "Cluster 2")
+)
+
+pairwise_tests <- rbindlist(lapply(names(pair_defs), function(comparison) {
+  pair <- pair_defs[[comparison]]
+
+  ans <- score_long[
+    Cluster %in% pair,
+    {
+      x <- Score[Cluster == pair[1]]
+      y <- Score[Cluster == pair[2]]
+      wt <- wilcox.test(x, y, exact = FALSE)
+      list(
+        Cluster_A = pair[1],
+        Cluster_B = pair[2],
+        Median_A = median(x, na.rm = TRUE),
+        Median_B = median(y, na.rm = TRUE),
+        Median_difference_A_minus_B = median(x, na.rm = TRUE) - median(y, na.rm = TRUE),
+        Wilcoxon_statistic = unname(wt$statistic),
+        P_value = wt$p.value
+      )
+    },
+    by = Pathway
+  ]
+
+  ans[, Comparison := comparison]
+  ans[, FDR_within_comparison := p.adjust(P_value, method = "BH")]
+  ans
+}), use.names = TRUE, fill = TRUE)
+
+pairwise_tests[, Pathway_label := pathway_label(Pathway)]   # [LABELS]
+
+setcolorder(
+  pairwise_tests,
+  c(
+    "Comparison", "Pathway", "Pathway_label", "Cluster_A", "Cluster_B", "Median_A",
+    "Median_B", "Median_difference_A_minus_B", "Wilcoxon_statistic",
+    "P_value", "FDR_within_comparison"
+  )
+)
+setorder(pairwise_tests, Comparison, FDR_within_comparison, P_value)
+
+fwrite(
+  pairwise_tests,
+  file.path(table_dir, paste0("epigenetic_ssGSEA_pairwise_cluster_tests_", run_date, ".tsv")),
+  sep = "\t", quote = FALSE, na = ""
+)
+
+# ============================================================
+# ssGSEA heatmap
+# [CLINICAL] No sample names; clinical tracks below the matrix.
+# ============================================================
+
+n_heatmap_pathways <- min(40L, nrow(global_tests))
+heatmap_pathways <- head(global_tests$Pathway, n_heatmap_pathways)
+heatmap_score_matrix <- zscore_rows(
+  ssgsea_scores[heatmap_pathways, cluster_dt$Sample, drop = FALSE]
+)
+
+# Top: cluster bar (also reused by the leading-edge heatmap).
+column_annotation <- HeatmapAnnotation(
+  Cluster = cluster_dt$Cluster,
+  col = list(Cluster = cluster_colors),
+  annotation_name_side = "left",            # aligned with clinical track names
+  annotation_name_gp = gpar(fontsize = 8),
+  simple_anno_size = unit(4, "mm")
+)
+
+# Bottom: clinical tracks in the same column order as the matrix.
+clinical_annotation <- build_clinical_annotation(cluster_dt$Sample)
+
+score_col_fun <- colorRamp2(
+  c(-2.5, 0, 2.5),
+  c("#2166AC", "white", "#B2182B")
+)
+
+score_heatmap <- Heatmap(
+  heatmap_score_matrix,
+  name = "Pathway Z-score",
+  col = score_col_fun,
+  cluster_rows = TRUE,
+  cluster_columns = FALSE,
+  column_split = cluster_dt$Cluster,
+  column_order = cluster_dt$Sample,
+  top_annotation = column_annotation,
+  bottom_annotation = clinical_annotation,  # [CLINICAL]
+  show_column_names = FALSE,                # [CLINICAL] hide sample names
+  # [LABELS] Row IDs stay unchanged; only the printed labels are cleaned.
+  row_labels = pathway_label(rownames(heatmap_score_matrix)),
+  row_names_gp = gpar(fontsize = heatmap_row_fontsize),
+  row_title = "Epigenetic pathways",
+  column_title = "pILC tumors grouped by NMF RNA cluster",
+  border = TRUE
+)
+
+save_heatmap_pdf_png(
+  score_heatmap,
+  file_stem = "epigenetic_ssGSEA_cluster_heatmap",
+  width_in  = 15,
+  height_in = max(12, 0.22 * n_heatmap_pathways + 6)   # +2 in for clinical tracks
+)
+
+# ============================================================
+# Top pathway boxplots
+# ============================================================
+
+top_box_pathways <- head(global_tests$Pathway, min(12L, nrow(global_tests)))
+box_dt <- score_long[Pathway %in% top_box_pathways]
+
+# [LABELS] Facets use clean labels, ordered from most to least significant.
+box_dt[, Pathway_label := factor(
+  pathway_label(Pathway),
+  levels = pathway_label(top_box_pathways)
+)]
+
+box_plot <- ggplot(box_dt, aes(x = Cluster, y = Score, color = Cluster)) +
+  geom_boxplot(outlier.shape = NA, width = 0.65) +
+  geom_jitter(width = 0.12, size = 2, alpha = 0.8) +
+  # [LABELS] Long labels wrap onto two lines in the facet strip.
+  facet_wrap(
+    ~ Pathway_label,
+    scales = "free_y",
+    ncol = 3,
+    labeller = label_wrap_gen(width = 40)
+  ) +
+  scale_color_manual(values = cluster_colors, drop = FALSE) +
+  labs(
+    title = "Epigenetic pathway scores across pILC RNA clusters",
+    subtitle = "Top pathways ranked by global Kruskal-Wallis FDR",
+    x = NULL,
+    y = "ssGSEA enrichment score"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    strip.text = element_text(size = pathway_label_text_size),   # [LABELS]
+    axis.text.x = element_text(angle = 30, hjust = 1),
+    legend.position = "none",
+    panel.grid.minor = element_blank()
+  )
+
+ggsave(
+  file.path(plot_dir, paste0("epigenetic_ssGSEA_top_pathway_boxplots_", run_date, ".pdf")),
+  box_plot,
+  width = 14,
+  height = 12
+)
+ggsave(
+  file.path(plot_dir, paste0("epigenetic_ssGSEA_top_pathway_boxplots_", run_date, ".png")),
+  box_plot,
+  width = 14,
+  height = 12,
+  dpi = 300
+)
+
+# Compact cluster-level dot plot for presentation.
+top_dot_pathways <- head(global_tests$Pathway, min(25L, nrow(global_tests)))
+dot_z <- zscore_rows(
+  ssgsea_scores[top_dot_pathways, cluster_dt$Sample, drop = FALSE],
+  cap = 3
+)
+dot_long <- melt(
+  as.data.table(dot_z, keep.rownames = "Pathway"),
+  id.vars = "Pathway",
+  variable.name = "Sample",
+  value.name = "ssGSEA_Z"
+)
+dot_long <- merge(
+  dot_long,
+  cluster_dt[, .(Sample, Cluster)],
+  by = "Sample",
+  all.x = TRUE,
+  sort = FALSE
+)
+dot_summary <- dot_long[
+  ,
+  .(Median_ssGSEA_Z = median(ssGSEA_Z, na.rm = TRUE)),
+  by = .(Pathway, Cluster)
+]
+dot_summary <- merge(
+  dot_summary,
+  global_tests[, .(Pathway, Global_FDR = FDR)],
+  by = "Pathway",
+  all.x = TRUE,
+  sort = FALSE
+)
+dot_summary[, minus_log10_FDR := -log10(pmax(Global_FDR, 1e-10))]
+dot_summary[, Pathway := factor(Pathway, levels = rev(top_dot_pathways))]
+
+# [LABELS] Clean y-axis labels; most significant pathway at the top.
+dot_summary[, Pathway_label := factor(
+  pathway_label(Pathway),
+  levels = rev(pathway_label(top_dot_pathways))
+)]
+
+cluster_dot_plot <- ggplot(
+  dot_summary,
+  aes(x = Cluster, y = Pathway_label, fill = Median_ssGSEA_Z, size = minus_log10_FDR)
+) +
+  geom_point(shape = 21, color = "grey20", stroke = 0.4) +
+  scale_fill_gradient2(
+    low = "#2166AC", mid = "white", high = "#B2182B", midpoint = 0,
+    name = "Median ssGSEA\nZ-score"
+  ) +
+  scale_size_continuous(name = "-log10 global FDR", range = c(2.5, 8)) +
+  labs(
+    title = "Focused chromatin programs across pILC RNA subsets",
+    subtitle = paste0(
+      "Hypothesis-driven analysis; top pathways ranked by three-cluster ",
+      "Kruskal-Wallis FDR"
+    ),
+    x = NULL,
+    y = NULL,
+    caption = paste0(
+      "Fill represents relative pathway expression within the cohort, not ",
+      "absolute biochemical activation. RNA clusters were derived from the ",
+      "same expression dataset."
+    )
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold", size = 15),
+    axis.text.y = element_text(size = pathway_label_text_size),   # [LABELS]
+    panel.grid.minor = element_blank(),
+    legend.position = "right",
+    plot.caption = element_text(hjust = 0, size = 8)
+  )
+
+ggsave(
+  file.path(plot_dir, paste0("focused_chromatin_cluster_dotplot_", run_date, ".pdf")),
+  cluster_dot_plot,
+  width = 12,
+  height = 10
+)
+ggsave(
+  file.path(plot_dir, paste0("focused_chromatin_cluster_dotplot_", run_date, ".png")),
+  cluster_dot_plot,
+  width = 12,
+  height = 10,
+  dpi = 300
+)
+
+fwrite(
+  dot_summary,
+  file.path(table_dir, paste0("focused_chromatin_cluster_dotplot_data_", run_date, ".tsv")),
+  sep = "\t", quote = FALSE, na = ""
+)
+
+# ============================================================
+# Cluster-versus-rest DESeq2 and ranked GSEA
+# ============================================================
+
+gsea_results <- list()
+deseq_cluster_results <- list()
+pairwise_gsea_results <- list()
+pairwise_deseq_results <- list()
+
+for (target_cluster in levels(metadata$Cluster)) {
+  message("Running cluster-versus-rest DESeq2 and GSEA: ", target_cluster)
+
+  dds_target <- dds
+  target_group <- ifelse(
+    colData(dds_target)$Cluster == target_cluster,
+    "Target",
+    "Rest"
+  )
+  colData(dds_target)$Target_vs_rest <- factor(
+    target_group,
+    levels = c("Rest", "Target")
+  )
+  design(dds_target) <- ~ Target_vs_rest
+
+  # Refit the model for the binary target-versus-rest comparison.
+  dds_target <- DESeq(dds_target, test = "Wald", parallel = FALSE, quiet = FALSE)
+
+  res <- results(
+    dds_target,
+    contrast = c("Target_vs_rest", "Target", "Rest"),
+    alpha = 0.05,
+    independentFiltering = TRUE
+  )
+
+  res_dt <- as.data.table(as.data.frame(res), keep.rownames = "Gene")
+  res_dt[, Target_cluster := target_cluster]
+  res_dt[, Comparison := paste0(safe_name(target_cluster), "_vs_Rest")]
+  res_dt[, Contrast_type := "Cluster_vs_rest"]
+  res_dt[, Direction := fifelse(
+    !is.na(padj) & padj < 0.05 & log2FoldChange > 0,
+    paste0("Higher_in_", target_cluster),
+    fifelse(
+      !is.na(padj) & padj < 0.05 & log2FoldChange < 0,
+      "Higher_in_Rest",
+      "Not_significant"
+    )
+  )]
+  setorder(res_dt, padj, pvalue, na.last = TRUE)
+  deseq_cluster_results[[target_cluster]] <- res_dt
+
+  cluster_safe <- safe_name(target_cluster)
+  fwrite(
+    res_dt,
+    file.path(
+      table_dir,
+      paste0("DESeq2_", cluster_safe, "_vs_rest_", run_date, ".tsv")
+    ),
+    sep = "\t", quote = FALSE, na = ""
+  )
+
+  ranks <- res_dt[!is.na(stat), stat]
+  names(ranks) <- res_dt[!is.na(stat), Gene]
+  ranks <- sort(ranks, decreasing = TRUE)
+
+  set.seed(42)
+  fg <- fgseaMultilevel(
+    pathways = epi_pathways,
+    stats = ranks,
+    minSize = 3,
+    maxSize = 500,
+    eps = 0,
+    scoreType = "std",
+    nproc = 1
+  )
+
+  fg <- as.data.table(fg)
+  fg[, Pathway_label := pathway_label(pathway)]   # [LABELS]
+  fg[, Target_cluster := target_cluster]
+  fg[, Comparison := paste0(safe_name(target_cluster), "_vs_Rest")]
+  fg[, Contrast_type := "Cluster_vs_rest"]
+  fg[, Direction := fifelse(
+    NES > 0,
+    paste0("Enriched_in_", target_cluster),
+    "Enriched_in_Rest"
+  )]
+  fg[, Abs_NES_for_sorting := abs(NES)]
+  setorder(fg, padj, pval, -Abs_NES_for_sorting, na.last = TRUE)
+  fg[, Abs_NES_for_sorting := NULL]
+  gsea_results[[target_cluster]] <- fg
+
+  fg_export <- copy(fg)
+  fg_export[, leadingEdge := vapply(
+    leadingEdge,
+    function(x) paste(x, collapse = ";"),
+    character(1)
+  )]
+  setcolorder(fg_export, c("pathway", "Pathway_label"))   # [LABELS]
+
+  fwrite(
+    fg_export,
+    file.path(
+      table_dir,
+      paste0("fgsea_epigenetic_", cluster_safe, "_vs_rest_", run_date, ".tsv")
+    ),
+    sep = "\t", quote = FALSE, na = ""
+  )
+
+  plot_fg <- fg[!is.na(padj)]
+  if (nrow(plot_fg) > 0) {
+    significant_fg <- plot_fg[padj < 0.05]
+    if (nrow(significant_fg) >= 5) {
+      plot_fg <- head(significant_fg, 20)
+    } else {
+      plot_fg <- head(plot_fg, 20)
+    }
+
+    # [LABELS] Clean y-axis labels; top-ranked pathway at the top.
+    plot_fg[, Pathway_label := factor(Pathway_label, levels = rev(Pathway_label))]
+    plot_fg[, minus_log10_fdr := -log10(pmax(padj, .Machine$double.xmin))]
+
+    gsea_dot <- ggplot(
+      plot_fg,
+      aes(x = NES, y = Pathway_label, size = minus_log10_fdr, color = NES)
+    ) +
+      geom_point(alpha = 0.9) +
+      scale_color_gradient2(
+        low = "#2166AC", mid = "grey90", high = "#B2182B", midpoint = 0
+      ) +
+      labs(
+        title = paste0(target_cluster, " versus the other RNA clusters"),
+        subtitle = "Ranked GSEA of chromatin and epigenetic pathways",
+        x = "Normalized enrichment score",
+        y = NULL,
+        size = "-log10 FDR",
+        color = "NES"
+      ) +
+      theme_bw(base_size = 11) +
+      theme(
+        plot.title = element_text(face = "bold"),
+        axis.text.y = element_text(size = pathway_label_text_size),   # [LABELS]
+        panel.grid.minor = element_blank()
+      )
+
+    ggsave(
+      file.path(
+        plot_dir,
+        paste0("fgsea_epigenetic_", cluster_safe, "_vs_rest_", run_date, ".pdf")
+      ),
+      gsea_dot,
+      width = 11,
+      height = 8
+    )
+    ggsave(
+      file.path(
+        plot_dir,
+        paste0("fgsea_epigenetic_", cluster_safe, "_vs_rest_", run_date, ".png")
+      ),
+      gsea_dot,
+      width = 11,
+      height = 8,
+      dpi = 300
+    )
+  }
+}
+
+# Pairwise DESeq2 and ranked GSEA characterize the direction of differences
+# between each pair of RNA-defined subsets.
+for (comparison in names(pair_defs)) {
+  pair <- pair_defs[[comparison]]
+  target_cluster <- pair[1]
+  reference_cluster <- pair[2]
+  message("Running pairwise DESeq2 and GSEA: ", comparison)
+
+  res <- results(
+    dds,
+    contrast = c("Cluster", target_cluster, reference_cluster),
+    alpha = 0.05,
+    independentFiltering = TRUE
+  )
+
+  res_dt <- as.data.table(as.data.frame(res), keep.rownames = "Gene")
+  res_dt[, `:=`(
+    Target_cluster = target_cluster,
+    Reference_cluster = reference_cluster,
+    Comparison = comparison,
+    Contrast_type = "Pairwise"
+  )]
+  res_dt[, Direction := fifelse(
+    !is.na(padj) & padj < 0.05 & log2FoldChange > 0,
+    paste0("Higher_in_", safe_name(target_cluster)),
+    fifelse(
+      !is.na(padj) & padj < 0.05 & log2FoldChange < 0,
+      paste0("Higher_in_", safe_name(reference_cluster)),
+      "Not_significant"
+    )
+  )]
+  setorder(res_dt, padj, pvalue, na.last = TRUE)
+  pairwise_deseq_results[[comparison]] <- res_dt
+
+  fwrite(
+    res_dt,
+    file.path(
+      table_dir,
+      paste0("DESeq2_", comparison, "_", run_date, ".tsv")
+    ),
+    sep = "\t", quote = FALSE, na = ""
+  )
+
+  ranks <- res_dt[!is.na(stat), stat]
+  names(ranks) <- res_dt[!is.na(stat), Gene]
+  ranks <- sort(ranks, decreasing = TRUE)
+
+  set.seed(42)
+  fg <- fgseaMultilevel(
+    pathways = epi_pathways,
+    stats = ranks,
+    minSize = 3,
+    maxSize = 500,
+    eps = 0,
+    scoreType = "std",
+    nproc = 1
+  )
+
+  fg <- as.data.table(fg)
+  fg[, Pathway_label := pathway_label(pathway)]   # [LABELS]
+  fg[, `:=`(
+    Target_cluster = target_cluster,
+    Reference_cluster = reference_cluster,
+    Comparison = comparison,
+    Contrast_type = "Pairwise"
+  )]
+  fg[, Direction := fifelse(
+    NES > 0,
+    paste0("Enriched_in_", safe_name(target_cluster)),
+    paste0("Enriched_in_", safe_name(reference_cluster))
+  )]
+  fg[, Abs_NES_for_sorting := abs(NES)]
+  setorder(fg, padj, pval, -Abs_NES_for_sorting, na.last = TRUE)
+  fg[, Abs_NES_for_sorting := NULL]
+  pairwise_gsea_results[[comparison]] <- fg
+
+  fg_export <- copy(fg)
+  fg_export[, leadingEdge := vapply(
+    leadingEdge,
+    function(x) paste(x, collapse = ";"),
+    character(1)
+  )]
+  setcolorder(fg_export, c("pathway", "Pathway_label"))   # [LABELS]
+  fwrite(
+    fg_export,
+    file.path(
+      table_dir,
+      paste0("fgsea_chromatin_", comparison, "_", run_date, ".tsv")
+    ),
+    sep = "\t", quote = FALSE, na = ""
+  )
+}
+
+all_deseq_cluster_results <- rbindlist(
+  c(deseq_cluster_results, pairwise_deseq_results),
+  use.names = TRUE,
+  fill = TRUE,
+  idcol = "Result_set"
+)
+fwrite(
+  all_deseq_cluster_results,
+  file.path(table_dir, paste0("DESeq2_all_cluster_comparisons_", run_date, ".tsv")),
+  sep = "\t", quote = FALSE, na = ""
+)
+
+all_gsea <- rbindlist(
+  c(gsea_results, pairwise_gsea_results),
+  use.names = TRUE,
+  fill = TRUE,
+  idcol = "Result_set"
+)
+all_gsea_export <- copy(all_gsea)
+all_gsea_export[, leadingEdge := vapply(
+  leadingEdge,
+  function(x) paste(x, collapse = ";"),
+  character(1)
+)]
+
+fwrite(
+  all_gsea_export,
+  file.path(table_dir, paste0("fgsea_chromatin_all_cluster_comparisons_", run_date, ".tsv")),
+  sep = "\t", quote = FALSE, na = ""
+)
+
+# Combined GSEA overview across cluster-versus-rest and pairwise comparisons.
+gsea_plot_candidates <- all_gsea[!is.na(padj) & !is.na(NES)]
+if (nrow(gsea_plot_candidates) > 0L) {
+  significant_pathways <- unique(gsea_plot_candidates[padj < 0.05, pathway])
+
+  if (length(significant_pathways) == 0L) {
+    significant_pathways <- unique(
+      gsea_plot_candidates[
+        order(padj, -abs(NES)),
+        head(.SD, 5L),
+        by = Comparison
+      ]$pathway
+    )
+  }
+
+  pathway_priority <- gsea_plot_candidates[
+    pathway %in% significant_pathways,
+    .(Minimum_FDR = min(padj, na.rm = TRUE), Maximum_abs_NES = max(abs(NES), na.rm = TRUE)),
+    by = pathway
+  ]
+  setorder(pathway_priority, Minimum_FDR, -Maximum_abs_NES)
+  display_pathways <- head(pathway_priority$pathway, 30L)
+
+  gsea_overview_dt <- gsea_plot_candidates[pathway %in% display_pathways]
+  gsea_overview_dt[, minus_log10_FDR := -log10(pmax(padj, 1e-10))]
+  gsea_overview_dt[, pathway := factor(pathway, levels = rev(display_pathways))]
+
+  # [LABELS] Clean y-axis labels; highest-priority pathway at the top.
+  gsea_overview_dt[, Pathway_label := factor(
+    pathway_label(pathway),
+    levels = rev(pathway_label(display_pathways))
+  )]
+
+  comparison_levels <- c(
+    "Cluster_1_vs_Rest", "Cluster_2_vs_Rest", "Cluster_3_vs_Rest",
+    "Cluster2_vs_Cluster1", "Cluster3_vs_Cluster1", "Cluster3_vs_Cluster2"
+  )
+  gsea_overview_dt[, Comparison := factor(Comparison, levels = comparison_levels)]
+
+  gsea_overview_plot <- ggplot(
+    gsea_overview_dt,
+    aes(x = Comparison, y = Pathway_label, fill = NES, size = minus_log10_FDR)
+  ) +
+    geom_point(shape = 21, color = "grey20", stroke = 0.4) +
+    scale_fill_gradient2(
+      low = "#2166AC", mid = "white", high = "#B2182B", midpoint = 0,
+      name = "GSEA NES"
+    ) +
+    scale_size_continuous(name = "-log10 FDR", range = c(2, 8)) +
+    labs(
+      title = "Chromatin pathway enrichment across pILC RNA-cluster comparisons",
+      subtitle = "Preranked GSEA using DESeq2 Wald statistics",
+      x = NULL,
+      y = NULL,
+      caption = paste0(
+        "Positive NES indicates enrichment in the first group named in each ",
+        "contrast; negative NES indicates enrichment in the comparison group."
+      )
+    ) +
+    theme_bw(base_size = 10) +
+    theme(
+      plot.title = element_text(face = "bold", size = 14),
+      axis.text.x = element_text(angle = 35, hjust = 1),
+      axis.text.y = element_text(size = pathway_label_text_size - 0.5),   # [LABELS]
+      panel.grid.minor = element_blank(),
+      plot.caption = element_text(hjust = 0, size = 8)
+    )
+
+  ggsave(
+    file.path(plot_dir, paste0("chromatin_GSEA_all_comparisons_overview_", run_date, ".pdf")),
+    gsea_overview_plot,
+    width = 14,
+    height = max(9, 0.25 * length(display_pathways) + 4)
+  )
+  ggsave(
+    file.path(plot_dir, paste0("chromatin_GSEA_all_comparisons_overview_", run_date, ".png")),
+    gsea_overview_plot,
+    width = 14,
+    height = max(9, 0.25 * length(display_pathways) + 4),
+    dpi = 300
+  )
+}
+
+# ============================================================
+# Leading-edge gene table and heatmap
+# (rows are genes, so no pathway labels are drawn in this figure)
+# [CLINICAL] No sample names; clinical tracks below the matrix.
+# ============================================================
+
+sig_gsea <- all_gsea[!is.na(padj) & padj < 0.05]
+if (nrow(sig_gsea) == 0) {
+  message("No GSEA pathways reached FDR <0.05; using the top 5 per comparison for leading-edge review.")
+  sig_gsea <- all_gsea[order(padj, pval), head(.SD, 5), by = Comparison]
+}
+
+leading_edge_long <- rbindlist(lapply(seq_len(nrow(sig_gsea)), function(i) {
+  genes <- sig_gsea$leadingEdge[[i]]
+  if (!length(genes)) return(NULL)
+  data.table(
+    Target_cluster = sig_gsea$Target_cluster[i],
+    Comparison = sig_gsea$Comparison[i],
+    Contrast_type = sig_gsea$Contrast_type[i],
+    Pathway = sig_gsea$pathway[i],
+    Pathway_label = sig_gsea$Pathway_label[i],   # [LABELS]
+    NES = sig_gsea$NES[i],
+    FDR = sig_gsea$padj[i],
+    Gene = genes
+  )
+}), use.names = TRUE, fill = TRUE)
+
+if (nrow(leading_edge_long) > 0) {
+  fwrite(
+    leading_edge_long,
+    file.path(table_dir, paste0("fgsea_leading_edge_genes_", run_date, ".tsv")),
+    sep = "\t", quote = FALSE, na = ""
+  )
+
+  leading_rank <- leading_edge_long[
+    ,
+    .(
+      Pathway_count = uniqueN(Pathway),
+      Cluster_count = uniqueN(Target_cluster),
+      Comparison_count = uniqueN(Comparison),
+      Minimum_FDR = min(FDR, na.rm = TRUE)
+    ),
+    by = Gene
+  ]
+  setorder(
+    leading_rank,
+    -Comparison_count,
+    -Cluster_count,
+    -Pathway_count,
+    Minimum_FDR
+  )
+
+  leading_genes <- head(leading_rank$Gene, 75)
+  leading_genes <- intersect(leading_genes, rownames(vst_matrix))
+
+  if (length(leading_genes) >= 2) {
+    leading_mat <- zscore_rows(
+      vst_matrix[leading_genes, cluster_dt$Sample, drop = FALSE]
+    )
+
+    leading_heatmap <- Heatmap(
+      leading_mat,
+      name = "Expression Z-score",
+      col = score_col_fun,
+      cluster_rows = TRUE,
+      cluster_columns = FALSE,
+      column_split = cluster_dt$Cluster,
+      column_order = cluster_dt$Sample,
+      top_annotation = column_annotation,
+      bottom_annotation = build_clinical_annotation(cluster_dt$Sample),  # [CLINICAL]
+      show_column_names = FALSE,                                         # [CLINICAL]
+      row_names_gp = gpar(fontsize = 7),
+      row_title = "Epigenetic pathway leading-edge genes",
+      column_title = "DESeq2 VST expression",
+      border = TRUE
+    )
+
+    save_heatmap_pdf_png(
+      leading_heatmap,
+      file_stem = "epigenetic_leading_edge_gene_heatmap",
+      width_in  = 15,
+      height_in = max(12, 0.18 * length(leading_genes) + 6)
+    )
+  }
+}
+
+# ============================================================
+# Compact analysis summary
+# ============================================================
+
+summary_dt <- data.table(
+  Metric = c(
+    "Samples",
+    "Cluster_1_samples",
+    "Cluster_2_samples",
+    "Cluster_3_samples",
+    "Samples_matched_to_clinical",
+    "Input_ENSG_identifiers",
+    "ENSG_identifiers_mapped_to_symbols",
+    "ENSG_identifiers_unresolved",
+    "Genes_before_filtering",
+    "Genes_after_filtering",
+    "C5_epigenetic_pathways_selected",
+    "Curated_pathways_defined",
+    "Total_pathways_scored",
+    "ssGSEA_pathways_global_FDR_lt_0.05",
+    "GSEA_rows_FDR_lt_0.05",
+    "GSEA_cluster_vs_rest_rows_FDR_lt_0.05",
+    "GSEA_pairwise_rows_FDR_lt_0.05"
+  ),
+  Value = c(
+    ncol(count_matrix),
+    sum(cluster_dt$Cluster == "Cluster 1"),
+    sum(cluster_dt$Cluster == "Cluster 2"),
+    sum(cluster_dt$Cluster == "Cluster 3"),
+    sum(sample_clinical_dt$Clinical_matched),
+    sum(gene_id_audit$Is_ENSG),
+    sum(gene_id_audit$Mapping_status == "ENSG_mapped"),
+    sum(gene_id_audit$Mapping_status == "ENSG_unresolved"),
+    nrow(dds0),
+    nrow(dds),
+    length(c5_epi),
+    length(curated_sets),
+    length(epi_pathways),
+    sum(global_tests$FDR < 0.05, na.rm = TRUE),
+    sum(all_gsea$padj < 0.05, na.rm = TRUE),
+    sum(
+      all_gsea$padj < 0.05 & all_gsea$Contrast_type == "Cluster_vs_rest",
+      na.rm = TRUE
+    ),
+    sum(
+      all_gsea$padj < 0.05 & all_gsea$Contrast_type == "Pairwise",
+      na.rm = TRUE
+    )
+  )
+)
+
+fwrite(
+  summary_dt,
+  file.path(table_dir, paste0("epigenetic_pathway_analysis_summary_", run_date, ".tsv")),
+  sep = "\t"
+)
+
+writeLines(
+  c(
+    paste0("pILC focused chromatin pathway analysis: ", run_date),
+    "Seed: 42",
+    paste0("Raw counts: ", count_file),
+    paste0("NMF clusters: ", cluster_gct_file),
+    paste0("C5 GMT: ", c5_gmt_file),
+    paste0("Clinical annotations: ", clinical_file),
+    "Gene identifiers: ENSG IDs were stripped of version suffixes and mapped with org.Hs.eg.db; unresolved IDs were retained.",
+    "DESeq2 prefilter: count >=10 in at least 3 samples",
+    "Sample-level scoring: ssGSEA on DESeq2 VST expression",
+    "Global score comparison: Kruskal-Wallis with BH FDR",
+    "Pairwise score comparison: Wilcoxon rank-sum with BH FDR within each contrast",
+    "Ranked enrichment: fgseaMultilevel using DESeq2 Wald statistics",
+    "GSEA contrasts: each cluster versus the other two clusters plus all three pairwise contrasts",
+    "Small curated gene sets with >=3 expressed genes were retained; interpret small sets cautiously.",
+    "Figures use cleaned display labels with a source tag ([GO-BP], [GO-CC], [GO-MF], [HPO], [Curated]); original pathway IDs are retained in all tables alongside a Pathway_label column.",
+    "Sample-level heatmaps hide sample names and show clinical tracks (tumor cellularity, pleomorphic cellularity, TILs, grade, HER2, ER, PR) below the matrix; column order is saved in pILC_RNA_sample_order_and_clinical_annotation_<date>.tsv.",
+    "Clinical tracks are descriptive; cluster-clinical associations require separate formal testing.",
+    "The RNA clusters were derived from the same expression data. These analyses characterize the clusters and are not independent validation.",
+    "RNA pathway enrichment supports transcriptional programs consistent with epigenetic dysregulation but does not directly prove an epigenetic mechanism."
+  ),
+  file.path(out_dir, paste0("README_pILC_Focused_Chromatin_Pathway_Analysis_", run_date, ".txt"))
+)
+
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(out_dir, paste0("sessionInfo_", run_date, ".txt"))
+)
+
+message("Analysis complete.")
+message("Output directory: ", out_dir)
+print(summary_dt)
+
+graphics.off()
+```

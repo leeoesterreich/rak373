@@ -1,0 +1,1014 @@
+---
+title: "Epigenetic_Pathway_Analysis_3Cluster"
+output: html_document
+date: "2026-09-23"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r}
+
+set.seed(42)
+
+# ============================================================
+# pILC RNA-seq: focused chromatin and epigenetic pathway analysis
+#
+# Analyses
+#   1. DESeq2 VST from raw HTSeq counts
+#   2. Epigenetic pathway extraction from MSigDB C5 + custom GMT
+#   3. Curated SWI/SNF, PRC1/2, HDAC/HAT, histone and DNA methylation sets
+#   4. Sample-level ssGSEA pathway scores and cluster comparisons
+#   5. Cluster-versus-rest DESeq2 ranking and fgseaMultilevel
+#   6. Pathway and leading-edge heatmaps
+#
+# Important interpretation
+#   The three clusters were derived from these expression data. Results
+#   characterize the clusters and do not constitute independent validation.
+# ============================================================
+
+suppressPackageStartupMessages({
+  required_packages <- c(
+    "DESeq2", "data.table", "fgsea", "GSVA", "ggplot2",
+    "ComplexHeatmap", "circlize", "grid"
+  )
+
+  missing_packages <- required_packages[
+    !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+  ]
+
+  if (length(missing_packages) > 0) {
+    stop(
+      "Missing required packages: ", paste(missing_packages, collapse = ", "),
+      "\nInstall Bioconductor packages with:\n",
+      "if (!requireNamespace('BiocManager', quietly=TRUE)) install.packages('BiocManager')\n",
+      "BiocManager::install(c(",
+      paste(sprintf("'%s'", missing_packages), collapse = ", "),
+      "))"
+    )
+  }
+
+  library(DESeq2)
+  library(data.table)
+  library(fgsea)
+  library(GSVA)
+  library(ggplot2)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(grid)
+})
+
+graphics.off()
+
+# ============================================================
+# Input and output paths
+# ============================================================
+
+count_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/4_Count_file_pILC/VST_data/htseq_raw_counts_with_gene_names.csv"
+
+cluster_gct_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/NMF/GenePattern_NMFConsensus/vst_transformed_data.consensus.k.3.gct"
+
+c5_gmt_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/GSEA/Dataset/c5.all.v2025.1.Hs.symbols.gmt"
+
+custom_gmt_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/GSEA/Dataset/custom_gene_sets.gmt"
+
+out_root <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/Downstream/Epigenetic_Pathway_Analysis"
+
+run_date <- format(Sys.Date(), "%Y-%m-%d")
+out_dir <- file.path(
+  out_root,
+  paste0("pILC_Epigenetic_Pathway_Analysis_", run_date)
+)
+table_dir <- file.path(out_dir, "tables")
+plot_dir <- file.path(out_dir, "plots")
+
+dir.create(table_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(plot_dir, recursive = TRUE, showWarnings = FALSE)
+
+input_files <- c(
+  count_file = count_file,
+  cluster_gct_file = cluster_gct_file,
+  c5_gmt_file = c5_gmt_file,
+  custom_gmt_file = custom_gmt_file
+)
+
+missing_inputs <- names(input_files)[!file.exists(input_files)]
+if (length(missing_inputs) > 0) {
+  stop(
+    "Required input file(s) not found:\n",
+    paste0(missing_inputs, ": ", input_files[missing_inputs], collapse = "\n")
+  )
+}
+
+fwrite(
+  data.table(Input = names(input_files), Path = unname(input_files)),
+  file.path(table_dir, paste0("input_file_audit_", run_date, ".tsv")),
+  sep = "\t"
+)
+
+# ============================================================
+# Helper functions
+# ============================================================
+
+clean_gene <- function(x) {
+  x <- toupper(trimws(as.character(x)))
+  x[is.na(x)] <- ""
+  x
+}
+
+clean_sample <- function(x) {
+  x <- trimws(as.character(x))
+  sub("_S[0-9]+$", "", x)
+}
+
+safe_name <- function(x) {
+  gsub("[^A-Za-z0-9]+", "_", x)
+}
+
+zscore_rows <- function(mat, cap = 2.5) {
+  z <- t(scale(t(mat)))
+  z[!is.finite(z)] <- 0
+  z[z > cap] <- cap
+  z[z < -cap] <- -cap
+  z
+}
+
+prefix_pathways <- function(pathways, prefix) {
+  if (!length(pathways)) return(list())
+  pathways <- lapply(pathways, function(g) unique(clean_gene(g)))
+  pathways <- lapply(pathways, function(g) g[g != ""])
+  names(pathways) <- paste0(prefix, "__", make.unique(names(pathways)))
+  pathways
+}
+
+write_matrix_tsv <- function(mat, row_name, file) {
+  dt <- as.data.table(mat, keep.rownames = row_name)
+  fwrite(dt, file, sep = "\t", quote = FALSE, na = "")
+}
+
+# ============================================================
+# Read NMF cluster membership
+# ============================================================
+
+cluster_dt <- fread(cluster_gct_file, skip = 2, data.table = TRUE)
+
+required_cluster_cols <- c("Name", "Description")
+if (!all(required_cluster_cols %in% names(cluster_dt))) {
+  stop("Cluster GCT must contain Name and Description columns.")
+}
+
+membership_cols <- grep("^membership", names(cluster_dt), value = TRUE)
+if (length(membership_cols) != 1) {
+  stop(
+    "Expected exactly one membership column in cluster GCT; found: ",
+    paste(membership_cols, collapse = ", ")
+  )
+}
+
+cluster_dt <- cluster_dt[
+  ,
+  .(
+    Sample_original = Name,
+    Sample = clean_sample(Name),
+    Cluster_number = as.integer(get(membership_cols[1]))
+  )
+]
+
+if (anyNA(cluster_dt$Cluster_number)) {
+  stop("Non-numeric or missing cluster memberships detected.")
+}
+if (anyDuplicated(cluster_dt$Sample)) {
+  stop("Duplicate samples after removing GenePattern _S suffixes.")
+}
+
+cluster_dt[, Cluster := factor(
+  paste0("Cluster ", Cluster_number),
+  levels = c("Cluster 1", "Cluster 2", "Cluster 3")
+)]
+
+if (anyNA(cluster_dt$Cluster)) {
+  stop("Cluster membership must be 1, 2 or 3.")
+}
+
+cluster_colors <- c(
+  "Cluster 1" = "#1B9E77",
+  "Cluster 2" = "#D95F02",
+  "Cluster 3" = "#7570B3"
+)
+
+setorder(cluster_dt, Cluster_number)
+
+fwrite(
+  cluster_dt,
+  file.path(table_dir, paste0("pILC_cluster_metadata_", run_date, ".tsv")),
+  sep = "\t"
+)
+
+message("Cluster sizes:")
+print(cluster_dt[, .N, by = Cluster])
+
+# ============================================================
+# Read and validate raw HTSeq counts
+# ============================================================
+
+count_dt <- fread(count_file, data.table = TRUE)
+if (!("Gene" %in% names(count_dt))) {
+  stop("Count file must contain a column named Gene.")
+}
+
+count_dt[, Gene := clean_gene(Gene)]
+count_dt <- count_dt[Gene != "" & !grepl("^__", Gene)]
+
+sample_cols <- setdiff(names(count_dt), "Gene")
+
+missing_samples <- setdiff(cluster_dt$Sample, sample_cols)
+extra_samples <- setdiff(sample_cols, cluster_dt$Sample)
+
+if (length(missing_samples) > 0) {
+  stop(
+    "Cluster samples missing from the count matrix: ",
+    paste(missing_samples, collapse = ", ")
+  )
+}
+if (length(extra_samples) > 0) {
+  stop(
+    "Count-matrix samples without cluster assignments: ",
+    paste(extra_samples, collapse = ", ")
+  )
+}
+
+# Aggregate duplicate symbols if upper-casing or annotation produced duplicates.
+count_dt <- count_dt[
+  ,
+  lapply(.SD, function(x) sum(as.numeric(x), na.rm = TRUE)),
+  by = Gene,
+  .SDcols = sample_cols
+]
+
+count_dt <- count_dt[, c("Gene", cluster_dt$Sample), with = FALSE]
+count_matrix <- as.matrix(count_dt[, -"Gene"])
+rownames(count_matrix) <- count_dt$Gene
+storage.mode(count_matrix) <- "numeric"
+
+if (anyNA(count_matrix)) stop("Missing count values detected.")
+if (any(count_matrix < 0)) stop("Negative count values detected.")
+if (any(count_matrix != round(count_matrix))) {
+  stop("The HTSeq input contains non-integer values; raw counts are required.")
+}
+storage.mode(count_matrix) <- "integer"
+
+metadata <- data.frame(
+  Sample = cluster_dt$Sample,
+  Cluster = cluster_dt$Cluster,
+  row.names = cluster_dt$Sample,
+  check.names = FALSE
+)
+
+# ============================================================
+# DESeq2 normalization and VST
+# ============================================================
+
+dds0 <- DESeqDataSetFromMatrix(
+  countData = count_matrix,
+  colData = metadata,
+  design = ~ Cluster
+)
+
+# Retain genes with at least 10 reads in at least 3 tumors.
+keep_gene <- rowSums(counts(dds0) >= 10) >= 3
+
+filter_audit <- data.table(
+  Gene = rownames(dds0),
+  Total_count = rowSums(counts(dds0)),
+  Samples_with_count_ge_10 = rowSums(counts(dds0) >= 10),
+  Retained = keep_gene
+)
+
+fwrite(
+  filter_audit,
+  file.path(table_dir, paste0("gene_filter_audit_", run_date, ".tsv")),
+  sep = "\t"
+)
+
+dds <- dds0[keep_gene, ]
+dds <- DESeq(dds, test = "Wald", parallel = FALSE, quiet = FALSE)
+
+vst_object <- vst(dds, blind = FALSE)
+vst_matrix <- assay(vst_object)
+
+normalized_counts <- counts(dds, normalized = TRUE)
+
+write_matrix_tsv(
+  normalized_counts,
+  "Gene",
+  file.path(table_dir, paste0("DESeq2_normalized_counts_", run_date, ".tsv"))
+)
+
+write_matrix_tsv(
+  vst_matrix,
+  "Gene",
+  file.path(table_dir, paste0("DESeq2_VST_expression_", run_date, ".tsv"))
+)
+
+# ============================================================
+# Read pathway collections
+# ============================================================
+
+c5_all <- prefix_pathways(fgsea::gmtPathways(c5_gmt_file), "C5")
+custom_all <- prefix_pathways(fgsea::gmtPathways(custom_gmt_file), "CUSTOM")
+
+# Terms intentionally focus on chromatin and epigenetic biology.
+epigenetic_pattern <- paste(
+  c(
+    "CHROMATIN", "HISTONE", "NUCLEOSOME", "EPIGENETIC",
+    "DNA_METHYL", "DNA_DEMETHYL", "METHYLTRANSFERASE", "DEMETHYLASE",
+    "ACETYLTRANSFERASE", "DEACETYLASE", "HISTONE_ACETYL",
+    "SWI.*SNF", "BAF_COMPLEX", "PBAF", "POLYCOMB", "PRC1", "PRC2",
+    "HDAC", "HAT_COMPLEX", "EZH", "KMT", "KDM",
+    "COVALENT_CHROMATIN", "CHROMOSOME_ORGANIZATION"
+  ),
+  collapse = "|"
+)
+
+c5_epi <- c5_all[grepl(epigenetic_pattern, names(c5_all), ignore.case = TRUE)]
+custom_epi <- custom_all[
+  grepl(epigenetic_pattern, names(custom_all), ignore.case = TRUE)
+]
+
+# Curated core programs supplement ontology terms and permit direct inspection
+# of biologically important epigenetic complexes.
+curated_sets <- list(
+  CURATED__SWI_SNF_BAF_CORE = c(
+    "ARID1A", "ARID1B", "ARID2", "SMARCA2", "SMARCA4", "SMARCB1",
+    "SMARCC1", "SMARCC2", "SMARCD1", "SMARCD2", "SMARCD3", "SMARCE1",
+    "ACTL6A", "ACTL6B", "DPF1", "DPF2", "DPF3", "BCL7A", "BCL7B",
+    "BCL7C", "BRD7", "BRD9", "PBRM1"
+  ),
+  CURATED__PRC2_CORE = c(
+    "EZH1", "EZH2", "EED", "SUZ12", "RBBP4", "RBBP7", "JARID2",
+    "AEBP2", "MTF2", "PHF1", "PHF19", "EPOP"
+  ),
+  CURATED__PRC1_CORE = c(
+    "RING1", "RNF2", "BMI1", "PCGF1", "PCGF2", "PCGF3", "PCGF4",
+    "PCGF5", "PCGF6", "CBX2", "CBX4", "CBX6", "CBX7", "CBX8",
+    "PHC1", "PHC2", "PHC3"
+  ),
+  CURATED__HDAC_PROGRAM = c(
+    "HDAC1", "HDAC2", "HDAC3", "HDAC4", "HDAC5", "HDAC6", "HDAC7",
+    "HDAC8", "HDAC9", "HDAC10", "HDAC11", "SIRT1", "SIRT2", "SIRT3",
+    "SIRT4", "SIRT5", "SIRT6", "SIRT7", "NCOR1", "NCOR2", "SIN3A",
+    "SIN3B", "MTA1", "MTA2", "MTA3", "CHD3", "CHD4"
+  ),
+  CURATED__HISTONE_ACETYLTRANSFERASE_HAT_PROGRAM = c(
+    "CREBBP", "EP300", "KAT2A", "KAT2B", "KAT5", "KAT6A", "KAT6B",
+    "KAT7", "KAT8", "ELP3", "NCOA1", "NCOA2", "NCOA3", "CLOCK"
+  ),
+  CURATED__DNA_METHYLATION_WRITERS_READERS = c(
+    "DNMT1", "DNMT3A", "DNMT3B", "DNMT3L", "UHRF1", "UHRF2",
+    "MECP2", "MBD1", "MBD2", "MBD3", "MBD4", "ZBTB33", "ZBTB38",
+    "ZBTB4"
+  ),
+  CURATED__DNA_DEMETHYLATION_PROGRAM = c(
+    "TET1", "TET2", "TET3", "TDG", "GADD45A", "GADD45B", "GADD45G",
+    "AICDA", "APOBEC1"
+  ),
+  CURATED__HISTONE_LYSINE_METHYLTRANSFERASES = c(
+    "KMT2A", "KMT2B", "KMT2C", "KMT2D", "KMT2E", "KMT5A", "KMT5B",
+    "KMT5C", "SETD1A", "SETD1B", "SETD2", "SETD3", "SETD5", "SETD6",
+    "SETD7", "SETD8", "SETDB1", "SETDB2", "EHMT1", "EHMT2", "SUV39H1",
+    "SUV39H2", "EZH1", "EZH2", "DOT1L", "NSD1", "NSD2", "NSD3"
+  ),
+  CURATED__HISTONE_LYSINE_DEMETHYLASES = c(
+    "KDM1A", "KDM1B", "KDM2A", "KDM2B", "KDM3A", "KDM3B", "KDM4A",
+    "KDM4B", "KDM4C", "KDM4D", "KDM4E", "KDM5A", "KDM5B", "KDM5C",
+    "KDM5D", "KDM6A", "KDM6B", "KDM7A", "KDM8", "JMJD6", "PHF2",
+    "PHF8"
+  ),
+  CURATED__CHROMATIN_REMODELING_EXPANDED = c(
+    "ARID1A", "ARID1B", "ARID2", "SMARCA2", "SMARCA4", "SMARCB1",
+    "SMARCC1", "SMARCC2", "PBRM1", "CHD1", "CHD2", "CHD3", "CHD4",
+    "CHD5", "CHD6", "CHD7", "CHD8", "CHD9", "ATRX", "DAXX", "SRCAP",
+    "EP400", "INO80", "INO80B", "INO80C", "INO80D", "INO80E", "HELLS"
+  )
+)
+curated_sets <- lapply(curated_sets, clean_gene)
+
+all_epi_pathways <- c(c5_epi, custom_epi, curated_sets)
+
+# Ensure unique pathway names and retain expressed genes only.
+names(all_epi_pathways) <- make.unique(names(all_epi_pathways))
+expressed_genes <- rownames(vst_matrix)
+
+pathway_audit <- rbindlist(lapply(names(all_epi_pathways), function(nm) {
+  original_genes <- unique(clean_gene(all_epi_pathways[[nm]]))
+  matched_genes <- intersect(original_genes, expressed_genes)
+  source <- sub("__.*$", "", nm)
+  data.table(
+    Pathway = nm,
+    Source = source,
+    Original_gene_count = length(original_genes),
+    Expressed_gene_count = length(matched_genes),
+    Expressed_genes = paste(sort(matched_genes), collapse = ";")
+  )
+}))
+
+fwrite(
+  pathway_audit,
+  file.path(table_dir, paste0("epigenetic_pathway_gene_audit_", run_date, ".tsv")),
+  sep = "\t", quote = FALSE
+)
+
+# Minimum 3 expressed genes permits core protein complexes to be scored.
+# Interpret very small gene sets cautiously.
+epi_pathways <- lapply(all_epi_pathways, intersect, y = expressed_genes)
+epi_pathways <- lapply(epi_pathways, unique)
+epi_pathways <- epi_pathways[lengths(epi_pathways) >= 3 & lengths(epi_pathways) <= 500]
+
+if (length(epi_pathways) == 0) {
+  stop("No epigenetic pathways retained after expression and size filtering.")
+}
+
+message("Epigenetic pathways retained: ", length(epi_pathways))
+
+fwrite(
+  data.table(
+    Pathway = names(epi_pathways),
+    Expressed_gene_count = lengths(epi_pathways)
+  ),
+  file.path(table_dir, paste0("retained_epigenetic_pathways_", run_date, ".tsv")),
+  sep = "\t"
+)
+
+# ============================================================
+# Sample-level ssGSEA scores
+# ============================================================
+
+message("Running sample-level ssGSEA...")
+
+gsva_exports <- getNamespaceExports("GSVA")
+
+if ("ssgseaParam" %in% gsva_exports) {
+  ssgsea_param <- GSVA::ssgseaParam(
+    exprData = vst_matrix,
+    geneSets = epi_pathways,
+    minSize = 3,
+    maxSize = 500,
+    normalize = TRUE
+  )
+  ssgsea_scores <- GSVA::gsva(ssgsea_param, verbose = FALSE)
+} else {
+  # Compatibility with older GSVA releases.
+  ssgsea_scores <- GSVA::gsva(
+    expr = vst_matrix,
+    gset.idx.list = epi_pathways,
+    method = "ssgsea",
+    kcdf = "Gaussian",
+    min.sz = 3,
+    max.sz = 500,
+    abs.ranking = TRUE,
+    ssgsea.norm = TRUE,
+    verbose = FALSE
+  )
+}
+
+ssgsea_scores <- as.matrix(ssgsea_scores)
+ssgsea_scores <- ssgsea_scores[, cluster_dt$Sample, drop = FALSE]
+
+write_matrix_tsv(
+  ssgsea_scores,
+  "Pathway",
+  file.path(table_dir, paste0("epigenetic_ssGSEA_scores_", run_date, ".tsv"))
+)
+
+# ============================================================
+# Global and pairwise pathway-score comparisons
+# ============================================================
+
+score_long <- melt(
+  as.data.table(ssgsea_scores, keep.rownames = "Pathway"),
+  id.vars = "Pathway",
+  variable.name = "Sample",
+  value.name = "Score"
+)
+
+score_long <- merge(
+  score_long,
+  cluster_dt[, .(Sample, Cluster)],
+  by = "Sample",
+  all.x = TRUE,
+  sort = FALSE
+)
+score_long[, Cluster := factor(Cluster, levels = levels(cluster_dt$Cluster))]
+
+global_tests <- score_long[
+  ,
+  {
+    kw <- kruskal.test(Score ~ Cluster)
+    list(
+      Kruskal_Wallis_statistic = unname(kw$statistic),
+      P_value = kw$p.value,
+      Cluster1_median = median(Score[Cluster == "Cluster 1"], na.rm = TRUE),
+      Cluster2_median = median(Score[Cluster == "Cluster 2"], na.rm = TRUE),
+      Cluster3_median = median(Score[Cluster == "Cluster 3"], na.rm = TRUE)
+    )
+  },
+  by = Pathway
+]
+global_tests[, FDR := p.adjust(P_value, method = "BH")]
+setorder(global_tests, FDR, P_value)
+
+fwrite(
+  global_tests,
+  file.path(table_dir, paste0("epigenetic_ssGSEA_global_cluster_tests_", run_date, ".tsv")),
+  sep = "\t", quote = FALSE, na = ""
+)
+
+pair_defs <- list(
+  Cluster2_vs_Cluster1 = c("Cluster 2", "Cluster 1"),
+  Cluster3_vs_Cluster1 = c("Cluster 3", "Cluster 1"),
+  Cluster3_vs_Cluster2 = c("Cluster 3", "Cluster 2")
+)
+
+pairwise_tests <- rbindlist(lapply(names(pair_defs), function(comparison) {
+  pair <- pair_defs[[comparison]]
+
+  ans <- score_long[
+    Cluster %in% pair,
+    {
+      x <- Score[Cluster == pair[1]]
+      y <- Score[Cluster == pair[2]]
+      wt <- wilcox.test(x, y, exact = FALSE)
+      list(
+        Cluster_A = pair[1],
+        Cluster_B = pair[2],
+        Median_A = median(x, na.rm = TRUE),
+        Median_B = median(y, na.rm = TRUE),
+        Median_difference_A_minus_B = median(x, na.rm = TRUE) - median(y, na.rm = TRUE),
+        Wilcoxon_statistic = unname(wt$statistic),
+        P_value = wt$p.value
+      )
+    },
+    by = Pathway
+  ]
+
+  ans[, Comparison := comparison]
+  ans[, FDR_within_comparison := p.adjust(P_value, method = "BH")]
+  ans
+}), use.names = TRUE, fill = TRUE)
+
+setcolorder(
+  pairwise_tests,
+  c(
+    "Comparison", "Pathway", "Cluster_A", "Cluster_B", "Median_A",
+    "Median_B", "Median_difference_A_minus_B", "Wilcoxon_statistic",
+    "P_value", "FDR_within_comparison"
+  )
+)
+setorder(pairwise_tests, Comparison, FDR_within_comparison, P_value)
+
+fwrite(
+  pairwise_tests,
+  file.path(table_dir, paste0("epigenetic_ssGSEA_pairwise_cluster_tests_", run_date, ".tsv")),
+  sep = "\t", quote = FALSE, na = ""
+)
+
+# ============================================================
+# ssGSEA heatmap
+# ============================================================
+
+n_heatmap_pathways <- min(40L, nrow(global_tests))
+heatmap_pathways <- head(global_tests$Pathway, n_heatmap_pathways)
+heatmap_score_matrix <- zscore_rows(
+  ssgsea_scores[heatmap_pathways, cluster_dt$Sample, drop = FALSE]
+)
+
+column_annotation <- HeatmapAnnotation(
+  Cluster = cluster_dt$Cluster,
+  col = list(Cluster = cluster_colors),
+  annotation_name_gp = gpar(fontsize = 10),
+  simple_anno_size = unit(4, "mm")
+)
+
+score_col_fun <- colorRamp2(
+  c(-2.5, 0, 2.5),
+  c("#2166AC", "white", "#B2182B")
+)
+
+score_heatmap <- Heatmap(
+  heatmap_score_matrix,
+  name = "Pathway Z-score",
+  col = score_col_fun,
+  cluster_rows = TRUE,
+  cluster_columns = FALSE,
+  column_split = cluster_dt$Cluster,
+  column_order = cluster_dt$Sample,
+  top_annotation = column_annotation,
+  show_column_names = TRUE,
+  column_names_rot = 90,
+  column_names_gp = gpar(fontsize = 7),
+  row_names_gp = gpar(fontsize = 7),
+  row_title = "Epigenetic pathways",
+  column_title = "pILC tumors grouped by NMF RNA cluster",
+  border = TRUE
+)
+
+pdf(
+  file.path(plot_dir, paste0("epigenetic_ssGSEA_cluster_heatmap_", run_date, ".pdf")),
+  width = 15,
+  height = max(10, 0.22 * n_heatmap_pathways + 4)
+)
+draw(score_heatmap, heatmap_legend_side = "right", annotation_legend_side = "right")
+dev.off()
+
+png(
+  file.path(plot_dir, paste0("epigenetic_ssGSEA_cluster_heatmap_", run_date, ".png")),
+  width = 4500,
+  height = max(3000, 80 * n_heatmap_pathways + 1000),
+  res = 300
+)
+draw(score_heatmap, heatmap_legend_side = "right", annotation_legend_side = "right")
+dev.off()
+
+# ============================================================
+# Top pathway boxplots
+# ============================================================
+
+top_box_pathways <- head(global_tests$Pathway, min(12L, nrow(global_tests)))
+box_dt <- score_long[Pathway %in% top_box_pathways]
+box_dt[, Pathway := factor(Pathway, levels = rev(top_box_pathways))]
+
+box_plot <- ggplot(box_dt, aes(x = Cluster, y = Score, color = Cluster)) +
+  geom_boxplot(outlier.shape = NA, width = 0.65) +
+  geom_jitter(width = 0.12, size = 2, alpha = 0.8) +
+  facet_wrap(~ Pathway, scales = "free_y", ncol = 3) +
+  scale_color_manual(values = cluster_colors, drop = FALSE) +
+  labs(
+    title = "Epigenetic pathway scores across pILC RNA clusters",
+    subtitle = "Top pathways ranked by global Kruskal-Wallis FDR",
+    x = NULL,
+    y = "ssGSEA enrichment score"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    strip.text = element_text(size = 8),
+    axis.text.x = element_text(angle = 30, hjust = 1),
+    legend.position = "none",
+    panel.grid.minor = element_blank()
+  )
+
+ggsave(
+  file.path(plot_dir, paste0("epigenetic_ssGSEA_top_pathway_boxplots_", run_date, ".pdf")),
+  box_plot,
+  width = 14,
+  height = 12
+)
+ggsave(
+  file.path(plot_dir, paste0("epigenetic_ssGSEA_top_pathway_boxplots_", run_date, ".png")),
+  box_plot,
+  width = 14,
+  height = 12,
+  dpi = 300
+)
+
+# ============================================================
+# Cluster-versus-rest DESeq2 and ranked GSEA
+# ============================================================
+
+gsea_results <- list()
+deseq_cluster_results <- list()
+
+for (target_cluster in levels(metadata$Cluster)) {
+  message("Running cluster-versus-rest DESeq2 and GSEA: ", target_cluster)
+
+  dds_target <- dds
+  target_group <- ifelse(
+    colData(dds_target)$Cluster == target_cluster,
+    "Target",
+    "Rest"
+  )
+  colData(dds_target)$Target_vs_rest <- factor(
+    target_group,
+    levels = c("Rest", "Target")
+  )
+  design(dds_target) <- ~ Target_vs_rest
+
+  # Refit the model for the binary target-versus-rest comparison.
+  dds_target <- DESeq(dds_target, test = "Wald", parallel = FALSE, quiet = FALSE)
+
+  res <- results(
+    dds_target,
+    contrast = c("Target_vs_rest", "Target", "Rest"),
+    alpha = 0.05,
+    independentFiltering = TRUE
+  )
+
+  res_dt <- as.data.table(as.data.frame(res), keep.rownames = "Gene")
+  res_dt[, Target_cluster := target_cluster]
+  res_dt[, Direction := fifelse(
+    !is.na(padj) & padj < 0.05 & log2FoldChange > 0,
+    paste0("Higher_in_", target_cluster),
+    fifelse(
+      !is.na(padj) & padj < 0.05 & log2FoldChange < 0,
+      "Higher_in_Rest",
+      "Not_significant"
+    )
+  )]
+  setorder(res_dt, padj, pvalue, na.last = TRUE)
+  deseq_cluster_results[[target_cluster]] <- res_dt
+
+  cluster_safe <- safe_name(target_cluster)
+  fwrite(
+    res_dt,
+    file.path(
+      table_dir,
+      paste0("DESeq2_", cluster_safe, "_vs_rest_", run_date, ".tsv")
+    ),
+    sep = "\t", quote = FALSE, na = ""
+  )
+
+  ranks <- res_dt[!is.na(stat), stat]
+  names(ranks) <- res_dt[!is.na(stat), Gene]
+  ranks <- sort(ranks, decreasing = TRUE)
+
+  set.seed(42)
+  fg <- fgseaMultilevel(
+    pathways = epi_pathways,
+    stats = ranks,
+    minSize = 3,
+    maxSize = 500,
+    eps = 0,
+    scoreType = "std",
+    nproc = 1
+  )
+
+  fg <- as.data.table(fg)
+  fg[, Target_cluster := target_cluster]
+  fg[, Direction := fifelse(
+    NES > 0,
+    paste0("Enriched_in_", target_cluster),
+    "Enriched_in_Rest"
+  )]
+  fg[, Abs_NES_for_sorting := abs(NES)]
+  setorder(fg, padj, pval, -Abs_NES_for_sorting, na.last = TRUE)
+  fg[, Abs_NES_for_sorting := NULL]
+  gsea_results[[target_cluster]] <- fg
+
+  fg_export <- copy(fg)
+  fg_export[, leadingEdge := vapply(
+    leadingEdge,
+    function(x) paste(x, collapse = ";"),
+    character(1)
+  )]
+
+  fwrite(
+    fg_export,
+    file.path(
+      table_dir,
+      paste0("fgsea_epigenetic_", cluster_safe, "_vs_rest_", run_date, ".tsv")
+    ),
+    sep = "\t", quote = FALSE, na = ""
+  )
+
+  plot_fg <- fg[!is.na(padj)]
+  if (nrow(plot_fg) > 0) {
+    significant_fg <- plot_fg[padj < 0.05]
+    if (nrow(significant_fg) >= 5) {
+      plot_fg <- head(significant_fg, 20)
+    } else {
+      plot_fg <- head(plot_fg, 20)
+    }
+
+    plot_fg[, pathway := factor(pathway, levels = rev(pathway))]
+    plot_fg[, minus_log10_fdr := -log10(pmax(padj, .Machine$double.xmin))]
+
+    gsea_dot <- ggplot(
+      plot_fg,
+      aes(x = NES, y = pathway, size = minus_log10_fdr, color = NES)
+    ) +
+      geom_point(alpha = 0.9) +
+      scale_color_gradient2(
+        low = "#2166AC", mid = "grey90", high = "#B2182B", midpoint = 0
+      ) +
+      labs(
+        title = paste0(target_cluster, " versus the other RNA clusters"),
+        subtitle = "Ranked GSEA of chromatin and epigenetic pathways",
+        x = "Normalized enrichment score",
+        y = NULL,
+        size = "-log10 FDR",
+        color = "NES"
+      ) +
+      theme_bw(base_size = 11) +
+      theme(
+        plot.title = element_text(face = "bold"),
+        axis.text.y = element_text(size = 7),
+        panel.grid.minor = element_blank()
+      )
+
+    ggsave(
+      file.path(
+        plot_dir,
+        paste0("fgsea_epigenetic_", cluster_safe, "_vs_rest_", run_date, ".pdf")
+      ),
+      gsea_dot,
+      width = 11,
+      height = 8
+    )
+    ggsave(
+      file.path(
+        plot_dir,
+        paste0("fgsea_epigenetic_", cluster_safe, "_vs_rest_", run_date, ".png")
+      ),
+      gsea_dot,
+      width = 11,
+      height = 8,
+      dpi = 300
+    )
+  }
+}
+
+all_deseq_cluster_results <- rbindlist(
+  deseq_cluster_results,
+  use.names = TRUE,
+  fill = TRUE
+)
+fwrite(
+  all_deseq_cluster_results,
+  file.path(table_dir, paste0("DESeq2_all_clusters_vs_rest_", run_date, ".tsv")),
+  sep = "\t", quote = FALSE, na = ""
+)
+
+all_gsea <- rbindlist(gsea_results, use.names = TRUE, fill = TRUE)
+all_gsea_export <- copy(all_gsea)
+all_gsea_export[, leadingEdge := vapply(
+  leadingEdge,
+  function(x) paste(x, collapse = ";"),
+  character(1)
+)]
+
+fwrite(
+  all_gsea_export,
+  file.path(table_dir, paste0("fgsea_epigenetic_all_clusters_vs_rest_", run_date, ".tsv")),
+  sep = "\t", quote = FALSE, na = ""
+)
+
+# ============================================================
+# Leading-edge gene table and heatmap
+# ============================================================
+
+sig_gsea <- all_gsea[!is.na(padj) & padj < 0.05]
+if (nrow(sig_gsea) == 0) {
+  message("No GSEA pathways reached FDR <0.05; using the top 5 per cluster for leading-edge review.")
+  sig_gsea <- all_gsea[order(padj, pval), head(.SD, 5), by = Target_cluster]
+}
+
+leading_edge_long <- rbindlist(lapply(seq_len(nrow(sig_gsea)), function(i) {
+  genes <- sig_gsea$leadingEdge[[i]]
+  if (!length(genes)) return(NULL)
+  data.table(
+    Target_cluster = sig_gsea$Target_cluster[i],
+    Pathway = sig_gsea$pathway[i],
+    NES = sig_gsea$NES[i],
+    FDR = sig_gsea$padj[i],
+    Gene = genes
+  )
+}), use.names = TRUE, fill = TRUE)
+
+if (nrow(leading_edge_long) > 0) {
+  fwrite(
+    leading_edge_long,
+    file.path(table_dir, paste0("fgsea_leading_edge_genes_", run_date, ".tsv")),
+    sep = "\t", quote = FALSE, na = ""
+  )
+
+  leading_rank <- leading_edge_long[
+    ,
+    .(
+      Pathway_count = uniqueN(Pathway),
+      Cluster_count = uniqueN(Target_cluster),
+      Minimum_FDR = min(FDR, na.rm = TRUE)
+    ),
+    by = Gene
+  ]
+  setorder(leading_rank, -Cluster_count, -Pathway_count, Minimum_FDR)
+
+  leading_genes <- head(leading_rank$Gene, 75)
+  leading_genes <- intersect(leading_genes, rownames(vst_matrix))
+
+  if (length(leading_genes) >= 2) {
+    leading_mat <- zscore_rows(
+      vst_matrix[leading_genes, cluster_dt$Sample, drop = FALSE]
+    )
+
+    leading_heatmap <- Heatmap(
+      leading_mat,
+      name = "Expression Z-score",
+      col = score_col_fun,
+      cluster_rows = TRUE,
+      cluster_columns = FALSE,
+      column_split = cluster_dt$Cluster,
+      column_order = cluster_dt$Sample,
+      top_annotation = column_annotation,
+      show_column_names = TRUE,
+      column_names_rot = 90,
+      column_names_gp = gpar(fontsize = 7),
+      row_names_gp = gpar(fontsize = 7),
+      row_title = "Epigenetic pathway leading-edge genes",
+      column_title = "DESeq2 VST expression",
+      border = TRUE
+    )
+
+    pdf(
+      file.path(plot_dir, paste0("epigenetic_leading_edge_gene_heatmap_", run_date, ".pdf")),
+      width = 15,
+      height = max(10, 0.18 * length(leading_genes) + 4)
+    )
+    draw(leading_heatmap, heatmap_legend_side = "right", annotation_legend_side = "right")
+    dev.off()
+
+    png(
+      file.path(plot_dir, paste0("epigenetic_leading_edge_gene_heatmap_", run_date, ".png")),
+      width = 4500,
+      height = max(3000, 65 * length(leading_genes) + 1000),
+      res = 300
+    )
+    draw(leading_heatmap, heatmap_legend_side = "right", annotation_legend_side = "right")
+    dev.off()
+  }
+}
+
+# ============================================================
+# Compact analysis summary
+# ============================================================
+
+summary_dt <- data.table(
+  Metric = c(
+    "Samples",
+    "Cluster_1_samples",
+    "Cluster_2_samples",
+    "Cluster_3_samples",
+    "Genes_before_filtering",
+    "Genes_after_filtering",
+    "C5_epigenetic_pathways_selected",
+    "Custom_epigenetic_pathways_selected",
+    "Curated_pathways_defined",
+    "Total_pathways_scored",
+    "ssGSEA_pathways_global_FDR_lt_0.05",
+    "GSEA_rows_FDR_lt_0.05"
+  ),
+  Value = c(
+    ncol(count_matrix),
+    sum(cluster_dt$Cluster == "Cluster 1"),
+    sum(cluster_dt$Cluster == "Cluster 2"),
+    sum(cluster_dt$Cluster == "Cluster 3"),
+    nrow(dds0),
+    nrow(dds),
+    length(c5_epi),
+    length(custom_epi),
+    length(curated_sets),
+    length(epi_pathways),
+    sum(global_tests$FDR < 0.05, na.rm = TRUE),
+    sum(all_gsea$padj < 0.05, na.rm = TRUE)
+  )
+)
+
+fwrite(
+  summary_dt,
+  file.path(table_dir, paste0("epigenetic_pathway_analysis_summary_", run_date, ".tsv")),
+  sep = "\t"
+)
+
+writeLines(
+  c(
+    paste0("pILC chromatin and epigenetic pathway analysis: ", run_date),
+    "Seed: 42",
+    paste0("Raw counts: ", count_file),
+    paste0("NMF clusters: ", cluster_gct_file),
+    paste0("C5 GMT: ", c5_gmt_file),
+    paste0("Custom GMT: ", custom_gmt_file),
+    "DESeq2 prefilter: count >=10 in at least 3 samples",
+    "Sample-level scoring: ssGSEA on DESeq2 VST expression",
+    "Global score comparison: Kruskal-Wallis with BH FDR",
+    "Pairwise score comparison: Wilcoxon rank-sum with BH FDR within each contrast",
+    "Ranked enrichment: fgseaMultilevel using DESeq2 Wald statistics",
+    "GSEA contrasts: each cluster versus the other two clusters",
+    "Small curated gene sets with >=3 expressed genes were retained; interpret small sets cautiously.",
+    "The RNA clusters were derived from the same expression data. These analyses characterize the clusters and are not independent validation.",
+    "RNA pathway enrichment supports transcriptional programs consistent with epigenetic dysregulation but does not directly prove an epigenetic mechanism."
+  ),
+  file.path(out_dir, paste0("README_pILC_Epigenetic_Pathway_Analysis_", run_date, ".txt"))
+)
+
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(out_dir, paste0("sessionInfo_", run_date, ".txt"))
+)
+
+message("Analysis complete.")
+message("Output directory: ", out_dir)
+print(summary_dt)
+
+graphics.off()
+
+```
+
