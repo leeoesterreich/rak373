@@ -1,5 +1,5 @@
 ---
-title: "Chromatin_gene_oncoplots"
+title: "Chromatin_gene_mutation_and_CNV_oncoplots"
 output:
   html_document:
     toc: true
@@ -37,9 +37,16 @@ This Rmd plots somatic mutations (WES) in two chromatin gene lists:
   combined oncoplot and one oncoplot per biological module (7 modules). This list
   is defined a priori and does not depend on the RNA clusters.
 
-Final figures: two oncoplots (leading-edge genes; all curated genes), rows
-ordered by mutation frequency, mutated genes only, columns grouped by RNA NMF
+Final figures: for each gene list (leading-edge genes; all curated genes), two
+SEPARATE plots with identical column order and clinical tracks:
+
+- **Mutation oncoplot**: nonsilent mutations with PCGR VAF >= 5%.
+- **CNV oncoplot**: PCGR copy-number calls (Gain / Hetdel / Homdel; most severe
+  call per gene per tumor), rows = genes with a CNV in >= 1 tumor.
+
+Rows are ordered by the number of altered tumors; columns are grouped by RNA NMF
 cluster (WES-only tumors shown as "No RNA") with TP order within each group.
+A merged mutation + CNV plot is optional (PLOT_COMBINED).
 
 A gene-level audit records, for every requested gene, the first filter that
 removed it (no variant, only silent, VAF not matched, VAF <5%) or that it was plotted.
@@ -129,6 +136,34 @@ rna_cluster_colors <- c(
   "Cluster 3" = "#7570B3",
   "No RNA"    = "#BDBDBD"
 )
+
+# ------------------------------------------------------------
+# Copy-number (CNV) layer for the integrated oncoplots
+# ------------------------------------------------------------
+# TRUE = read the PCGR CNV files (needed for the CNV plots).
+INCLUDE_CNV <- TRUE
+
+# Which plots to make for each gene list (separate figures, not merged):
+PLOT_MUTATION <- TRUE    # mutation oncoplot  (nonsilent, PCGR VAF >= 5%)
+PLOT_CNV      <- TRUE    # CNV oncoplot       (PCGR Gain / Hetdel / Homdel)
+PLOT_COMBINED <- FALSE   # optional merged mutation + CNV plot (off by default)
+
+# Per-sample PCGR CNV CSV files (same folder and pattern as CNV_Plot_WES.Rmd).
+CNV_DIR <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/CNV_PCGR/Plot"
+CNV_FILE_PATTERN <- "^TP.*_T\\.csv$"
+
+# A gene is shown if it has a qualifying mutation OR a CNV in >= this many tumors.
+MIN_CNV_SAMPLES <- 1L
+
+# CNV colors (same as CNV_Plot_WES.Rmd).
+cnv_cols <- c(
+  "Gain"   = "#31A354",  # green
+  "Hetdel" = "#8C6D31",  # brown
+  "Homdel" = "#D7301F"   # red
+)
+
+# Size of the mutation box inside a cell when CNV is shown (fraction of the cell).
+mut_inner_frac <- 0.58
 
 # Flag MAF symbols that are older aliases of a gene in the lists
 # (requires AnnotationDbi + org.Hs.eg.db).
@@ -932,6 +967,11 @@ cat("\n")
 plot_gene_keys <- gene_audit[Plotted == TRUE, Gene_key]
 plot_sets <- lapply(oncoplot_sets, function(g) g[clean_key(g) %in% plot_gene_keys])
 
+# Separate row sets for the separate plots (CNV sets are filled in read_cnv).
+plot_sets_mutation <- plot_sets
+plot_sets_cnv      <- lapply(oncoplot_sets, function(g) character())
+plot_sets_combined <- plot_sets
+
 # Clinical match check (same as the original script).
 cat("Clinical samples matching MAF samples:",
     sum(clean_sample(all_samples) %in% clinical_plot_dt$Sample_key), "of",
@@ -1016,6 +1056,173 @@ if (isTRUE(ORDER_BY_RNA_CLUSTER)) {
     file.path(table_dir, "WES_sample_RNA_cluster_order.tsv"),
     sep = "\t", quote = FALSE, na = ""
   )
+}
+```
+
+```{r read_cnv}
+# ============================================================
+# Copy-number calls (PCGR CNV), one call per gene per sample
+# ============================================================
+# Logic reused from CNV_Plot_WES.Rmd:
+#   - read the per-sample PCGR CNV CSV files
+#   - normalize VARIANT_CLASS to Gain / Hetdel / Homdel
+#   - keep the most severe call per sample x gene: Homdel > Hetdel > Gain
+# The cohort for CNV = all sample files found (a tumor with no CNV calls still
+# counts as assessed). CNV samples are matched to WES barcodes with the same
+# key used for the RNA clusters.
+
+# Empty template so the plotting function works when INCLUDE_CNV = FALSE.
+cnv_onecall <- data.table(
+  Tumor_Sample_Barcode = character(),
+  Gene_key = character(),
+  CNV_class = character()
+)
+
+if (isTRUE(INCLUDE_CNV)) {
+
+  cnv_files <- sort(list.files(CNV_DIR, pattern = CNV_FILE_PATTERN, full.names = TRUE))
+  if (length(cnv_files) == 0) stop("No per-sample CNV CSV files found in: ", CNV_DIR)
+  cat("CNV sample files found:", length(cnv_files), "\n")
+
+  # Same class mapping as CNV_Plot_WES.Rmd.
+  normalize_cnv_class <- function(x) {
+    x <- tolower(trimws(as.character(x)))
+    fcase(
+      x %in% c("hetdel", "het_del", "hetd", "heterozygous deletion", "het deletion"), "Hetdel",
+      x %in% c("homdel", "hom_del", "homd", "homozygous deletion", "hom deletion"), "Homdel",
+      x %in% c("gain", "amp", "amplification", "hlamp", "high-level amplification"), "Gain",
+      default = NA_character_
+    )
+  }
+  cnv_priority <- c(Homdel = 3L, Hetdel = 2L, Gain = 1L)
+
+  # Read one file; the first unnamed row-name column (if any) is ignored.
+  read_one_cnv <- function(f) {
+    dt <- fread(f, na.strings = c("", "NA"), data.table = TRUE)
+    if (!all(c("SYMBOL", "VARIANT_CLASS") %in% names(dt))) {
+      stop("Missing SYMBOL or VARIANT_CLASS in ", basename(f))
+    }
+    data.table(
+      CNV_sample = sub("\\.csv$", "", basename(f)),
+      SYMBOL = as.character(dt$SYMBOL),
+      VARIANT_CLASS = as.character(dt$VARIANT_CLASS)
+    )
+  }
+
+  cnv_long <- rbindlist(lapply(cnv_files, read_one_cnv), use.names = TRUE)
+  cnv_long[, Gene_key := clean_key(SYMBOL)]
+  cnv_long[, CNV_class := normalize_cnv_class(VARIANT_CLASS)]
+  cnv_long <- cnv_long[!is.na(Gene_key) & !is.na(CNV_class)]
+  cnv_long[, CNV_score := cnv_priority[CNV_class]]
+
+  # One call per sample x gene: most severe first.
+  setorder(cnv_long, CNV_sample, Gene_key, -CNV_score)
+  cnv_sample_gene <- unique(cnv_long, by = c("CNV_sample", "Gene_key"))
+
+  # Match CNV samples to WES barcodes.
+  cnv_sample_map <- data.table(
+    CNV_sample = sub("\\.csv$", "", basename(cnv_files)),
+    Sample_match_key = sample_match_key(sub("\\.csv$", "", basename(cnv_files)))
+  )
+  wes_key_dt <- data.table(
+    Tumor_Sample_Barcode = all_samples,
+    Sample_match_key = sample_match_key(all_samples)
+  )
+  cnv_sample_map <- merge(cnv_sample_map, wes_key_dt, by = "Sample_match_key", all = TRUE)
+  cnv_sample_map[, Status := fcase(
+    !is.na(CNV_sample) & !is.na(Tumor_Sample_Barcode), "CNV_and_WES_mutations",
+    !is.na(CNV_sample) &  is.na(Tumor_Sample_Barcode), "CNV_file_not_in_MAF (not plotted)",
+     is.na(CNV_sample) & !is.na(Tumor_Sample_Barcode), "In_MAF_no_CNV_file (CNV not assessed)"
+  )]
+  fwrite(cnv_sample_map, file.path(table_dir, "CNV_to_WES_sample_matching.tsv"),
+         sep = "\t", quote = FALSE, na = "")
+  cat("CNV sample matching:\n")
+  print(cnv_sample_map[, .N, by = Status])
+  if (any(cnv_sample_map$Status != "CNV_and_WES_mutations")) {
+    warning("Some samples are missing CNV files or are absent from the MAF; see CNV_to_WES_sample_matching.tsv")
+  }
+
+  cnv_onecall <- merge(
+    cnv_sample_gene[, .(CNV_sample, Gene_key, CNV_class)],
+    cnv_sample_map[!is.na(Tumor_Sample_Barcode) & !is.na(CNV_sample),
+                   .(CNV_sample, Tumor_Sample_Barcode)],
+    by = "CNV_sample"
+  )[, .(Tumor_Sample_Barcode, Gene_key, CNV_class)]
+
+  cat("\nCNV calls per class (one per sample x gene, all genes):\n")
+  print(cnv_onecall[, .N, by = CNV_class])
+
+  # ------------------------------------------------------------
+  # Add CNV to the gene audit and decide which genes are plotted
+  # ------------------------------------------------------------
+  cnv_gene_counts <- cnv_onecall[
+    Gene_key %in% gene_audit$Gene_key,
+    .(
+      CNV_any_samples    = uniqueN(Tumor_Sample_Barcode),
+      CNV_Gain_samples   = uniqueN(Tumor_Sample_Barcode[CNV_class == "Gain"]),
+      CNV_Hetdel_samples = uniqueN(Tumor_Sample_Barcode[CNV_class == "Hetdel"]),
+      CNV_Homdel_samples = uniqueN(Tumor_Sample_Barcode[CNV_class == "Homdel"])
+    ),
+    by = Gene_key
+  ]
+  cnv_count_cols <- setdiff(names(cnv_gene_counts), "Gene_key")
+  old_cols <- intersect(c(cnv_count_cols, "Any_altered_samples"), names(gene_audit))
+  if (length(old_cols) > 0) gene_audit[, (old_cols) := NULL]
+  gene_audit <- merge(gene_audit, cnv_gene_counts, by = "Gene_key", all.x = TRUE, sort = FALSE)
+  for (cc in cnv_count_cols) gene_audit[is.na(get(cc)), (cc) := 0L]
+
+  # Tumors altered by mutation OR CNV (each tumor counted once per gene).
+  any_pairs <- unique(rbind(
+    maf_dt[Gene_key %in% gene_audit[Plotted == TRUE, Gene_key], .(Gene_key, Tumor_Sample_Barcode)],
+    cnv_onecall[Gene_key %in% gene_audit$Gene_key, .(Gene_key, Tumor_Sample_Barcode)]
+  ))
+  any_counts <- any_pairs[, .(Any_altered_samples = .N), by = Gene_key]
+  gene_audit <- merge(gene_audit, any_counts, by = "Gene_key", all.x = TRUE, sort = FALSE)
+  gene_audit[is.na(Any_altered_samples), Any_altered_samples := 0L]
+
+  gene_audit[, Plotted_mutation := Plotted]
+  gene_audit[, Plotted := Plotted_mutation | CNV_any_samples >= MIN_CNV_SAMPLES]
+  gene_audit[, Alteration_type := fcase(
+    Plotted_mutation & CNV_any_samples >= MIN_CNV_SAMPLES, "Mutation_and_CNV",
+    Plotted_mutation, "Mutation_only",
+    CNV_any_samples >= MIN_CNV_SAMPLES, "CNV_only",
+    default = "Not_altered"
+  )]
+  setorder(gene_audit, -Plotted, -Any_altered_samples, Gene)
+
+  fwrite(gene_audit,
+         file.path(table_dir, paste0("chromatin_gene_mutation_CNV_audit_", VAF_TAG, ".tsv")),
+         sep = "\t", quote = FALSE, na = "")
+
+  list_summary_cnv <- rbindlist(lapply(names(oncoplot_sets), function(nm) {
+    a <- gene_audit[Gene_key %in% clean_key(oncoplot_sets[[nm]])]
+    data.table(
+      Gene_list = nm,
+      Genes_requested = nrow(a),
+      Mutation_only = sum(a$Alteration_type == "Mutation_only"),
+      CNV_only = sum(a$Alteration_type == "CNV_only"),
+      Mutation_and_CNV = sum(a$Alteration_type == "Mutation_and_CNV"),
+      Not_altered = sum(a$Alteration_type == "Not_altered"),
+      Plotted = sum(a$Plotted)
+    )
+  }))
+  fwrite(list_summary_cnv,
+         file.path(table_dir, paste0("chromatin_gene_list_mutation_CNV_summary_", VAF_TAG, ".tsv")),
+         sep = "\t", quote = FALSE, na = "")
+  cat("\nGenes per list (mutation and/or CNV):\n")
+  print(list_summary_cnv)
+
+  # Rows for each separate plot, per list (original list order kept).
+  mut_keys      <- gene_audit[Plotted_mutation == TRUE, Gene_key]
+  cnv_keys      <- gene_audit[CNV_any_samples >= MIN_CNV_SAMPLES, Gene_key]
+  combined_keys <- gene_audit[Plotted == TRUE, Gene_key]
+
+  plot_sets_mutation <- lapply(oncoplot_sets, function(g) g[clean_key(g) %in% mut_keys])
+  plot_sets_cnv      <- lapply(oncoplot_sets, function(g) g[clean_key(g) %in% cnv_keys])
+  plot_sets_combined <- lapply(oncoplot_sets, function(g) g[clean_key(g) %in% combined_keys])
+
+  # plot_gene_keys is used for the variant-level table: mutation genes only.
+  plot_gene_keys <- mut_keys
 }
 ```
 
@@ -1283,14 +1490,27 @@ fwrite(
 
 ```{r define_plot_function}
 # ============================================================
-# Main plotting function (identical to the functional-category script)
+# Main plotting function
+# Based on the functional-category oncoplot function. When INCLUDE_CNV = TRUE:
+#   - each cell: CNV = full-cell color, mutation = smaller inner box
+#   - rows: genes with a qualifying mutation OR a CNV
+#   - row order: tumors altered by mutation or CNV (high to low)
+#   - extra top barplot (CNV genes per sample) and right barplot (CNV class)
+# When INCLUDE_CNV = FALSE the plot matches the original mutation-only style.
 # ============================================================
 
 # sample_order: column order; sample_group: RNA cluster per column (same order),
 # or NULL for the original TP-order style without a cluster bar.
+# layers: "mutation", "cnv", or c("mutation", "cnv") for the merged plot.
 make_category_oncoplot <- function(category_name, genes,
                                    sample_order = all_samples,
-                                   sample_group = NULL) {
+                                   sample_group = NULL,
+                                   layers = "mutation") {
+
+  show_mut <- "mutation" %in% layers
+  show_cnv <- "cnv" %in% layers && isTRUE(INCLUDE_CNV)
+  both_layers <- show_mut && show_cnv
+  layer_label <- if (both_layers) "mutation + CNV" else if (show_cnv) "CNV" else "mutations"
 
   cat("============================================================\n")
   cat("Category:", category_name, "\n")
@@ -1298,81 +1518,112 @@ make_category_oncoplot <- function(category_name, genes,
 
   genes <- unique(genes)
   genes_key <- clean_key(genes)
-
-  cat_maf <- maf_dt[Gene_key %in% genes_key]
-
-  if (nrow(cat_maf) == 0) {
-    cat("No mutated genes from this category found in MAF. Skipping.\n\n")
-    return(NULL)
-  }
+  gene_label <- setNames(genes, genes_key)   # key -> display name
 
   # Column order supplied by the caller (RNA-cluster order or TP order)
   plot_samples <- sample_order
 
+  cat_maf <- if (show_mut) {
+    maf_dt[Gene_key %in% genes_key & Tumor_Sample_Barcode %in% plot_samples]
+  } else {
+    maf_dt[0]
+  }
+  cat_cnv <- if (show_cnv) {
+    cnv_onecall[Gene_key %in% genes_key & Tumor_Sample_Barcode %in% plot_samples]
+  } else {
+    cnv_onecall[0]
+  }
+
+  if (nrow(cat_maf) == 0 && nrow(cat_cnv) == 0) {
+    cat("No altered genes from this list. Skipping.\n\n")
+    return(NULL)
+  }
+
   # ------------------------------------------------------------
-  # Cell-level summary
+  # Mutation cell-level summary
   # Multi_Hit = >1 MAF variant row in same Sample + Gene
   # Oncogenicity priority = Oncogenic > Likely_Oncogenic
   # ------------------------------------------------------------
 
-  cell_dt <- cat_maf[
-    ,
-    {
-      onc_vals <- ONCOGENICITY[!is.na(ONCOGENICITY)]
+  if (nrow(cat_maf) > 0) {
+    cell_dt <- cat_maf[
+      ,
+      {
+        onc_vals <- ONCOGENICITY[!is.na(ONCOGENICITY)]
 
-      cell_onc <- ""
+        cell_onc <- ""
 
-      if ("Oncogenic" %in% onc_vals) {
-        cell_onc <- "Oncogenic"
-      } else if ("Likely_Oncogenic" %in% onc_vals) {
-        cell_onc <- "Likely_Oncogenic"
-      }
+        if ("Oncogenic" %in% onc_vals) {
+          cell_onc <- "Oncogenic"
+        } else if ("Likely_Oncogenic" %in% onc_vals) {
+          cell_onc <- "Likely_Oncogenic"
+        }
 
-      list(
-        n_variants = .N,
-        Display = ifelse(.N > 1, "Multi_Hit", as.character(Variant_Classification[1])),
-        Variant_Classification_List = paste(unique(Variant_Classification), collapse = ";"),
-        HGVSp_List = paste(unique(na.omit(HGVSp)), collapse = ";"),
-        HGVSc_List = paste(unique(na.omit(HGVSc)), collapse = ";"),
-        Cell_ONCOGENICITY = cell_onc,
-        ONCOGENICITY_List = paste(unique(na.omit(ONCOGENICITY)), collapse = ";"),
-        ONCOGENICITY_match_methods = paste(unique(na.omit(oncogenicity_match_method)), collapse = ";")
-      )
-    },
-    by = .(Tumor_Sample_Barcode, Hugo_Symbol, Gene_key)
-  ]
+        list(
+          n_variants = .N,
+          Display = ifelse(.N > 1, "Multi_Hit", as.character(Variant_Classification[1])),
+          Variant_Classification_List = paste(unique(Variant_Classification), collapse = ";"),
+          HGVSp_List = paste(unique(na.omit(HGVSp)), collapse = ";"),
+          HGVSc_List = paste(unique(na.omit(HGVSc)), collapse = ";"),
+          VAF_percent_List = paste(unique(na.omit(VAF_percent)), collapse = ";"),
+          Cell_ONCOGENICITY = cell_onc,
+          ONCOGENICITY_List = paste(unique(na.omit(ONCOGENICITY)), collapse = ";"),
+          ONCOGENICITY_match_methods = paste(unique(na.omit(oncogenicity_match_method)), collapse = ";")
+        )
+      },
+      by = .(Tumor_Sample_Barcode, Gene_key)
+    ]
+  } else {
+    cell_dt <- data.table(
+      Tumor_Sample_Barcode = character(), Gene_key = character(),
+      n_variants = integer(), Display = character(), Cell_ONCOGENICITY = character()
+    )
+  }
+  cell_dt[, Gene := unname(gene_label[Gene_key])]
+  cat_cnv <- copy(cat_cnv)
+  cat_cnv[, Gene := unname(gene_label[Gene_key])]
 
   # ------------------------------------------------------------
-  # Order genes by alteration frequency: high to low
-  # Tie-breaker 1 = total MAF variant rows in that gene
-  # Tie-breaker 2 = original gene-list order (here: heatmap rank)
+  # Order genes: tumors altered by mutation OR CNV (high to low)
+  # Tie-breakers: mutated tumors, variant rows, original list order
   # ------------------------------------------------------------
 
-  gene_order_dt <- cell_dt[
-    ,
-    .(
-      n_altered_samples = uniqueN(Tumor_Sample_Barcode),
-      n_variant_rows = sum(n_variants),
-      category_order = match(Gene_key[1], genes_key)
-    ),
-    by = .(Gene_key, Hugo_Symbol)
-  ]
+  altered_pairs <- unique(rbind(
+    cell_dt[, .(Gene_key, Tumor_Sample_Barcode)],
+    cat_cnv[, .(Gene_key, Tumor_Sample_Barcode)]
+  ))
+  gene_order_dt <- altered_pairs[, .(n_altered_samples = .N), by = Gene_key]
+  mut_counts <- cell_dt[, .(n_mutated_samples = .N, n_variant_rows = sum(n_variants)), by = Gene_key]
+  gene_order_dt <- merge(gene_order_dt, mut_counts, by = "Gene_key", all.x = TRUE)
+  gene_order_dt[is.na(n_mutated_samples), `:=`(n_mutated_samples = 0L, n_variant_rows = 0L)]
+  gene_order_dt[, category_order := match(Gene_key, genes_key)]
+  gene_order_dt[, Gene := unname(gene_label[Gene_key])]
 
   setorder(
     gene_order_dt,
     -n_altered_samples,
+    -n_mutated_samples,
     -n_variant_rows,
     category_order,
-    Hugo_Symbol
+    Gene
   )
 
-  plot_genes <- gene_order_dt$Hugo_Symbol
-  names(plot_genes) <- NULL
+  plot_genes <- gene_order_dt$Gene
 
-  category_safe <- safe_file_name(category_name)
+  layer_suffix <- if (both_layers) "_mutation_CNV" else if (show_cnv) "_CNV" else "_mutation"
+  category_safe <- paste0(safe_file_name(category_name), layer_suffix)
+
+  # Cell-level table: mutation and CNV per sample x gene
+  cell_table <- merge(
+    cell_dt,
+    cat_cnv[, .(Tumor_Sample_Barcode, Gene_key, CNV_class)],
+    by = c("Tumor_Sample_Barcode", "Gene_key"),
+    all = TRUE
+  )
+  cell_table[, Gene := unname(gene_label[Gene_key])]
 
   fwrite(
-    cell_dt,
+    cell_table,
     file = file.path(table_dir, paste0(category_safe, "_cell_level_oncoplot_table.tsv")),
     sep = "\t",
     quote = FALSE,
@@ -1380,88 +1631,92 @@ make_category_oncoplot <- function(category_name, genes,
   )
 
   # ------------------------------------------------------------
-  # Build mutation matrix and oncogenicity matrix
+  # Mutation matrix, oncogenicity matrix and CNV matrix
   # ------------------------------------------------------------
 
-  mut_mat <- matrix(
-    "",
-    nrow = length(plot_genes),
-    ncol = length(plot_samples),
-    dimnames = list(plot_genes, plot_samples)
-  )
-
-  onc_mat <- matrix(
-    "",
-    nrow = length(plot_genes),
-    ncol = length(plot_samples),
-    dimnames = list(plot_genes, plot_samples)
-  )
+  empty_mat <- function() {
+    matrix("", nrow = length(plot_genes), ncol = length(plot_samples),
+           dimnames = list(plot_genes, plot_samples))
+  }
+  mut_mat <- empty_mat()
+  onc_mat <- empty_mat()
+  cnv_mat <- empty_mat()
 
   for (ii in seq_len(nrow(cell_dt))) {
-    g <- cell_dt$Hugo_Symbol[ii]
+    g <- cell_dt$Gene[ii]
     s <- cell_dt$Tumor_Sample_Barcode[ii]
-
     if (g %in% rownames(mut_mat) && s %in% colnames(mut_mat)) {
       mut_mat[g, s] <- cell_dt$Display[ii]
       onc_mat[g, s] <- cell_dt$Cell_ONCOGENICITY[ii]
     }
   }
 
-  plot_mat <- mut_mat
-  plot_mat[plot_mat == ""] <- NA_character_
-
-  # ------------------------------------------------------------
-  # Top stacked barplot: number of mutation rows per sample
-  # ------------------------------------------------------------
-
-  sample_class_dt <- cat_maf[
-    ,
-    .N,
-    by = .(Tumor_Sample_Barcode, Variant_Classification)
-  ]
-
-  sample_class_mat_dt <- dcast(
-    sample_class_dt,
-    Tumor_Sample_Barcode ~ Variant_Classification,
-    value.var = "N",
-    fill = 0
-  )
-
-  sample_class_mat_dt <- merge(
-    data.table(Tumor_Sample_Barcode = plot_samples),
-    sample_class_mat_dt,
-    by = "Tumor_Sample_Barcode",
-    all.x = TRUE,
-    sort = FALSE
-  )
-
-  sample_class_mat_dt <- sample_class_mat_dt[
-    match(plot_samples, Tumor_Sample_Barcode)
-  ]
-
-  sample_class_cols <- setdiff(colnames(sample_class_mat_dt), "Tumor_Sample_Barcode")
-
-  if (length(sample_class_cols) == 0) {
-
-    sample_class_mat <- matrix(
-      0,
-      nrow = length(plot_samples),
-      ncol = 1,
-      dimnames = list(plot_samples, "No_mutation")
-    )
-
-  } else {
-
-    for (cc in sample_class_cols) {
-      sample_class_mat_dt[is.na(get(cc)), (cc) := 0]
+  for (ii in seq_len(nrow(cat_cnv))) {
+    g <- cat_cnv$Gene[ii]
+    s <- cat_cnv$Tumor_Sample_Barcode[ii]
+    if (g %in% rownames(cnv_mat) && s %in% colnames(cnv_mat)) {
+      cnv_mat[g, s] <- cat_cnv$CNV_class[ii]
     }
-
-    sample_class_mat <- as.matrix(sample_class_mat_dt[, ..sample_class_cols])
-    rownames(sample_class_mat) <- sample_class_mat_dt$Tumor_Sample_Barcode
   }
 
+  # Helper: long counts -> matrix in a fixed row order (missing = 0)
+  counts_to_matrix <- function(dt, row_col, class_col, row_ids, classes = NULL) {
+    if (nrow(dt) == 0) {
+      cls <- if (is.null(classes)) "None" else classes
+      return(matrix(0, nrow = length(row_ids), ncol = length(cls),
+                    dimnames = list(row_ids, cls)))
+    }
+    wide <- dcast(dt, as.formula(paste(row_col, "~", class_col)), value.var = "N", fill = 0)
+    wide <- merge(setnames(data.table(row_ids), row_col), wide, by = row_col,
+                  all.x = TRUE, sort = FALSE)
+    wide <- wide[match(row_ids, wide[[row_col]])]
+    cls <- setdiff(names(wide), row_col)
+    if (!is.null(classes)) {
+      for (cc in setdiff(classes, cls)) wide[, (cc) := 0]
+      cls <- classes
+    }
+    m <- as.matrix(wide[, ..cls])
+    m[is.na(m)] <- 0
+    rownames(m) <- row_ids
+    m
+  }
+
+  # Guard: anno_barplot needs a non-zero axis range
+  safe_ylim <- function(m) c(0, max(1, max(rowSums(m))))
+
   # ------------------------------------------------------------
-  # Bottom clinical annotations
+  # Top barplots: mutations per sample and CNV genes per sample
+  # ------------------------------------------------------------
+
+  sample_class_mat <- counts_to_matrix(
+    cat_maf[, .N, by = .(Tumor_Sample_Barcode, Variant_Classification)],
+    "Tumor_Sample_Barcode", "Variant_Classification", plot_samples
+  )
+
+  cnv_classes <- names(cnv_cols)
+  sample_cnv_mat <- counts_to_matrix(
+    cat_cnv[, .N, by = .(Tumor_Sample_Barcode, CNV_class)],
+    "Tumor_Sample_Barcode", "CNV_class", plot_samples, classes = cnv_classes
+  )
+
+  # ------------------------------------------------------------
+  # Right barplots: mutated tumors by class, CNV tumors by class
+  # ------------------------------------------------------------
+
+  gene_class_mat <- counts_to_matrix(
+    cell_dt[, .N, by = .(Gene, Display)], "Gene", "Display", plot_genes
+  )
+  gene_cnv_mat <- counts_to_matrix(
+    cat_cnv[, .N, by = .(Gene, CNV_class)], "Gene", "CNV_class", plot_genes,
+    classes = cnv_classes
+  )
+
+  # % altered = tumors with a mutation OR a CNV in the gene
+  gene_altered_counts <- rowSums(mut_mat != "" | cnv_mat != "")
+  gene_altered_pct <- round(100 * gene_altered_counts / ncol(mut_mat))
+
+  # ------------------------------------------------------------
+  # Bottom clinical annotations (unchanged)
   # ------------------------------------------------------------
 
   plot_sample_keys <- clean_sample(plot_samples)
@@ -1552,10 +1807,6 @@ make_category_oncoplot <- function(category_name, genes,
     PR = binary_receptor_cols
   )
 
-  if (length(setdiff(colnames(clinical_anno_df), names(clinical_anno_cols))) > 0) {
-    stop("Clinical annotation dataframe and color list names do not match.")
-  }
-
   bottom_clin_ha <- HeatmapAnnotation(
     ` ` = anno_empty(
       height = unit(1, "mm"),
@@ -1592,154 +1843,183 @@ make_category_oncoplot <- function(category_name, genes,
   )
 
   # ------------------------------------------------------------
-  # Right-side stacked barplot: altered samples per gene by class
+  # Mutation colors
   # ------------------------------------------------------------
-
-  gene_class_dt <- cell_dt[
-    ,
-    .N,
-    by = .(Hugo_Symbol, Display)
-  ]
-
-  gene_class_mat_dt <- dcast(
-    gene_class_dt,
-    Hugo_Symbol ~ Display,
-    value.var = "N",
-    fill = 0
-  )
-
-  gene_class_mat_dt <- merge(
-    data.table(Hugo_Symbol = plot_genes),
-    gene_class_mat_dt,
-    by = "Hugo_Symbol",
-    all.x = TRUE,
-    sort = FALSE
-  )
-
-  gene_class_mat_dt <- gene_class_mat_dt[
-    match(plot_genes, Hugo_Symbol)
-  ]
-
-  gene_class_cols <- setdiff(colnames(gene_class_mat_dt), "Hugo_Symbol")
-
-  if (length(gene_class_cols) == 0) {
-
-    gene_class_mat <- matrix(
-      0,
-      nrow = length(plot_genes),
-      ncol = 1,
-      dimnames = list(plot_genes, "No_mutation")
-    )
-
-  } else {
-
-    for (cc in gene_class_cols) {
-      gene_class_mat_dt[is.na(get(cc)), (cc) := 0]
-    }
-
-    gene_class_mat <- as.matrix(gene_class_mat_dt[, ..gene_class_cols])
-    rownames(gene_class_mat) <- gene_class_mat_dt$Hugo_Symbol
-  }
-
-  gene_mutated_sample_counts <- rowSums(mut_mat != "")
-  gene_mutated_sample_pct <- round(100 * gene_mutated_sample_counts / ncol(mut_mat))
-
-  # ------------------------------------------------------------
-  # Mutation colors for heatmap and stacked barplots
-  # ------------------------------------------------------------
-
-  mut_types_heatmap <- sort(unique(na.omit(as.vector(plot_mat))))
-  sample_bar_classes <- colnames(sample_class_mat)
-  row_bar_classes <- colnames(gene_class_mat)
 
   all_mutation_types_for_plot <- sort(unique(c(
-    mut_types_heatmap,
-    sample_bar_classes,
-    row_bar_classes
+    as.vector(mut_mat[mut_mat != ""]),
+    colnames(sample_class_mat),
+    colnames(gene_class_mat)
   )))
-
-  all_mutation_types_for_plot <- setdiff(all_mutation_types_for_plot, "No_mutation")
+  all_mutation_types_for_plot <- setdiff(all_mutation_types_for_plot, c("None", ""))
 
   mutation_colors <- get_mutation_colors(all_mutation_types_for_plot)
 
-  sample_bar_colors <- mutation_colors[sample_bar_classes]
+  sample_bar_colors <- mutation_colors[colnames(sample_class_mat)]
   sample_bar_colors[is.na(sample_bar_colors)] <- "grey50"
 
-  row_bar_colors <- mutation_colors[row_bar_classes]
+  row_bar_colors <- mutation_colors[colnames(gene_class_mat)]
   row_bar_colors[is.na(row_bar_colors)] <- "grey50"
 
-  mutation_barplot <- anno_barplot(
-    sample_class_mat,
-    gp = gpar(fill = sample_bar_colors, col = NA),
-    border = FALSE,
-    bar_width = 0.97,
-    height = unit(2.2, "cm"),
-    axis_param = list(gp = gpar(fontsize = 8))
+  # ------------------------------------------------------------
+  # Top annotation: mutation barplot, CNV barplot, RNA cluster bar
+  # ------------------------------------------------------------
+
+  top_args <- list()
+  if (show_mut) top_args[["Mutations per sample"]] <- anno_barplot(
+      sample_class_mat,
+      gp = gpar(fill = sample_bar_colors, col = NA),
+      border = FALSE,
+      bar_width = 0.97,
+      ylim = safe_ylim(sample_class_mat),
+      height = unit(2.2, "cm"),
+      axis_param = list(gp = gpar(fontsize = 8))
+    )
+
+  if (show_cnv) {
+    top_args[["CNV genes per sample"]] <- anno_barplot(
+      sample_cnv_mat,
+      gp = gpar(fill = cnv_cols[colnames(sample_cnv_mat)], col = NA),
+      border = FALSE,
+      bar_width = 0.97,
+      ylim = safe_ylim(sample_cnv_mat),
+      height = unit(if (both_layers) 1.8 else 2.2, "cm"),
+      axis_param = list(gp = gpar(fontsize = 8))
+    )
+  }
+
+  top_extra <- list(
+    annotation_name_gp = gpar(fontsize = 9),
+    gap = unit(1.5, "mm")
   )
 
   if (is.null(sample_group)) {
-    # Original style: barplot only, no column split.
-    top_bar_ha <- HeatmapAnnotation(
-      `Mutations per sample` = mutation_barplot,
-      annotation_name_gp = gpar(fontsize = 10)
-    )
     column_split_vec <- NULL
     column_gap_unit <- unit(0.05, "mm")
   } else {
-    # Cluster bar directly above the matrix; columns split by RNA group.
     present_groups <- intersect(names(rna_cluster_colors), unique(sample_group))
-    top_bar_ha <- HeatmapAnnotation(
-      `Mutations per sample` = mutation_barplot,
-      `RNA cluster` = sample_group,
-      col = list(`RNA cluster` = rna_cluster_colors[present_groups]),
-      simple_anno_size = unit(4, "mm"),
-      gap = unit(1.5, "mm"),
-      annotation_name_gp = gpar(fontsize = 10),
-      annotation_legend_param = list(`RNA cluster` = list(title = "RNA cluster"))
-    )
+    top_args[["RNA cluster"]] <- sample_group
+    top_extra$col <- list(`RNA cluster` = rna_cluster_colors[present_groups])
+    top_extra$simple_anno_size <- unit(4, "mm")
+    top_extra$annotation_legend_param <- list(`RNA cluster` = list(title = "RNA cluster"))
     column_split_vec <- factor(sample_group, levels = present_groups)
     column_gap_unit <- unit(1.5, "mm")
   }
 
-  right_bar_ha <- rowAnnotation(
-    `Altered samples by class` = anno_barplot(
-      gene_class_mat,
-      gp = gpar(fill = row_bar_colors, col = NA),
-      border = FALSE,
-      bar_width = 0.90,
-      axis = TRUE,
-      axis_param = list(
-        gp = gpar(fontsize = 7),
-        side = "bottom"
-      )
-    ),
-    `% altered` = anno_text(
-      paste0(gene_mutated_sample_pct, "%"),
-      gp = gpar(fontsize = 10),
-      just = "left",
-      location = 0
-    ),
-    width = unit(4.2, "cm"),
-    show_annotation_name = FALSE
+  top_bar_ha <- do.call(HeatmapAnnotation, c(top_args, top_extra))
+
+  # ------------------------------------------------------------
+  # Right annotation: class barplots and % altered
+  # ------------------------------------------------------------
+
+  # NOTE: which = "row" is required because these annotation functions are
+  # created outside rowAnnotation(); without it ComplexHeatmap treats them as
+  # column annotations and the plot fails.
+  mut_bar <- anno_barplot(
+    gene_class_mat,
+    which = "row",
+    gp = gpar(fill = row_bar_colors, col = NA),
+    border = FALSE,
+    bar_width = 0.90,
+    ylim = safe_ylim(gene_class_mat),
+    axis = TRUE,
+    axis_param = list(gp = gpar(fontsize = 7), side = "bottom"),
+    width = unit(2.6, "cm")
   )
 
+  pct_text <- anno_text(
+    paste0(gene_altered_pct, "%"),
+    which = "row",
+    gp = gpar(fontsize = 10),
+    just = "left",
+    location = 0
+  )
+
+  cnv_bar <- anno_barplot(
+    gene_cnv_mat,
+    which = "row",
+    gp = gpar(fill = cnv_cols[colnames(gene_cnv_mat)], col = NA),
+    border = FALSE,
+    bar_width = 0.90,
+    ylim = safe_ylim(gene_cnv_mat),
+    axis = TRUE,
+    axis_param = list(gp = gpar(fontsize = 7), side = "bottom"),
+    width = unit(2.6, "cm")
+  )
+
+  if (both_layers) {
+    right_bar_ha <- rowAnnotation(
+      `Mutated` = mut_bar,
+      `CNV` = cnv_bar,
+      `% altered` = pct_text,
+      gap = unit(2, "mm"),
+      show_annotation_name = c(TRUE, TRUE, FALSE),
+      annotation_name_side = "bottom",
+      annotation_name_rot = 0,
+      annotation_name_gp = gpar(fontsize = 8)
+    )
+  } else if (show_cnv) {
+    right_bar_ha <- rowAnnotation(
+      `CNV samples by class` = cnv_bar,
+      `% altered` = pct_text,
+      gap = unit(2, "mm"),
+      show_annotation_name = FALSE
+    )
+  } else {
+    right_bar_ha <- rowAnnotation(
+      `Altered samples by class` = mut_bar,
+      `% altered` = pct_text,
+      show_annotation_name = FALSE
+    )
+  }
+
   # ------------------------------------------------------------
-  # Square cell size
+  # Cell size: 4 mm squares; rows shrink if there are many genes
+  # so the figure stays within a printable height
   # ------------------------------------------------------------
 
-  cell_size_mm <- 4.0
+  cell_w_mm <- 4.0
+  max_body_height_mm <- 22 * 25.4
+  cell_h_mm <- min(4.0, max_body_height_mm / max(1, nrow(mut_mat)))
 
-  heatmap_body_width_mm <- max(55, cell_size_mm * ncol(mut_mat))
-  heatmap_body_height_mm <- max(38, cell_size_mm * nrow(mut_mat))
+  heatmap_body_width_mm <- max(55, cell_w_mm * ncol(mut_mat))
+  heatmap_body_height_mm <- max(38, cell_h_mm * nrow(mut_mat))
 
-  plot_width <- max(13, min(26, heatmap_body_width_mm / 25.4 + 9.5))
-  plot_height <- max(8, min(24, heatmap_body_height_mm / 25.4 + 5.5))
+  row_font <- if (cell_h_mm >= 4) 10 else max(5, round(10 * cell_h_mm / 4, 1))
+  symbol_mm <- min(1.8, 0.45 * cell_h_mm)
+
+  extra_w_in <- if (both_layers) 12 else 9.5
+  extra_h_in <- if (both_layers) 7 else 5.5
+  plot_width <- max(13, min(30, heatmap_body_width_mm / 25.4 + extra_w_in))
+  plot_height <- max(8, min(32, heatmap_body_height_mm / 25.4 + extra_h_in))
 
   # ------------------------------------------------------------
-  # PCGR oncogenicity symbol legend
+  # Legends (built explicitly so CNV-only lists also work)
   # ------------------------------------------------------------
 
-  onc_lgd <- Legend(
+  lgd_list <- list()
+
+  if (show_mut && length(mutation_colors) > 0) {
+    lgd_list[[length(lgd_list) + 1]] <- Legend(
+      title = if (both_layers) "Mutation (inner box)" else "Mutation type",
+      labels = names(mutation_colors),
+      legend_gp = gpar(fill = unname(mutation_colors)),
+      title_gp = gpar(fontsize = 9, fontface = "bold"),
+      labels_gp = gpar(fontsize = 8)
+    )
+  }
+
+  if (show_cnv) {
+    lgd_list[[length(lgd_list) + 1]] <- Legend(
+      title = if (both_layers) "CNV (full cell)" else "CNV class",
+      labels = names(cnv_cols),
+      legend_gp = gpar(fill = unname(cnv_cols)),
+      title_gp = gpar(fontsize = 9, fontface = "bold"),
+      labels_gp = gpar(fontsize = 8)
+    )
+  }
+
+  if (show_mut) lgd_list[[length(lgd_list) + 1]] <- Legend(
     title = "PCGR oncogenicity",
     type = "points",
     labels = c("Oncogenic", "Likely_Oncogenic"),
@@ -1749,14 +2029,23 @@ make_category_oncoplot <- function(category_name, genes,
   )
 
   # ------------------------------------------------------------
-  # Heatmap / oncoplot-like plot
+  # Oncoplot. The heatmap body is a placeholder; every cell is
+  # drawn in layer_fun (grey background, CNV fill, mutation box, symbol).
   # ------------------------------------------------------------
 
+  placeholder_mat <- matrix(
+    0, nrow = length(plot_genes), ncol = length(plot_samples),
+    dimnames = list(plot_genes, plot_samples)
+  )
+
+  mut_box_frac <- if (both_layers) mut_inner_frac else 0.96
+  mut_box_border <- if (both_layers) "white" else NA
+
   ht <- Heatmap(
-    plot_mat,
-    name = "Mutation type",
-    col = mutation_colors,
-    na_col = "grey80",
+    placeholder_mat,
+    name = "Alterations",
+    col = colorRamp2(c(0, 1), c("grey80", "grey80")),
+    show_heatmap_legend = FALSE,
     cluster_rows = FALSE,
     cluster_columns = FALSE,
     row_order = plot_genes,
@@ -1765,9 +2054,9 @@ make_category_oncoplot <- function(category_name, genes,
     show_row_names = TRUE,
     show_column_names = FALSE,
     row_names_side = "left",
-    row_names_gp = gpar(fontsize = 10),
+    row_names_gp = gpar(fontsize = row_font),
     column_title = paste0(
-      category_name,
+      category_name, " (", layer_label, ")",
       " | genes: ", nrow(mut_mat),
       " | samples: ", ncol(mut_mat)
     ),
@@ -1780,13 +2069,9 @@ make_category_oncoplot <- function(category_name, genes,
     right_annotation = right_bar_ha,
     column_gap = column_gap_unit,
     row_gap = unit(0.05, "mm"),
-    heatmap_legend_param = list(
-      title = "Mutation type",
-      title_gp = gpar(fontsize = 9, fontface = "bold"),
-      labels_gp = gpar(fontsize = 8)
-    ),
     layer_fun = function(j, i, x, y, width, height, fill) {
 
+      # 1. grey background for every cell
       grid.rect(
         x = x,
         y = y,
@@ -1797,47 +2082,38 @@ make_category_oncoplot <- function(category_name, genes,
 
       for (kk in seq_along(x)) {
 
-        this_mut <- mut_mat[i[kk], j[kk]]
-
-        if (!is.na(this_mut) && this_mut != "") {
+        # 2. CNV: full-cell color
+        this_cnv <- cnv_mat[i[kk], j[kk]]
+        if (this_cnv != "") {
           grid.rect(
-            x = x[kk],
-            y = y[kk],
-            width = width[kk] * 0.96,
-            height = height[kk] * 0.96,
-            gp = gpar(fill = mutation_colors[this_mut], col = NA)
+            x = x[kk], y = y[kk],
+            width = width[kk] * 0.96, height = height[kk] * 0.96,
+            gp = gpar(fill = cnv_cols[this_cnv], col = NA)
           )
         }
-      }
 
-      for (kk in seq_along(x)) {
-
+        # 3. Mutation: inner box (full cell when CNV is not shown)
         this_mut <- mut_mat[i[kk], j[kk]]
-        this_onc <- onc_mat[i[kk], j[kk]]
-
-        symbol_col <- "black"
-
-        if (!is.na(this_mut) && this_mut == "Multi_Hit") {
-          symbol_col <- "white"
+        if (this_mut != "") {
+          grid.rect(
+            x = x[kk], y = y[kk],
+            width = width[kk] * mut_box_frac, height = height[kk] * mut_box_frac,
+            gp = gpar(fill = mutation_colors[this_mut], col = mut_box_border, lwd = 0.6)
+          )
         }
 
-        if (!is.na(this_onc) && this_onc == "Oncogenic") {
+        # 4. PCGR oncogenicity symbol on mutated cells
+        this_onc <- onc_mat[i[kk], j[kk]]
+        symbol_col <- if (this_mut == "Multi_Hit") "white" else "black"
 
+        if (this_onc == "Oncogenic") {
           grid.points(
-            x = x[kk],
-            y = y[kk],
-            pch = 8,
-            size = unit(1.8, "mm"),
+            x = x[kk], y = y[kk], pch = 8, size = unit(symbol_mm, "mm"),
             gp = gpar(col = symbol_col, fill = symbol_col, lwd = 1.0)
           )
-
-        } else if (!is.na(this_onc) && this_onc == "Likely_Oncogenic") {
-
+        } else if (this_onc == "Likely_Oncogenic") {
           grid.points(
-            x = x[kk],
-            y = y[kk],
-            pch = 24,
-            size = unit(1.8, "mm"),
+            x = x[kk], y = y[kk], pch = 24, size = unit(symbol_mm, "mm"),
             gp = gpar(col = symbol_col, fill = symbol_col, lwd = 1.0)
           )
         }
@@ -1849,70 +2125,59 @@ make_category_oncoplot <- function(category_name, genes,
   # Save PDF and PNG
   # ------------------------------------------------------------
 
-  pdf_file <- file.path(
-    out_dir,
-    paste0(category_safe, "_oncoplot_PCGR_oncogenicity_", VAF_TAG, ".pdf")
-  )
+  # e.g. Curated_chromatin_all_genes_CNV_oncoplot.pdf
+  #      Curated_chromatin_all_genes_mutation_oncoplot_VAFge5pct.pdf
+  file_stem <- if (show_cnv && !show_mut) {
+    paste0(category_safe, "_oncoplot")                 # CNV has no VAF filter
+  } else {
+    paste0(category_safe, "_oncoplot_", VAF_TAG)
+  }
+  pdf_file <- file.path(out_dir, paste0(file_stem, ".pdf"))
+  png_file <- file.path(out_dir, paste0(file_stem, ".png"))
 
-  png_file <- file.path(
-    out_dir,
-    paste0(category_safe, "_oncoplot_PCGR_oncogenicity_", VAF_TAG, ".png")
-  )
-
-  pdf(pdf_file, width = plot_width, height = plot_height)
-
-  draw(
-    ht,
-    heatmap_legend_side = "right",
-    annotation_legend_side = "right",
-    heatmap_legend_list = list(onc_lgd),
-    merge_legends = FALSE,
-    padding = unit(c(4, 28, 6, 4), "mm")
-  )
-
-  dev.off()
-
-  if (isTRUE(SAVE_PNG)) {
-
-    png(
-      filename = png_file,
-      width = plot_width,
-      height = plot_height,
-      units = "in",
-      res = 300
-    )
-
+  draw_oncoplot <- function() {
     draw(
       ht,
       heatmap_legend_side = "right",
       annotation_legend_side = "right",
-      heatmap_legend_list = list(onc_lgd),
+      heatmap_legend_list = lgd_list,
       merge_legends = FALSE,
       padding = unit(c(4, 28, 6, 4), "mm")
     )
+  }
 
+  pdf(pdf_file, width = plot_width, height = plot_height)
+  draw_oncoplot()
+  dev.off()
+
+  if (isTRUE(SAVE_PNG)) {
+    png(filename = png_file, width = plot_width, height = plot_height, units = "in", res = 300)
+    draw_oncoplot()
     dev.off()
-
   } else {
     png_file <- NA_character_
   }
 
   cat("Saved:\n")
   cat("  ", pdf_file, "\n")
-  if (!is.na(png_file)) {
-    cat("  ", png_file, "\n")
-  }
-  cat("  ", file.path(table_dir, paste0(category_safe, "_sample_order_and_clinical_annotation.tsv")), "\n\n")
+  if (!is.na(png_file)) cat("  ", png_file, "\n")
+  cat("\n")
 
   summary_dt <- data.table(
     Category = category_name,
+    Layers = layer_label,
     Genes_requested = length(genes),
-    Mutated_genes_plotted = nrow(mut_mat),
+    Genes_plotted = nrow(mut_mat),
+    Genes_with_mutation = sum(rowSums(mut_mat != "") > 0),
+    Genes_with_CNV = sum(rowSums(cnv_mat != "") > 0),
     Samples_shown = ncol(mut_mat),
     Sample_order = ifelse(is.null(sample_group), "TP order", "RNA cluster, then TP order"),
     Cells_with_mutation = sum(mut_mat != ""),
+    Cells_with_CNV = sum(cnv_mat != ""),
+    Cells_with_mutation_and_CNV = sum(mut_mat != "" & cnv_mat != ""),
     Cells_with_Oncogenic_symbol = sum(onc_mat == "Oncogenic"),
     Cells_with_Likely_Oncogenic_symbol = sum(onc_mat == "Likely_Oncogenic"),
+    Row_height_mm = round(cell_h_mm, 2),
     PDF = pdf_file,
     PNG = png_file,
     Sample_order_TSV = file.path(
@@ -1932,6 +2197,7 @@ make_category_oncoplot <- function(category_name, genes,
 }
 ```
 
+
 ```{r run_oncoplots}
 # ============================================================
 # Generate one oncoplot per gene list
@@ -1942,38 +2208,65 @@ gc()
 
 oncoplot_summaries <- list()
 
-for (list_name in names(plot_sets)) {
+# One job per (gene list x plot type). Mutation and CNV are separate figures.
+plot_jobs <- list()
+if (isTRUE(PLOT_MUTATION)) {
+  for (nm in names(plot_sets_mutation)) {
+    plot_jobs[[length(plot_jobs) + 1]] <- list(list_name = nm, layers = "mutation",
+                                               genes = plot_sets_mutation[[nm]])
+  }
+}
+if (isTRUE(PLOT_CNV) && isTRUE(INCLUDE_CNV)) {
+  for (nm in names(plot_sets_cnv)) {
+    plot_jobs[[length(plot_jobs) + 1]] <- list(list_name = nm, layers = "cnv",
+                                               genes = plot_sets_cnv[[nm]])
+  }
+}
+if (isTRUE(PLOT_COMBINED) && isTRUE(INCLUDE_CNV)) {
+  for (nm in names(plot_sets_combined)) {
+    plot_jobs[[length(plot_jobs) + 1]] <- list(list_name = nm, layers = c("mutation", "cnv"),
+                                               genes = plot_sets_combined[[nm]])
+  }
+}
+
+for (job in plot_jobs) {
 
   cat("\n\n############################################################\n")
-  cat("Running gene list:", list_name, "\n")
+  cat("Running:", job$list_name, "|", paste(job$layers, collapse = " + "), "\n")
   cat("############################################################\n\n")
 
-  if (length(plot_sets[[list_name]]) == 0) {
-    cat("No genes with qualifying mutations in this list. Skipping.\n")
+  if (length(job$genes) == 0) {
+    cat("No altered genes in this list for this plot type. Skipping.\n")
     next
   }
 
   res <- tryCatch(
     make_category_oncoplot(
-      category_name = list_name,
-      genes = plot_sets[[list_name]],
+      category_name = job$list_name,
+      genes = job$genes,
       sample_order = plot_sample_order,   # same column order for every oncoplot
-      sample_group = plot_sample_group
+      sample_group = plot_sample_group,
+      layers = job$layers
     ),
     error = function(e) {
-      message("[ERROR] Failed gene list: ", list_name)
+      message("[ERROR] Failed: ", job$list_name, " | ", paste(job$layers, collapse = " + "))
       message("Reason: ", e$message)
       return(NULL)
     }
   )
 
   if (!is.null(res)) {
-    res[, Genes_in_list := length(oncoplot_sets[[list_name]])]
+    res[, Genes_in_list := length(oncoplot_sets[[job$list_name]])]
     oncoplot_summaries[[length(oncoplot_summaries) + 1]] <- res
   }
 
   graphics.off()
   gc()
+}
+
+cat("\nPlots made:", length(oncoplot_summaries), "of", length(plot_jobs), "\n")
+if (length(oncoplot_summaries) < length(plot_jobs)) {
+  warning("Some plots failed; search the output above for [ERROR].")
 }
 
 if (length(oncoplot_summaries) > 0) {
@@ -1992,7 +2285,7 @@ if (length(oncoplot_summaries) > 0) {
     file.path(table_dir, paste0("chromatin_oncoplot_summary_", VAF_TAG, ".tsv")),
     sep = "\t", quote = FALSE, na = ""
   )
-  print(oncoplot_summary_dt[, .(Category, Genes_in_list, Mutated_genes_plotted, Cells_with_mutation)])
+  print(oncoplot_summary_dt[, .(Category, Layers, Genes_in_list, Genes_plotted, Genes_with_mutation, Genes_with_CNV)])
 }
 
 writeLines(
