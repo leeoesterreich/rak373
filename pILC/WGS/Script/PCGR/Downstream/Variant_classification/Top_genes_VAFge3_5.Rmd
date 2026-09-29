@@ -1,0 +1,310 @@
+---
+title: "Top genes across the cohort with PCGR tumor VAF >= 3% or >= 5% (WGS)"
+output: html_document
+date: "2026-09-29"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+suppressPackageStartupMessages({
+  library(data.table)
+  library(readxl)
+})
+set.seed(42)
+```
+
+```{r paths_and_parameters}
+# ---- Paths ----------------------------------------------------
+base_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WGS/PCGR/pcgr_outputs"
+out_dir  <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WGS/PCGR/Downstream/Variant_classification"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+run_date       <- format(Sys.Date(), "%Y-%m-%d")
+VAF_THRESHOLDS <- c(0.03, 0.05)   # fractions (3% and 5%)
+
+# ---- Non-silent classes (same list as the WES script) ---------
+INCLUDE_SPLICE_REGION <- TRUE     # set FALSE for a stricter list
+nonsilent_classes <- c(
+  "Missense_Mutation", "Nonsense_Mutation", "Nonstop_Mutation",
+  "Frame_Shift_Del", "Frame_Shift_Ins", "In_Frame_Del", "In_Frame_Ins",
+  "Splice_Site", "Translation_Start_Site"
+)
+if (INCLUDE_SPLICE_REGION) {
+  nonsilent_classes <- c(nonsilent_classes, "Splice_Region")
+}
+
+# Keep 'Silent' rows too, only so the audit can show what was excluded
+classes_to_read <- c(nonsilent_classes, "Silent")
+
+# Excel CONSEQUENCE terms that change the protein or splice site.
+# A row containing 'synonymous_variant' but none of these = silent.
+protein_altering_terms <- paste(
+  "missense_variant", "frameshift_variant", "stop_gained", "stop_lost",
+  "start_lost", "inframe_insertion", "inframe_deletion",
+  "protein_altering_variant", "splice_acceptor_variant",
+  "splice_donor_variant", sep = "|"
+)
+
+# Only the MAF columns we need (the full file has 116 columns)
+maf_cols <- c(
+  "Hugo_Symbol", "Chromosome", "Start_Position", "Variant_Classification",
+  "Variant_Type", "Reference_Allele", "Tumor_Seq_Allele2",
+  "Tumor_Sample_Barcode", "HGVSp_Short", "FILTER"
+)
+```
+
+```{r helper_functions}
+clean_gene <- function(x) {
+  x <- toupper(trimws(as.character(x)))
+  x[x %in% c("", ".", "NA", "N/A")] <- NA_character_
+  x
+}
+
+# Build one normalized key (chr:pos:ref:alt) so MAF and PCGR variants
+# written in different styles (MAF "-" alleles vs VCF anchor base) match.
+edit_key <- function(chr, pos, ref, alt, maf_format = FALSE) {
+  chr <- sub("^CHR", "", toupper(trimws(as.character(chr))))
+  pos <- suppressWarnings(as.integer(pos))
+  ref <- toupper(trimws(as.character(ref)))
+  alt <- toupper(trimws(as.character(alt)))
+
+  if (anyNA(c(chr, pos, ref, alt)) || !nzchar(chr) || pos < 1L ||
+      !grepl("^([ACGTN]+|-)$", ref) || !grepl("^([ACGTN]+|-)$", alt)) {
+    return(NA_character_)
+  }
+
+  # MAF insertions (REF = "-") use the left-flank position
+  if (maf_format && ref == "-") pos <- pos + 1L
+  if (ref == "-") ref <- ""
+  if (alt == "-") alt <- ""
+
+  # Strip identical PREFIX first (shifts position), then identical suffix.
+  # Prefix-first reproduces the MAF representation of VCF-style indels.
+  while (nzchar(ref) && nzchar(alt) && substr(ref, 1, 1) == substr(alt, 1, 1)) {
+    ref <- substring(ref, 2)
+    alt <- substring(alt, 2)
+    pos <- pos + 1L
+  }
+  while (nzchar(ref) && nzchar(alt) &&
+         substr(ref, nchar(ref), nchar(ref)) == substr(alt, nchar(alt), nchar(alt))) {
+    ref <- substr(ref, 1, nchar(ref) - 1L)
+    alt <- substr(alt, 1, nchar(alt) - 1L)
+  }
+
+  if (!nzchar(ref) && !nzchar(alt)) return(NA_character_)
+  paste(chr, pos, ifelse(nzchar(ref), ref, "-"), ifelse(nzchar(alt), alt, "-"), sep = ":")
+}
+
+# Parse PCGR GENOMIC_CHANGE, e.g. "16:g.68808447AGAATT>A"
+pcgr_genomic_key <- function(x) {
+  x <- trimws(as.character(x))
+  if (is.na(x) || !nzchar(x)) return(NA_character_)
+  hit <- regmatches(
+    x,
+    regexec("^(?:chr)?([^:]+):g\\.([0-9]+)([ACGTN]+|-)>([ACGTN]+|-)$",
+            x, perl = TRUE, ignore.case = TRUE)
+  )[[1]]
+  if (length(hit) == 5L) return(edit_key(hit[2], hit[3], hit[4], hit[5]))
+  NA_character_
+}
+```
+
+```{r read_all_samples}
+sample_ids <- list.dirs(base_dir, recursive = FALSE, full.names = FALSE)
+cat("Samples found:", length(sample_ids), "\n")
+
+maf_list <- vector("list", length(sample_ids))
+pcgr_list <- vector("list", length(sample_ids))
+maf_totals <- vector("list", length(sample_ids))
+names(maf_list) <- names(pcgr_list) <- sample_ids
+
+for (i in seq_along(sample_ids)) {
+  s <- sample_ids[i]
+  maf_file <- file.path(base_dir, s, paste0(s, ".pcgr.grch38.maf"))
+  xls_file <- file.path(base_dir, s, paste0(s, ".pcgr.grch38.xlsx"))
+
+  # ---- MAF: read needed columns, keep coding classes only ----
+  maf <- fread(maf_file, sep = "\t", skip = "Hugo_Symbol", select = maf_cols,
+               na.strings = c("", ".", "NA"))
+  if (!all(maf$Tumor_Sample_Barcode == s)) {
+    warning("Barcode differs from folder name in: ", s)
+  }
+  maf_totals[[i]] <- data.table(Sample_key = s, n_maf_rows = nrow(maf))
+  maf <- maf[Variant_Classification %in% classes_to_read]
+  maf[, Sample_key := s]
+  maf_list[[i]] <- maf
+
+  # ---- PCGR Excel: VAF + CONSEQUENCE ----
+  xls <- as.data.table(read_excel(xls_file, sheet = "SOMATIC_SNV_INDEL",
+                                  guess_max = 100000))
+  need <- c("SYMBOL", "GENOMIC_CHANGE", "VAF_TUMOR", "CONSEQUENCE")
+  if (length(setdiff(need, names(xls)))) {
+    stop("Missing Excel columns in ", s, ": ",
+         paste(setdiff(need, names(xls)), collapse = ", "))
+  }
+  pcgr_list[[i]] <- xls[, .(
+    Sample_key         = s,
+    PCGR_SYMBOL        = clean_gene(SYMBOL),
+    CONSEQUENCE        = as.character(CONSEQUENCE),
+    GENOMIC_CHANGE     = as.character(GENOMIC_CHANGE),
+    VAF_TUMOR_fraction = suppressWarnings(as.numeric(VAF_TUMOR)),
+    Variant_key        = vapply(GENOMIC_CHANGE, pcgr_genomic_key, character(1))
+  )]
+}
+
+maf_totals <- rbindlist(maf_totals)
+maf_all    <- rbindlist(maf_list)
+pcgr_dt    <- rbindlist(pcgr_list)
+
+# VAF must be a fraction between 0 and 1 (confirmed on the first sample)
+if (any(pcgr_dt$VAF_TUMOR_fraction < 0 | pcgr_dt$VAF_TUMOR_fraction > 1, na.rm = TRUE)) {
+  stop("VAF_TUMOR outside 0-1 detected: check whether some files use percent.")
+}
+if (anyNA(pcgr_dt$Variant_key)) {
+  warning(sum(is.na(pcgr_dt$Variant_key)), " PCGR rows had an unparseable GENOMIC_CHANGE.")
+}
+
+# Flag Excel rows that are silent at the protein level
+pcgr_dt[, Excel_synonymous_only :=
+          grepl("synonymous_variant", CONSEQUENCE) &
+          !grepl(protein_altering_terms, CONSEQUENCE)]
+pcgr_dt[, Match_key := paste(Sample_key, Variant_key, sep = "|")]
+
+# Collapse duplicated PCGR rows of the same sample + variant
+pcgr_vaf <- pcgr_dt[!is.na(Variant_key), .(
+  VAF_TUMOR_fraction   = if (all(is.na(VAF_TUMOR_fraction))) NA_real_
+                         else median(VAF_TUMOR_fraction, na.rm = TRUE),
+  Excel_synonymous_only = all(Excel_synonymous_only),
+  PCGR_SYMBOL          = PCGR_SYMBOL[1],
+  CONSEQUENCE          = CONSEQUENCE[1],
+  PCGR_rows            = .N
+), by = Match_key]
+```
+
+```{r match_maf_to_pcgr}
+# Normalized key for each MAF row (only ~50k coding rows, so this is fast)
+maf_all[, Variant_key := mapply(
+  edit_key, Chromosome, Start_Position, Reference_Allele, Tumor_Seq_Allele2,
+  MoreArgs = list(maf_format = TRUE), USE.NAMES = FALSE
+)]
+maf_all[, Hugo_Symbol_clean := clean_gene(Hugo_Symbol)]
+maf_all[, Match_key := paste(Sample_key, Variant_key, sep = "|")]
+
+maf_vaf <- merge(maf_all, pcgr_vaf, by = "Match_key", all.x = TRUE, sort = FALSE)
+
+maf_vaf[, matched := !is.na(VAF_TUMOR_fraction)]
+maf_vaf[, gene_mismatch := matched & !is.na(PCGR_SYMBOL) &
+                           Hugo_Symbol_clean != PCGR_SYMBOL]
+
+# Final non-silent flag: MAF class AND not synonymous-only in PCGR
+maf_vaf[, is_nonsilent := matched &
+          Variant_Classification %in% nonsilent_classes &
+          !Excel_synonymous_only]
+
+# ---- Sanity checks (please paste these outputs back) ----
+cat("\nCoding-class MAF rows:", nrow(maf_vaf),
+    "| matched to PCGR:", sum(maf_vaf$matched),
+    "| gene-label mismatches:", sum(maf_vaf$gene_mismatch), "\n")
+
+cat("\nFILTER values of matched variants:\n")
+print(maf_vaf[matched == TRUE, .N, by = FILTER][order(-N)][1:10])
+
+cat("\nMAF class vs PCGR synonymous-only flag (matched rows):\n")
+print(maf_vaf[matched == TRUE, .N, by = .(Variant_Classification, Excel_synonymous_only)][order(-N)])
+
+# PCGR variants not found among the kept MAF rows (possible key failures
+# or variants whose MAF class is intron/UTR/etc.)
+pcgr_not_in_maf <- pcgr_vaf[!Match_key %in% maf_vaf$Match_key]
+cat("\nPCGR variants without a matching coding MAF row:", nrow(pcgr_not_in_maf), "\n")
+print(pcgr_not_in_maf[, .N, by = CONSEQUENCE][order(-N)][1:10])
+
+fwrite(maf_vaf[, .(Sample_key, Hugo_Symbol, PCGR_SYMBOL, Variant_Classification,
+                   CONSEQUENCE, Chromosome, Start_Position, Reference_Allele,
+                   Tumor_Seq_Allele2, FILTER, VAF_TUMOR_fraction, matched,
+                   gene_mismatch, Excel_synonymous_only, is_nonsilent)],
+       file.path(out_dir, paste0("Full_MAF_nonsilent_variant_PCGR_VAF_match_audit_", run_date, ".tsv")),
+       sep = "\t", na = "NA", quote = FALSE)
+fwrite(pcgr_not_in_maf,
+       file.path(out_dir, paste0("PCGR_variants_not_in_MAF_audit_", run_date, ".tsv")),
+       sep = "\t", na = "NA", quote = FALSE)
+```
+
+```{r gene_tables_per_threshold}
+total_samples <- length(sample_ids)
+
+# Per-sample counts at each filtering stage (used for the dropped-sample report)
+stage <- data.table(Sample_key = sample_ids)
+stage <- merge(stage, maf_totals, by = "Sample_key", all.x = TRUE)
+counts <- maf_vaf[, .(
+  n_coding_class_rows = sum(Variant_Classification %in% nonsilent_classes),
+  n_matched_PCGR      = sum(matched),
+  n_nonsilent_matched = sum(is_nonsilent)
+), by = Sample_key]
+stage <- merge(stage, counts, by = "Sample_key", all.x = TRUE)
+for (col in c("n_coding_class_rows", "n_matched_PCGR", "n_nonsilent_matched")) {
+  set(stage, which(is.na(stage[[col]])), col, 0L)
+}
+
+for (thr in VAF_THRESHOLDS) {
+  lab <- sprintf("VAFge%dpct", round(thr * 100))
+
+  passing <- maf_vaf[is_nonsilent == TRUE & VAF_TUMOR_fraction >= thr &
+                       !is.na(Hugo_Symbol_clean)]
+
+  # ---- Samples dropped at this threshold, with the reason ----
+  stage[, n_pass_VAF := passing[, .N, by = Sample_key][match(Sample_key, Sample_key), N]]
+  stage[, n_pass_VAF := passing[.SD, on = "Sample_key", .N, by = .EACHI]$N]
+  dropped <- stage[n_pass_VAF == 0, .(
+    Sample_key,
+    Reason = fcase(
+      n_maf_rows == 0,           "MAF file is empty",
+      n_coding_class_rows == 0,  "no coding non-silent class rows in MAF",
+      n_matched_PCGR == 0,       "no MAF variant matched to a PCGR VAF",
+      n_nonsilent_matched == 0,  "all matched variants are silent",
+      default = paste0("all non-silent variants have VAF < ", thr * 100, "%")
+    )
+  )]
+
+  cat("\n=====", lab, "=====\n")
+  if (nrow(dropped)) {
+    cat("Samples dropped (no passing variant):\n")
+    print(dropped)
+  } else {
+    cat("No samples dropped: all", total_samples, "samples have >= 1 passing variant.\n")
+  }
+
+  retained_samples <- uniqueN(passing$Sample_key)
+
+  # ---- Gene-level summary ----
+  gene_summary <- passing[, .(
+    Mutated_Samples = uniqueN(Sample_key),
+    Variant_Count   = .N,
+    Median_VAF_Percent = round(100 * median(VAF_TUMOR_fraction), 2),
+    Variant_Classification = paste(sort(unique(Variant_Classification)), collapse = ";")
+  ), by = .(Hugo_Symbol = Hugo_Symbol_clean)]
+
+  gene_summary[, Frequency_Percent_retained_samples :=
+                 round(100 * Mutated_Samples / retained_samples, 2)]
+  gene_summary[, Frequency_Percent_all_samples :=
+                 round(100 * Mutated_Samples / total_samples, 2)]
+
+  setcolorder(gene_summary, c(
+    "Hugo_Symbol", "Mutated_Samples", "Frequency_Percent_retained_samples",
+    "Frequency_Percent_all_samples", "Variant_Count",
+    "Median_VAF_Percent", "Variant_Classification"
+  ))
+  setorder(gene_summary, -Mutated_Samples, -Variant_Count, Hugo_Symbol)
+
+  out_file <- file.path(out_dir, paste0(
+    "Full_MAF_nonsilent_", lab, "_gene_mutation_frequency_", run_date, ".tsv"))
+  fwrite(gene_summary, out_file, sep = "\t", quote = FALSE, na = "NA")
+
+  cat("Retained samples:", retained_samples, "of", total_samples, "\n")
+  cat("Non-silent variants:", nrow(passing),
+      "| genes:", nrow(gene_summary), "\nSaved:", out_file, "\n")
+  print(head(gene_summary, 20))
+}
+
+fwrite(stage, file.path(out_dir, paste0("Per_sample_filtering_stages_", run_date, ".tsv")),
+       sep = "\t", quote = FALSE)
+```
