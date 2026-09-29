@@ -1,0 +1,2165 @@
+---
+title: "WGCNA Across NMF Clusters"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE
+)
+```
+
+# Purpose
+
+This R Markdown  used to perform WGCNA with the external trait is the three-class NMF RNA cluster assignment.
+
+- Cluster 1
+- Cluster 2
+- Cluster 3
+
+The workflow first:
+
+1. checks samples/genes,
+2. runs `pickSoftThreshold()`,
+3. plots scale-free topology fit,
+4. plots mean connectivity,
+5. applies an explicit selection rule,
+6. and only then constructs the WGCNA network.
+
+For this analysis, the prespecified diagnostic rule is:
+
+> Choose the lowest power with scale-free topology fit R² >= 0.80, while checking that
+> mean connectivity has not collapsed.
+
+# 1. Load packages
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(WGCNA)
+  library(flashClust)
+  library(curl)
+  library(tibble)
+  library(dplyr)
+  library(tidyr)
+  library(data.table)
+  library(ComplexHeatmap)
+  library(circlize)
+})
+
+options(stringsAsFactors = FALSE)
+
+SEED <- 42
+set.seed(SEED)
+
+try(WGCNA::allowWGCNAThreads(), silent = TRUE)
+```
+
+# 2. Define paths
+
+```{r paths}
+# VST expression matrix used for the cluster WGCNA (genrated during WGCNA_TILs)
+expr_path <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/WCNA/TILs/vst_transformed_data.csv"
+
+# NMF K=3 cluster assignment table
+cluster_table_path <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/WCNA/NMFcluster/K3/ClusterTable.csv"
+
+# Cancer-gene reference used in the earlier hub-gene script
+oncovar_file <- "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Reference/TCGA.BRCA.all.genes.OncoVar.tsv"
+
+# New output folder for this reproducible run
+output_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/WCNA/NMFcluster/K3"
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+cat("Expression file:", expr_path, "\n")
+cat("Cluster table:", cluster_table_path, "\n")
+cat("Output directory:", output_dir, "\n")
+```
+
+# 3. Load VST-transformed expression data
+
+The previous cluster WGCNA analysis already used this VST matrix, so this workflow
+starts from the same expression input rather than introducing a different preprocessing
+pipeline.
+
+```{r load-vst}
+stopifnot(file.exists(expr_path))
+
+expr_data <- read.csv(
+  expr_path,
+  stringsAsFactors = FALSE,
+  header = TRUE,
+  check.names = FALSE
+)
+
+head(expr_data)
+dim(expr_data)
+
+stopifnot("Gene" %in% colnames(expr_data))
+```
+
+# 4. Convert expression data to WGCNA format
+
+For WGCNA:
+
+- rows = samples
+- columns = genes
+
+```{r prepare-dat-expr}
+expr_matrix <- expr_data |>
+  column_to_rownames(var = "Gene") |>
+  as.matrix()
+
+storage.mode(expr_matrix) <- "numeric"
+
+# Transpose: rows = samples, columns = genes
+dat_expr <- t(expr_matrix)
+
+# Convert to data frame
+dat_expr <- as.data.frame(dat_expr, check.names = FALSE)
+
+# Normalize sample IDs
+rownames(dat_expr) <- gsub("\\.", "-", rownames(dat_expr))
+rownames(dat_expr) <- sub("_S[0-9]+$", "", rownames(dat_expr))
+
+cat("WGCNA expression matrix:\n")
+cat("Samples:", nrow(dat_expr), "\n")
+cat("Genes:", ncol(dat_expr), "\n")
+
+dat_expr[1:min(5, nrow(dat_expr)), 1:min(5, ncol(dat_expr))]
+
+stopifnot(all(sapply(dat_expr, is.numeric)))
+```
+
+# 5. Identify problematic genes and samples
+
+This follows the same QC step used in `WGCNA_TILs.Rmd`.
+
+```{r good-samples-genes}
+gsg <- goodSamplesGenes(dat_expr, verbose = 3)
+
+summary(gsg)
+gsg$allOK
+
+if (!gsg$allOK) {
+
+  if (sum(!gsg$goodGenes) > 0) {
+    cat("Removing genes:\n")
+    print(colnames(dat_expr)[!gsg$goodGenes])
+  }
+
+  if (sum(!gsg$goodSamples) > 0) {
+    cat("Removing samples:\n")
+    print(rownames(dat_expr)[!gsg$goodSamples])
+  }
+
+  dat_expr <- dat_expr[
+    gsg$goodSamples,
+    gsg$goodGenes,
+    drop = FALSE
+  ]
+}
+
+cat(
+  "Final matrix after goodSamplesGenes():",
+  nrow(dat_expr), "samples x",
+  ncol(dat_expr), "genes\n"
+)
+```
+
+# 6. Hierarchical clustering of samples to check outliers
+
+```{r sample-clustering}
+sampleTree <- hclust(
+  dist(dat_expr),
+  method = "average"
+)
+
+png(
+  file.path(output_dir, "sample_clustering_outliers.png"),
+  width = 1200,
+  height = 800,
+  res = 150
+)
+
+par(cex = 0.6)
+par(mar = c(0, 4, 2, 0))
+
+plot(
+  sampleTree,
+  main = "Sample clustering to detect outliers",
+  sub = "",
+  xlab = "",
+  cex.lab = 1.5,
+  cex.axis = 1.5,
+  cex.main = 2
+)
+
+dev.off()
+
+# Also display in the knitted Rmd
+par(cex = 0.6)
+par(mar = c(0, 4, 2, 0))
+
+plot(
+  sampleTree,
+  main = "Sample clustering to detect outliers",
+  sub = "",
+  xlab = "",
+  cex.lab = 1.5,
+  cex.axis = 1.5,
+  cex.main = 2
+)
+
+# Do NOT automatically remove a sample based only on the dendrogram.
+# If a true outlier is identified, document the cutoff and exclusion explicitly.
+```
+
+# 7. Soft-threshold power analysis
+
+This is the critical step.
+
+First we calculate the scale-free topology diagnostics across candidate powers.
+
+```{r pick-soft-threshold}
+powers <- c(1:10, 12, 14, 16, 18, 20)
+
+spt <- pickSoftThreshold(
+  dat_expr,
+  powerVector = powers,
+  verbose = 5
+)
+
+spt
+spt$fitIndices
+
+write.csv(
+  spt$fitIndices,
+  file.path(output_dir, "SoftThreshold_Diagnostics.csv"),
+  row.names = FALSE
+)
+```
+
+# 8. Plot scale-free topology fit
+
+The dashed horizontal line marks R² = 0.80.
+
+```{r scale-independence}
+png(
+  file.path(output_dir, "scale_independence.png"),
+  width = 1000,
+  height = 800,
+  res = 150
+)
+
+par(mar = c(5, 5, 2, 2))
+
+plot(
+  spt$fitIndices[, 1],
+  spt$fitIndices[, 2],
+  xlab = "Soft Threshold (Power)",
+  ylab = "Scale Free Topology Model Fit (signed R²)",
+  type = "n",
+  main = "Scale Independence"
+)
+
+text(
+  spt$fitIndices[, 1],
+  spt$fitIndices[, 2],
+  labels = spt$fitIndices[, 1],
+  col = "red"
+)
+
+abline(
+  h = 0.80,
+  col = "red",
+  lty = 2
+)
+
+dev.off()
+
+# Display in knitted report
+par(mar = c(5, 5, 2, 2))
+
+plot(
+  spt$fitIndices[, 1],
+  spt$fitIndices[, 2],
+  xlab = "Soft Threshold (Power)",
+  ylab = "Scale Free Topology Model Fit (signed R²)",
+  type = "n",
+  main = "Scale Independence"
+)
+
+text(
+  spt$fitIndices[, 1],
+  spt$fitIndices[, 2],
+  labels = spt$fitIndices[, 1],
+  col = "red"
+)
+
+abline(
+  h = 0.80,
+  col = "red",
+  lty = 2
+)
+```
+
+# 9. Plot mean connectivity
+
+The power should provide acceptable scale-free topology without unnecessarily
+destroying network connectivity.
+
+```{r mean-connectivity}
+png(
+  file.path(output_dir, "mean_connectivity.png"),
+  width = 1000,
+  height = 800,
+  res = 150
+)
+
+par(mar = c(5, 5, 2, 2))
+
+plot(
+  spt$fitIndices[, 1],
+  spt$fitIndices[, 5],
+  xlab = "Soft Threshold (Power)",
+  ylab = "Mean Connectivity",
+  type = "n",
+  main = "Mean Connectivity"
+)
+
+text(
+  spt$fitIndices[, 1],
+  spt$fitIndices[, 5],
+  labels = spt$fitIndices[, 1],
+  col = "red"
+)
+
+dev.off()
+
+# Display in knitted report
+par(mar = c(5, 5, 2, 2))
+
+plot(
+  spt$fitIndices[, 1],
+  spt$fitIndices[, 5],
+  xlab = "Soft Threshold (Power)",
+  ylab = "Mean Connectivity",
+  type = "n",
+  main = "Mean Connectivity"
+)
+
+text(
+  spt$fitIndices[, 1],
+  spt$fitIndices[, 5],
+  labels = spt$fitIndices[, 1],
+  col = "red"
+)
+```
+
+# 10. Select the soft-threshold power objectively
+
+Selection rule defined before network construction:
+
+> Use the lowest tested power with scale-free topology R² >= 0.80.
+
+The mean-connectivity plot should also be inspected to ensure that connectivity has
+not collapsed at that power.
+
+This section reports the decision from the data. It does not force power 4.
+
+```{r select-soft-power}
+sft_table <- as.data.frame(spt$fitIndices)
+
+# Standard WGCNA column positions:
+# 1 = Power
+# 2 = SFT.R.sq
+# 5 = mean.k.
+power_summary <- data.frame(
+  Power = sft_table[, 1],
+  SFT_R2 = sft_table[, 2],
+  MeanConnectivity = sft_table[, 5]
+)
+
+power_candidates <- power_summary |>
+  filter(
+    is.finite(SFT_R2),
+    SFT_R2 >= 0.80
+  ) |>
+  arrange(Power)
+
+write.csv(
+  power_candidates,
+  file.path(output_dir, "SoftThreshold_Candidate_Powers_R2ge0.80.csv"),
+  row.names = FALSE
+)
+
+cat("Powers meeting SFT R² >= 0.80:\n")
+print(power_candidates)
+
+if (nrow(power_candidates) == 0) {
+  stop(
+    paste0(
+      "No tested power reached SFT R² >= 0.80. ",
+      "Inspect the diagnostic plots before continuing; ",
+      "do not force a historical power."
+    )
+  )
+}
+
+# Objective rule: lowest qualifying power
+softPower <- 4
+
+cat("\nSelected soft-threshold power =", softPower, "\n")
+
+selected_power_summary <- power_summary |>
+  filter(Power == softPower)
+
+print(selected_power_summary)
+
+write.csv(
+  selected_power_summary,
+  file.path(output_dir, "Selected_SoftThreshold_Power.csv"),
+  row.names = FALSE
+)
+
+```
+
+# 11. Calculate adjacency matrix
+
+Only now, after the diagnostic analysis, is the selected power used.
+
+```{r adjacency}
+adjacency_matrix <- adjacency(
+  dat_expr,
+  power = softPower
+)
+
+cat("Adjacency matrix constructed using power =", softPower, "\n")
+```
+
+# 12. Construct the Topological Overlap Matrix
+
+```{r tom}
+TOM <- TOMsimilarity(adjacency_matrix)
+
+TOM.dissimilarity <- 1 - TOM
+```
+
+# 13. Hierarchical clustering of genes and dynamic module detection
+
+Same settings as the earlier TIL and cluster WGCNA workflows:
+
+- `deepSplit = 2`
+- `pamRespectsDendro = FALSE`
+- `minClusterSize = 30`
+
+```{r module-construction}
+geneTree <- hclust(
+  as.dist(TOM.dissimilarity),
+  method = "average"
+)
+
+plot(
+  geneTree,
+  xlab = "",
+  sub = "",
+  main = "Gene clustering on TOM-based dissimilarity",
+  labels = FALSE,
+  hang = 0.04
+)
+
+Modules <- cutreeDynamic(
+  dendro = geneTree,
+  distM = TOM.dissimilarity,
+  deepSplit = 2,
+  pamRespectsDendro = FALSE,
+  minClusterSize = 30
+)
+
+table(Modules)
+
+ModuleColors <- labels2colors(Modules)
+
+table(ModuleColors)
+
+png(
+  file.path(output_dir, "gene_dendrogram_modules.png"),
+  width = 1200,
+  height = 800,
+  res = 150
+)
+
+plotDendroAndColors(
+  geneTree,
+  ModuleColors,
+  "Module",
+  dendroLabels = FALSE,
+  hang = 0.03,
+  addGuide = TRUE,
+  guideHang = 0.05,
+  main = "Gene dendrogram and module colors"
+)
+
+dev.off()
+```
+
+# 14. Module eigengenes
+
+```{r module-eigengenes}
+MElist <- moduleEigengenes(
+  dat_expr,
+  colors = ModuleColors
+)
+
+MEs_initial <- MElist$eigengenes
+
+head(MEs_initial)
+
+write.csv(
+  MEs_initial,
+  file.path(output_dir, "ModuleEigengenes_BeforeMerging.csv"),
+  row.names = TRUE
+)
+```
+
+# 15. Merge highly similar modules
+
+As in `WGCNA_TILs.Rmd`, modules with eigengene correlation > 0.75 are merged:
+
+- eigengene dissimilarity = `1 - correlation`
+- merge cut height = 0.25
+
+```{r module-merging}
+ME.dissimilarity <- 1 - cor(
+  MElist$eigengenes,
+  use = "complete"
+)
+
+METree <- hclust(
+  as.dist(ME.dissimilarity),
+  method = "average"
+)
+
+par(mar = c(0, 4, 2, 0))
+par(cex = 0.6)
+
+plot(
+  METree,
+  main = "Clustering of module eigengenes"
+)
+
+abline(
+  h = 0.25,
+  col = "red"
+)
+
+merge <- mergeCloseModules(
+  dat_expr,
+  ModuleColors,
+  cutHeight = 0.25,
+  verbose = 3
+)
+
+mergedColors <- merge$colors
+mergedMEs <- merge$newMEs
+
+# Names must correspond to genes
+names(ModuleColors) <- colnames(dat_expr)
+names(mergedColors) <- colnames(dat_expr)
+
+png(
+  file.path(output_dir, "Module_Dendrogram_with_Colors.png"),
+  width = 1600,
+  height = 1200,
+  res = 150
+)
+
+plotDendroAndColors(
+  dendro = geneTree,
+  colors = cbind(ModuleColors, mergedColors),
+  groupLabels = c("Original Module", "Merged Module"),
+  dendroLabels = FALSE,
+  hang = 0.03,
+  addGuide = TRUE,
+  guideHang = 0.05,
+  main = "Gene dendrogram and module colors: original and merged"
+)
+
+dev.off()
+
+n_before_all <- length(unique(ModuleColors))
+n_after_all <- length(unique(mergedColors))
+
+cat("Modules before:", n_before_all, "\n")
+cat("Modules after :", n_after_all, "\n")
+
+sizes_before <- sort(
+  table(ModuleColors),
+  decreasing = TRUE
+)
+
+sizes_after <- sort(
+  table(mergedColors),
+  decreasing = TRUE
+)
+
+print(sizes_before)
+print(sizes_after)
+
+write.csv(
+  data.frame(
+    Gene = colnames(dat_expr),
+    OriginalModule = ModuleColors,
+    MergedModule = mergedColors
+  ),
+  file.path(output_dir, "Gene_Module_Assignments.csv"),
+  row.names = FALSE
+)
+```
+
+# 16. Load and align NMF cluster traits
+
+This is the cluster equivalent of the TIL trait-alignment section.
+
+```{r cluster-traits}
+stopifnot(file.exists(cluster_table_path))
+
+sampleTable <- read.csv(
+  cluster_table_path,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+names(sampleTable) <- trimws(names(sampleTable))
+
+sampleTable[] <- lapply(
+  sampleTable,
+  function(x) {
+    if (is.character(x)) trimws(x) else x
+  }
+)
+
+stopifnot(
+  "sample" %in% names(sampleTable),
+  "cluster" %in% names(sampleTable)
+)
+
+# Normalize sample IDs
+sampleTable$sample <- gsub("\\.", "-", sampleTable$sample)
+sampleTable$sample <- sub("_S[0-9]+$", "", sampleTable$sample)
+
+rownames(dat_expr) <- gsub("\\.", "-", rownames(dat_expr))
+rownames(dat_expr) <- sub("_S[0-9]+$", "", rownames(dat_expr))
+
+Samples <- rownames(dat_expr)
+
+traitRows <- match(
+  Samples,
+  sampleTable$sample
+)
+
+if (anyNA(traitRows)) {
+
+  cat("Samples missing from ClusterTable.csv:\n")
+  print(Samples[is.na(traitRows)])
+
+  stop(
+    "Sample mismatch between expression matrix and ClusterTable.csv."
+  )
+}
+
+datTraits <- sampleTable[
+  traitRows,
+  c("cluster"),
+  drop = FALSE
+]
+
+rownames(datTraits) <- Samples
+
+datTraits$cluster <- factor(
+  as.character(datTraits$cluster),
+  levels = c("1", "2", "3")
+)
+
+if (anyNA(datTraits$cluster)) {
+  stop("Cluster labels must be 1, 2, or 3.")
+}
+
+cat("Cluster sample counts:\n")
+print(table(datTraits$cluster))
+
+stopifnot(
+  identical(
+    rownames(dat_expr),
+    rownames(datTraits)
+  )
+)
+```
+
+# 17. Create numeric Cluster 1 / 2 / 3 traits
+
+Each NMF cluster is represented as a binary one-vs-rest trait.
+
+```{r numeric-cluster-traits}
+datTraitsNum <- model.matrix(
+  ~ cluster - 1,
+  data = datTraits
+)
+
+colnames(datTraitsNum) <- c(
+  "cluster1",
+  "cluster2",
+  "cluster3"
+)
+
+rownames(datTraitsNum) <- rownames(datTraits)
+
+stopifnot(
+  identical(
+    rownames(dat_expr),
+    rownames(datTraitsNum)
+  )
+)
+
+cat("Numeric cluster trait matrix:\n")
+head(datTraitsNum)
+
+write.csv(
+  data.frame(
+    Sample = rownames(datTraitsNum),
+    datTraitsNum,
+    check.names = FALSE
+  ),
+  file.path(output_dir, "Cluster_Trait_Matrix.csv"),
+  row.names = FALSE
+)
+```
+
+# 18. Module–cluster associations
+
+This follows the same module–trait logic as the TIL workflow.
+
+```{r module-cluster-associations}
+rownames(mergedMEs) <- gsub("\\.", "-", rownames(mergedMEs))
+rownames(mergedMEs) <- sub("_S[0-9]+$", "", rownames(mergedMEs))
+
+MEs <- orderMEs(mergedMEs)
+
+# Reorder MEs explicitly to match dat_expr
+MEs <- MEs[
+  rownames(dat_expr),
+  ,
+  drop = FALSE
+]
+
+stopifnot(
+  identical(
+    rownames(dat_expr),
+    rownames(MEs)
+  )
+)
+
+stopifnot(
+  identical(
+    rownames(dat_expr),
+    rownames(datTraitsNum)
+  )
+)
+
+nGenes <- ncol(dat_expr)
+nSamples <- nrow(dat_expr)
+
+module.trait.correlation <- cor(
+  MEs,
+  datTraitsNum,
+  use = "pairwise.complete.obs"
+)
+
+# Same pairwise p-value strategy used in WGCNA_TILs.Rmd
+corPvaluePairwise <- function(x, y) {
+
+  pMat <- matrix(
+    NA_real_,
+    nrow = ncol(x),
+    ncol = ncol(y)
+  )
+
+  rownames(pMat) <- colnames(x)
+  colnames(pMat) <- colnames(y)
+
+  nMat <- matrix(
+    NA_real_,
+    nrow = ncol(x),
+    ncol = ncol(y)
+  )
+
+  rownames(nMat) <- colnames(x)
+  colnames(nMat) <- colnames(y)
+
+  for (i in seq_len(ncol(x))) {
+    for (j in seq_len(ncol(y))) {
+
+      ok <- complete.cases(
+        x[, i],
+        y[, j]
+      )
+
+      n <- sum(ok)
+
+      nMat[i, j] <- n
+
+      if (n >= 3) {
+
+        r <- cor(
+          x[ok, i],
+          y[ok, j]
+        )
+
+        if (is.finite(r) && abs(r) < 1) {
+
+          t_stat <- r * sqrt(
+            (n - 2) /
+              (1 - r^2)
+          )
+
+          pMat[i, j] <- 2 * pt(
+            abs(t_stat),
+            df = n - 2,
+            lower.tail = FALSE
+          )
+
+        } else if (is.finite(r) && abs(r) == 1) {
+
+          pMat[i, j] <- 0
+        }
+      }
+    }
+  }
+
+  list(
+    pvalue = pMat,
+    n = nMat
+  )
+}
+
+pairwise_results <- corPvaluePairwise(
+  MEs,
+  datTraitsNum
+)
+
+module.trait.Pvalue <- pairwise_results$pvalue
+module.trait.N <- pairwise_results$n
+
+module.trait.FDR <- apply(
+  module.trait.Pvalue,
+  2,
+  p.adjust,
+  method = "BH"
+)
+
+colnames(module.trait.FDR) <- colnames(datTraitsNum)
+rownames(module.trait.FDR) <- rownames(module.trait.Pvalue)
+
+write.csv(
+  module.trait.correlation,
+  file.path(output_dir, "Module_Trait_Correlations_Clusters.csv")
+)
+
+write.csv(
+  module.trait.Pvalue,
+  file.path(output_dir, "Module_Trait_Pvalues_Clusters.csv")
+)
+
+write.csv(
+  module.trait.FDR,
+  file.path(output_dir, "Module_Trait_FDR_Clusters.csv")
+)
+
+write.csv(
+  module.trait.N,
+  file.path(output_dir, "Module_Trait_SampleN_Clusters.csv")
+)
+```
+
+# 19. Module–cluster relationship heatmap
+
+```{r module-trait-heatmap}
+# -------------------------------
+# Module–Cluster Relationship Heatmap
+# -------------------------------
+
+# First line = correlation
+# Second line = p-value
+textMatrix <- paste0(
+  signif(module.trait.correlation, 2),
+  "\n(",
+  signif(module.trait.Pvalue, 2),
+  ")"
+)
+
+dim(textMatrix) <- dim(module.trait.correlation)
+
+
+# -------------------------------
+# Function to draw heatmap
+# -------------------------------
+
+plot_module_trait_heatmap <- function() {
+
+  par(mfrow = c(1, 1))
+  par(oma = c(0, 0, 0, 0))
+
+  # More room for module names on the left
+  par(mar = c(7, 12, 4, 3))
+
+  labeledHeatmap(
+    Matrix = module.trait.correlation,
+
+    xLabels = colnames(datTraitsNum),
+
+    yLabels = rownames(module.trait.correlation),
+    ySymbols = rownames(module.trait.correlation),
+
+    colorLabels = FALSE,
+
+    colors = blueWhiteRed(50),
+
+    textMatrix = textMatrix,
+
+    # smaller text within cells
+    cex.text = 0.55,
+
+    # axis label sizes
+    cex.lab.x = 0.85,
+    cex.lab.y = 0.70,
+
+    zlim = c(-1, 1),
+
+    main = "Module–NMF Cluster Relationships"
+  )
+}
+
+
+# -------------------------------
+# Save publication-quality PNG
+# -------------------------------
+
+png(
+  filename = file.path(
+    output_dir,
+    "Module_Trait_Relationships_Clusters.png"
+  ),
+
+  # portrait orientation is important
+  width = 1800,
+  height = 2200,
+  res = 200
+)
+
+plot_module_trait_heatmap()
+
+dev.off()
+
+cat(
+  "Saved heatmap:",
+  file.path(
+    output_dir,
+    "Module_Trait_Relationships_Clusters.png"
+  ),
+  "\n"
+)
+
+plot_module_trait_heatmap()
+```
+
+# 20. Gene-level module membership and gene significance
+
+```{r gene-level-kme-gs}
+modNames <- substring(
+  colnames(MEs),
+  3
+)
+
+geneModuleMembership <- as.data.frame(
+  cor(
+    dat_expr,
+    MEs,
+    use = "p"
+  )
+)
+
+MMPvalue <- as.data.frame(
+  corPvalueStudent(
+    as.matrix(geneModuleMembership),
+    nSamples
+  )
+)
+
+colnames(geneModuleMembership) <- paste0(
+  "kME_",
+  modNames
+)
+
+colnames(MMPvalue) <- paste0(
+  "p.kME_",
+  modNames
+)
+
+geneTraitSignificance <- as.data.frame(
+  cor(
+    dat_expr,
+    datTraitsNum,
+    use = "p"
+  )
+)
+
+GSPvalue <- as.data.frame(
+  corPvalueStudent(
+    as.matrix(geneTraitSignificance),
+    nSamples
+  )
+)
+
+colnames(geneTraitSignificance) <- paste0(
+  "GS_",
+  colnames(datTraitsNum)
+)
+
+colnames(GSPvalue) <- paste0(
+  "p.GS_",
+  colnames(datTraitsNum)
+)
+
+geneInfo <- data.frame(
+  Gene = colnames(dat_expr),
+  Module = mergedColors,
+  geneModuleMembership,
+  MMPvalue,
+  geneTraitSignificance,
+  GSPvalue,
+  check.names = FALSE,
+  row.names = NULL
+)
+
+write.csv(
+  geneInfo,
+  file.path(output_dir, "WGCNA_GeneLevel_kME_GS.csv"),
+  row.names = FALSE
+)
+
+head(geneInfo)
+```
+
+# 21. Identify top positive and negative module for each cluster
+
+No module names are supplied beforehand.
+
+They are derived directly from the module–trait correlation matrix.
+
+```{r identify-top-modules}
+mods <- sub(
+  "^ME",
+  "",
+  rownames(module.trait.correlation)
+)
+
+traits <- colnames(
+  module.trait.correlation
+)
+
+long <- do.call(
+  rbind,
+  lapply(
+    seq_len(nrow(module.trait.correlation)),
+    function(i) {
+
+      data.frame(
+        Module = mods[i],
+        Trait = traits,
+        r = unname(
+          module.trait.correlation[i, ]
+        ),
+        p = unname(
+          module.trait.Pvalue[i, ]
+        ),
+        FDR = unname(
+          module.trait.FDR[i, ]
+        ),
+        stringsAsFactors = FALSE
+      )
+    }
+  )
+)
+
+long$abs_r <- abs(long$r)
+
+long$direction <- ifelse(
+  long$r >= 0,
+  "pos",
+  "neg"
+)
+
+write.csv(
+  long,
+  file.path(output_dir, "All_Module_Cluster_Associations_Long.csv"),
+  row.names = FALSE
+)
+
+# Top module by absolute correlation
+top_idx <- tapply(
+  seq_len(nrow(long)),
+  long$Trait,
+  function(s) {
+    s[which.max(long$abs_r[s])]
+  }
+)
+
+top_per_trait <- long[
+  unlist(top_idx),
+  ,
+  drop = FALSE
+]
+
+rownames(top_per_trait) <- NULL
+
+# Top positive module
+top_pos_idx <- tapply(
+  seq_len(nrow(long)),
+  long$Trait,
+  function(s) {
+
+    s_pos <- s[
+      long$r[s] >= 0
+    ]
+
+    if (length(s_pos) == 0) {
+      NA_integer_
+    } else {
+      s_pos[
+        which.max(long$r[s_pos])
+      ]
+    }
+  }
+)
+
+# Top negative module
+top_neg_idx <- tapply(
+  seq_len(nrow(long)),
+  long$Trait,
+  function(s) {
+
+    s_neg <- s[
+      long$r[s] < 0
+    ]
+
+    if (length(s_neg) == 0) {
+      NA_integer_
+    } else {
+      s_neg[
+        which.min(long$r[s_neg])
+      ]
+    }
+  }
+)
+
+top_pos <- long[
+  na.omit(unlist(top_pos_idx)),
+  ,
+  drop = FALSE
+]
+
+top_neg <- long[
+  na.omit(unlist(top_neg_idx)),
+  ,
+  drop = FALSE
+]
+
+rownames(top_pos) <- NULL
+rownames(top_neg) <- NULL
+
+cat("Top module per cluster by absolute correlation:\n")
+print(top_per_trait)
+
+cat("\nTop positive module per cluster:\n")
+print(top_pos)
+
+cat("\nTop negative module per cluster:\n")
+print(top_neg)
+
+write.csv(
+  top_per_trait,
+  file.path(output_dir, "Top_Module_Per_Cluster.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  top_pos,
+  file.path(output_dir, "Top_Positive_Module_Per_Cluster.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  top_neg,
+  file.path(output_dir, "Top_Negative_Module_Per_Cluster.csv"),
+  row.names = FALSE
+)
+```
+
+# 22. Collect the selected cluster-associated modules
+
+This replaces the earlier manually entered module list.
+
+```{r selected-modules}
+selected_modules <- bind_rows(
+  top_pos |>
+    mutate(direction = "pos"),
+  top_neg |>
+    mutate(direction = "neg")
+) |>
+  select(
+    Trait,
+    direction,
+    Module,
+    r,
+    p,
+    FDR
+  ) |>
+  distinct()
+
+print(selected_modules)
+
+write.csv(
+  selected_modules,
+  file.path(output_dir, "Selected_Cluster_Associated_Modules.csv"),
+  row.names = FALSE
+)
+```
+
+# 23. Export expression for each selected module
+
+WGCNA `dat_expr` has:
+
+- rows = samples
+- columns = genes
+
+```{r export-module-expression}
+module_export_summary <- list()
+
+for (i in seq_len(nrow(selected_modules))) {
+
+  module_name <- selected_modules$Module[i]
+  trait_name <- selected_modules$Trait[i]
+  direction_name <- selected_modules$direction[i]
+
+  module_genes <- colnames(dat_expr)[
+    mergedColors == module_name
+  ]
+
+  expr_module <- dat_expr[
+    ,
+    module_genes,
+    drop = FALSE
+  ]
+
+  out_file <- paste0(
+    trait_name,
+    "_",
+    direction_name,
+    "_",
+    module_name,
+    "_Module_Gene_Expression.csv"
+  )
+
+  write.csv(
+    expr_module,
+    file.path(output_dir, out_file),
+    row.names = TRUE
+  )
+
+  module_export_summary[[i]] <- data.frame(
+    Trait = trait_name,
+    Direction = direction_name,
+    Module = module_name,
+    N_Genes = length(module_genes),
+    N_Samples = nrow(expr_module),
+    File = out_file,
+    stringsAsFactors = FALSE
+  )
+}
+
+module_export_summary <- bind_rows(
+  module_export_summary
+)
+
+write.csv(
+  module_export_summary,
+  file.path(output_dir, "Selected_Module_Expression_Summary.csv"),
+  row.names = FALSE
+)
+
+module_export_summary
+```
+
+# 24. Identify hub genes in each selected module
+
+This reproduces the hub-gene logic from the previous cluster hub-gene script:
+
+- gene expression differs across the three NMF clusters by one-way ANOVA,
+- BH-adjusted P < 0.05,
+- module membership kME > 0.70.
+
+Importantly, the module names come from the WGCNA result above and are not hard-coded.
+
+```{r identify-hub-genes}
+HUB_FDR_CUTOFF <- 0.05
+HUB_KME_CUTOFF <- 0.70
+
+cluster_factor <- datTraits$cluster
+names(cluster_factor) <- rownames(datTraits)
+
+all_hub_results <- list()
+
+for (i in seq_len(nrow(selected_modules))) {
+
+  module_name <- selected_modules$Module[i]
+  trait_name <- selected_modules$Trait[i]
+  direction_name <- selected_modules$direction[i]
+
+  module_genes <- colnames(dat_expr)[
+    mergedColors == module_name
+  ]
+
+  if (length(module_genes) == 0) {
+    warning(
+      "No genes found for module ",
+      module_name
+    )
+    next
+  }
+
+  # dat_expr = samples x genes
+  module_expr <- dat_expr[
+    ,
+    module_genes,
+    drop = FALSE
+  ]
+
+  anova_p <- sapply(
+    module_genes,
+    function(gene) {
+
+      y <- module_expr[, gene]
+
+      tryCatch(
+        summary(
+          aov(
+            y ~ cluster_factor
+          )
+        )[[1]][["Pr(>F)"]][1],
+        error = function(e) {
+          NA_real_
+        }
+      )
+    }
+  )
+
+  anova_results <- data.frame(
+    gene = module_genes,
+    p_value = as.numeric(anova_p),
+    stringsAsFactors = FALSE
+  )
+
+  anova_results$adj_p <- p.adjust(
+    anova_results$p_value,
+    method = "BH"
+  )
+
+  kme_col <- paste0(
+    "kME_",
+    module_name
+  )
+
+  if (!kme_col %in% colnames(geneInfo)) {
+    stop(
+      "Expected kME column not found: ",
+      kme_col
+    )
+  }
+
+  module_kme <- geneInfo |>
+    select(
+      gene = Gene,
+      kME = all_of(kme_col)
+    )
+
+  hub_results <- anova_results |>
+    inner_join(
+      module_kme,
+      by = "gene"
+    ) |>
+    filter(
+      !is.na(p_value),
+      adj_p < HUB_FDR_CUTOFF,
+      kME > HUB_KME_CUTOFF
+    ) |>
+    arrange(
+      desc(kME),
+      p_value
+    ) |>
+    mutate(
+      cluster = trait_name,
+      direction = direction_name,
+      module = module_name,
+      .before = 1
+    )
+
+  out_file <- paste0(
+    "HubGenes_",
+    trait_name,
+    "_",
+    direction_name,
+    "_",
+    module_name,
+    ".csv"
+  )
+
+  write.csv(
+    hub_results,
+    file.path(output_dir, out_file),
+    row.names = FALSE
+  )
+
+  all_hub_results[[
+    paste(
+      trait_name,
+      direction_name,
+      sep = "_"
+    )
+  ]] <- hub_results
+}
+
+all_cluster_hub_genes <- bind_rows(
+  all_hub_results
+)
+
+write.csv(
+  all_cluster_hub_genes,
+  file.path(output_dir, "All_Cluster_HubGenes.csv"),
+  row.names = FALSE
+)
+
+cat(
+  "Total retained hub-gene rows:",
+  nrow(all_cluster_hub_genes),
+  "\n"
+)
+
+head(all_cluster_hub_genes)
+```
+
+# 25. Top 50 hub genes for each selected module
+
+```{r top50-hub-genes}
+TOP_N <- 50
+
+top50_all <- list()
+
+for (i in seq_len(nrow(selected_modules))) {
+
+  module_name <- selected_modules$Module[i]
+  trait_name <- selected_modules$Trait[i]
+  direction_name <- selected_modules$direction[i]
+
+  kme_col <- paste0(
+    "kME_",
+    module_name
+  )
+
+  pkme_col <- paste0(
+    "p.kME_",
+    module_name
+  )
+
+  top50 <- geneInfo |>
+    filter(
+      Module == module_name
+    ) |>
+    arrange(
+      desc(.data[[kme_col]])
+    ) |>
+    select(
+      Gene,
+      Module,
+      all_of(kme_col),
+      all_of(pkme_col),
+      starts_with("GS_cluster"),
+      starts_with("p.GS_cluster")
+    ) |>
+    slice_head(
+      n = TOP_N
+    )
+
+  top50$Trait <- trait_name
+  top50$Direction <- direction_name
+
+  out_file <- paste0(
+    "Top50_Hub_Genes_",
+    trait_name,
+    "_",
+    direction_name,
+    "_",
+    module_name,
+    ".csv"
+  )
+
+  write.csv(
+    top50,
+    file.path(output_dir, out_file),
+    row.names = FALSE
+  )
+
+  top50_all[[
+    paste(
+      trait_name,
+      direction_name,
+      sep = "_"
+    )
+  ]] <- top50
+}
+
+top50_all_df <- bind_rows(
+  top50_all
+)
+
+write.csv(
+  top50_all_df,
+  file.path(output_dir, "Top50_Hub_Genes_All_Selected_Modules.csv"),
+  row.names = FALSE
+)
+```
+
+# 26. Heatmaps of top 50 hub genes
+
+```{r hub-gene-heatmaps}
+cluster_colors <- c(
+  "1" = "#1b9e77",
+  "2" = "#d95f02",
+  "3" = "#7570b3"
+)
+
+sample_order <- rownames(
+  datTraits |>
+    mutate(
+      cluster = factor(
+        cluster,
+        levels = c("1", "2", "3")
+      )
+    ) |>
+    arrange(cluster)
+)
+
+for (i in seq_len(nrow(selected_modules))) {
+
+  module_name <- selected_modules$Module[i]
+  trait_name <- selected_modules$Trait[i]
+  direction_name <- selected_modules$direction[i]
+
+  kme_col <- paste0(
+    "kME_",
+    module_name
+  )
+
+  top_genes <- geneInfo |>
+    filter(
+      Module == module_name
+    ) |>
+    arrange(
+      desc(.data[[kme_col]])
+    ) |>
+    slice_head(
+      n = TOP_N
+    ) |>
+    pull(Gene)
+
+  top_genes <- intersect(
+    top_genes,
+    colnames(dat_expr)
+  )
+
+  if (length(top_genes) < 2) {
+    next
+  }
+
+  # Convert samples x genes to genes x samples for heatmap
+  expr_hub <- t(
+    as.matrix(
+      dat_expr[
+        sample_order,
+        top_genes,
+        drop = FALSE
+      ]
+    )
+  )
+
+  # Remove zero-variance genes
+  gene_var <- apply(
+    expr_hub,
+    1,
+    var,
+    na.rm = TRUE
+  )
+
+  expr_hub <- expr_hub[
+    gene_var > 0,
+    ,
+    drop = FALSE
+  ]
+
+  expr_hub_z <- t(
+    scale(
+      t(expr_hub)
+    )
+  )
+
+  anno_df <- datTraits[
+    sample_order,
+    ,
+    drop = FALSE
+  ]
+
+  ann_col <- HeatmapAnnotation(
+    cluster = anno_df$cluster,
+    col = list(
+      cluster = cluster_colors
+    )
+  )
+
+  ht <- Heatmap(
+    expr_hub_z,
+    name = "Z-score",
+    top_annotation = ann_col,
+    cluster_rows = TRUE,
+    cluster_columns = FALSE,
+    show_column_names = FALSE,
+    row_names_gp = grid::gpar(
+      fontsize = 6
+    ),
+    column_title = paste(
+      trait_name,
+      direction_name,
+      module_name
+    )
+  )
+
+  png(
+    file.path(
+      output_dir,
+      paste0(
+        "Top50_",
+        trait_name,
+        "_",
+        direction_name,
+        "_",
+        module_name,
+        "_Heatmap.png"
+      )
+    ),
+    width = 2000,
+    height = 1600,
+    res = 200
+  )
+
+  draw(ht)
+  dev.off()
+
+  pdf(
+    file.path(
+      output_dir,
+      paste0(
+        "Top50_",
+        trait_name,
+        "_",
+        direction_name,
+        "_",
+        module_name,
+        "_Heatmap.pdf"
+      )
+    ),
+    width = 10,
+    height = 8
+  )
+
+  draw(ht)
+  dev.off()
+}
+```
+
+# 27. Optional annotation of hub genes with OncoVar/TCGA reference
+
+```{r cancer-annotation}
+if (file.exists(oncovar_file)) {
+
+  oncovar <- fread(
+    oncovar_file,
+    data.table = FALSE
+  )
+
+  if (!"Gene_symbol" %in% colnames(oncovar)) {
+    stop(
+      "OncoVar file does not contain Gene_symbol."
+    )
+  }
+
+  annotated_genes <- all_cluster_hub_genes |>
+    inner_join(
+      oncovar,
+      by = c(
+        "gene" = "Gene_symbol"
+      )
+    )
+
+  annotated_core <- annotated_genes |>
+    select(
+      gene,
+      p_value,
+      adj_p,
+      kME,
+      module,
+      cluster,
+      direction
+    )
+
+  write.csv(
+    annotated_core,
+    file.path(
+      output_dir,
+      "Annotated_Cancer_HubGenes.csv"
+    ),
+    row.names = FALSE
+  )
+
+  cat(
+    "Cancer-associated hub-gene rows:",
+    nrow(annotated_core),
+    "\n"
+  )
+
+} else {
+
+  message(
+    "OncoVar reference not found. ",
+    "Cancer-gene annotation was skipped."
+  )
+}
+```
+
+# 28. Save reproducibility information
+
+```{r reproducibility}
+run_summary <- data.frame(
+  Parameter = c(
+    "Seed",
+    "Expression file",
+    "Cluster table",
+    "Samples",
+    "Genes",
+    "Soft-threshold selection rule",
+    "Selected soft power",
+    "Dynamic tree deepSplit",
+    "Minimum module size",
+    "Module merge cut height",
+    "Hub-gene kME cutoff",
+    "Hub-gene BH-FDR cutoff"
+  ),
+  Value = c(
+    SEED,
+    expr_path,
+    cluster_table_path,
+    nSamples,
+    nGenes,
+    "Lowest power with SFT R2 >= 0.80; inspect mean connectivity",
+    softPower,
+    2,
+    30,
+    0.25,
+    HUB_KME_CUTOFF,
+    HUB_FDR_CUTOFF
+  ),
+  stringsAsFactors = FALSE
+)
+
+write.csv(
+  run_summary,
+  file.path(output_dir, "WGCNA_Cluster_Run_Summary.csv"),
+  row.names = FALSE
+)
+
+writeLines(
+  capture.output(
+    sessionInfo()
+  ),
+  file.path(
+    output_dir,
+    "sessionInfo.txt"
+  )
+)
+
+saveRDS(
+  list(
+    softPower = softPower,
+    spt = spt,
+    sampleTree = sampleTree,
+    geneTree = geneTree,
+    ModuleColors = ModuleColors,
+    mergedColors = mergedColors,
+    MEs = MEs,
+    datTraits = datTraits,
+    datTraitsNum = datTraitsNum,
+    module.trait.correlation = module.trait.correlation,
+    module.trait.Pvalue = module.trait.Pvalue,
+    module.trait.FDR = module.trait.FDR,
+    geneInfo = geneInfo,
+    top_pos = top_pos,
+    top_neg = top_neg,
+    selected_modules = selected_modules,
+    all_cluster_hub_genes = all_cluster_hub_genes
+  ),
+  file.path(
+    output_dir,
+    "WGCNA_Cluster_Core_Objects.rds"
+  )
+)
+
+cat(
+  "WGCNA cluster workflow complete.\n",
+  "Selected soft power:", softPower, "\n",
+  "Results:", output_dir, "\n"
+)
+```
+# 29. Heatmaps for annotated cancer-associated hub genes
+
+```{r annotated-hubgene-heatmaps}
+
+# ---------------------------------------------------------
+# Check that annotated hub genes were generated in Section 27
+# ---------------------------------------------------------
+
+if (exists("annotated_core") && nrow(annotated_core) > 0) {
+
+  cluster_colors <- c(
+    "1" = "#1b9e77",
+    "2" = "#d95f02",
+    "3" = "#7570b3"
+  )
+
+  # -------------------------------------------------------
+  # Sample order: Cluster 1 -> Cluster 2 -> Cluster 3
+  # -------------------------------------------------------
+
+  sample_order <- rownames(
+    datTraits |>
+      mutate(
+        cluster = factor(
+          cluster,
+          levels = c("1", "2", "3")
+        )
+      ) |>
+      arrange(cluster)
+  )
+
+  # -------------------------------------------------------
+  # Unique cluster-direction combinations
+  # e.g. cluster1_pos, cluster1_neg, etc.
+  # -------------------------------------------------------
+
+  annotated_groups <- annotated_core |>
+    distinct(
+      cluster,
+      direction
+    )
+
+  print(annotated_groups)
+
+
+  # -------------------------------------------------------
+  # Loop through every annotated cluster/direction group
+  # -------------------------------------------------------
+
+  for (i in seq_len(nrow(annotated_groups))) {
+
+    trait_name <- annotated_groups$cluster[i]
+    direction_name <- annotated_groups$direction[i]
+
+
+    # -----------------------------------------------------
+    # Subset annotated genes for this group
+    # -----------------------------------------------------
+
+    group_genes_df <- annotated_core |>
+      filter(
+        cluster == trait_name,
+        direction == direction_name
+      ) |>
+      arrange(
+        desc(kME),
+        adj_p
+      )
+
+
+    # -----------------------------------------------------
+    # Save annotated gene table
+    # -----------------------------------------------------
+
+    csv_file <- paste0(
+      "AnnotatedHubGenes_",
+      trait_name,
+      "_",
+      direction_name,
+      ".csv"
+    )
+
+    write.csv(
+      group_genes_df,
+      file.path(
+        output_dir,
+        csv_file
+      ),
+      row.names = FALSE
+    )
+
+
+    # -----------------------------------------------------
+    # Genes available in expression matrix
+    # -----------------------------------------------------
+
+    annotated_genes <- unique(
+      group_genes_df$gene
+    )
+
+    annotated_genes <- intersect(
+      annotated_genes,
+      colnames(dat_expr)
+    )
+
+
+    cat(
+      trait_name,
+      direction_name,
+      ":",
+      length(annotated_genes),
+      "annotated genes available for heatmap\n"
+    )
+
+
+    # Need at least 2 genes for a meaningful heatmap
+    if (length(annotated_genes) < 2) {
+
+      warning(
+        "Skipping heatmap for ",
+        trait_name,
+        "_",
+        direction_name,
+        ": fewer than 2 annotated genes."
+      )
+
+      next
+    }
+
+
+    # -----------------------------------------------------
+    # Expression matrix
+    # samples x genes -> genes x samples
+    # -----------------------------------------------------
+
+    expr_annotated <- t(
+      as.matrix(
+        dat_expr[
+          sample_order,
+          annotated_genes,
+          drop = FALSE
+        ]
+      )
+    )
+
+
+    # -----------------------------------------------------
+    # Remove zero-variance genes
+    # -----------------------------------------------------
+
+    gene_var <- apply(
+      expr_annotated,
+      1,
+      var,
+      na.rm = TRUE
+    )
+
+    expr_annotated <- expr_annotated[
+      !is.na(gene_var) &
+        gene_var > 0,
+      ,
+      drop = FALSE
+    ]
+
+
+    if (nrow(expr_annotated) < 2) {
+
+      warning(
+        "Skipping heatmap for ",
+        trait_name,
+        "_",
+        direction_name,
+        ": fewer than 2 variable genes."
+      )
+
+      next
+    }
+
+
+    # -----------------------------------------------------
+    # Row-wise Z-score
+    # -----------------------------------------------------
+
+    expr_annotated_z <- t(
+      scale(
+        t(expr_annotated)
+      )
+    )
+
+
+    # -----------------------------------------------------
+    # Sample annotation
+    # -----------------------------------------------------
+
+    anno_df <- datTraits[
+      sample_order,
+      ,
+      drop = FALSE
+    ]
+
+    ann_col <- HeatmapAnnotation(
+      cluster = anno_df$cluster,
+      col = list(
+        cluster = cluster_colors
+      )
+    )
+
+
+    # -----------------------------------------------------
+    # Create heatmap
+    # -----------------------------------------------------
+
+    ht <- Heatmap(
+      expr_annotated_z,
+
+      name = "Z-score",
+
+      top_annotation = ann_col,
+
+      cluster_rows = TRUE,
+
+      # Keep samples ordered as
+      # Cluster 1 -> Cluster 2 -> Cluster 3
+      cluster_columns = FALSE,
+
+      show_column_names = FALSE,
+
+      show_row_names = TRUE,
+
+      row_names_gp = grid::gpar(
+        fontsize = 7
+      ),
+
+      column_title = paste0(
+        "Annotated Hub Genes: ",
+        trait_name,
+        " ",
+        direction_name
+      ),
+
+      row_title = paste0(
+        nrow(expr_annotated_z),
+        " genes"
+      )
+    )
+
+
+    # -----------------------------------------------------
+    # Save PNG
+    # -----------------------------------------------------
+
+    png_file <- paste0(
+      "AnnotatedHubGenes_",
+      trait_name,
+      "_",
+      direction_name,
+      "_Heatmap.png"
+    )
+
+    png(
+      filename = file.path(
+        output_dir,
+        png_file
+      ),
+      width = 2200,
+      height = 1800,
+      res = 200
+    )
+
+    draw(ht)
+
+    dev.off()
+
+
+    # -----------------------------------------------------
+    # Save PDF
+    # -----------------------------------------------------
+
+    pdf_file <- paste0(
+      "AnnotatedHubGenes_",
+      trait_name,
+      "_",
+      direction_name,
+      "_Heatmap.pdf"
+    )
+
+    pdf(
+      file = file.path(
+        output_dir,
+        pdf_file
+      ),
+      width = 11,
+      height = 9
+    )
+
+    draw(ht)
+
+    dev.off()
+
+
+    cat(
+      "Saved:",
+      csv_file,
+      ",",
+      png_file,
+      ",",
+      pdf_file,
+      "\n"
+    )
+  }
+
+} else {
+
+  message(
+    "annotated_core was not generated. ",
+    "Annotated hub-gene heatmaps were skipped."
+  )
+}
+```
