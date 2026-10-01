@@ -1,0 +1,94 @@
+---
+title: "Filtering"
+author: "bts76"
+date: "2025-11-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+```
+
+```{r}
+impact <- vroom::vroom("pILC_IMPACT.tsv")
+```
+```{r}
+impact
+```
+
+```{r}
+impact$Variant_Classification %>% table()
+```
+```{r}
+impact[impact$NORMAL_SAMPLE == "FFPEPOOLEDNORMAL",] %>% ggplot(aes(x = TUMOR_MAF)) + geom_histogram() + theme_classic()
+```
+
+```{r}
+impact[impact$NORMAL_SAMPLE != "FFPEPOOLEDNORMAL",] %>% ggplot(aes(x = TUMOR_MAF)) + geom_histogram() + theme_classic()
+```
+```{r}
+impact$AF <- as.numeric(impact$AF)
+impact[impact$Variant_Classification != "Intron",] %>% ggplot(aes(x = TUMOR_DP, y = NORMAL_DP)) + geom_point(aes(color = AF)) + geom_abline() + theme_classic() 
+```
+
+```{r}
+table(impact[impact$Variant_Classification != "Intron", "variantCaller"])
+```
+
+```{r}
+# Apply filters:
+# 1. For pooled normals: exclude germline peak (0.4-0.6)
+# 2. For all samples: TUMOR_DP > 10
+# 3. For all samples: TUMOR_MAF > 0.02 (2% AF)
+
+impact_filtered <- impact[impact$Variant_Classification != "Intron",] %>%
+  filter(
+    # Tumor depth filter (all samples)
+    TUMOR_DP > 10,
+    # MAF filter (all samples)
+    TUMOR_MAF > 0.02,
+    # Conditional germline filter (only for pooled normals)
+    !(NORMAL_SAMPLE == "FFPEPOOLEDNORMAL" & TUMOR_MAF >= 0.4 & TUMOR_MAF <= 0.6)
+  )
+
+# Check the results
+nrow(impact) - nrow(impact_filtered)  # Number of variants filtered out
+summary(impact_filtered$TUMOR_DP)
+summary(impact_filtered$TUMOR_MAF)
+
+# Visualize
+impact_filtered %>%
+  ggplot(aes(x = TUMOR_MAF)) + 
+  geom_histogram() + 
+  theme_classic()
+
+# Compare pooled vs paired normals
+impact_filtered %>%
+  mutate(Normal_Type = ifelse(NORMAL_SAMPLE == "FFPEPOOLEDNORMAL", 
+                               "Pooled Normal", 
+                               "Paired Normal")) %>%
+  ggplot(aes(x = TUMOR_MAF, fill = Normal_Type)) + 
+  geom_histogram(alpha = 0.6, position = "identity") + 
+  theme_classic()
+```
+```{r}
+table(impact_filtered$TUMOR_SAMPLE)
+```
+```{r}
+impact_filtered
+```
+
+
+```{r}
+table(impact_filtered$LOH)
+```
+
+```{r}
+write_tsv(impact_filtered, "pILC_IMPACT_filtered.tsv")
+save.image("pILC_IMPACT_filtering.RData")
+```
+

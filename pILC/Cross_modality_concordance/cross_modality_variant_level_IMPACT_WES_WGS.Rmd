@@ -1,0 +1,587 @@
+---
+title: "Cross-modality comparison at variant level: IMPACT (lifted to hg38) vs WES vs WGS"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    theme: readable
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(grid)
+})
+
+set.seed(42)
+graphics.off()
+```
+
+# Idea
+
+Same design as the gene-level analysis, but a call is now an exact variant
+(tumor + chr:pos:ref:alt, all hg38) instead of a gene. IMPACT coordinates were
+lifted from hg19 to hg38 first. Only tumors sequenced by both assays in a comparison
+are used, only non-silent variants, the same VAF cutoff for every assay, and only
+panel genes.
+
+```{r paths_and_parameters}
+impact_hg38_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/MSK_IMPACT/pILC_IMPACT_filtered_hg38.tsv"
+wgs_audit    <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WGS/PCGR/Downstream/Variant_classification/Top_Mutated_Genes_Cohort/Full_MAF_nonsilent_variant_PCGR_VAF_match_audit_2026-09-29.tsv"
+wgs_pcgr_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WGS/PCGR/pcgr_outputs"
+wes_audit    <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Compare_TumorOnly_vs_WithPON/maftools/Tier_1_common/Combined_MAF/Full_MAF_nonsilent_variant_PCGR_VAF_match_audit_2026-09-23.tsv"
+
+# IMPACT panel gene list (one gene per line). If NA, genes seen in IMPACT are used.
+panel_file <- NA_character_
+
+# Tumors sequenced but with no row in a filtered table, e.g. list(IMPACT = "TP05-123")
+extra_universe <- list(IMPACT = character(), WES = character(), WGS = character())
+
+out_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/Cross_modality_concordance/variant_level"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+VAF_THRESHOLDS <- c(0.03, 0.05)
+TOP_N_HEATMAP  <- 50
+# Tumors shown as heatmap columns: "all" = every tumor with >= 1 modality,
+# "IMPACT_WES" = only tumors sequenced by both IMPACT and WES
+HEATMAP_TUMORS <- "all"
+clinical_file  <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/Clinical_correlation/pILC_ClinicoPathological_details.csv"
+
+nonsilent_classes <- c(
+  "Missense_Mutation", "Nonsense_Mutation", "Nonstop_Mutation",
+  "Frame_Shift_Del", "Frame_Shift_Ins", "In_Frame_Del", "In_Frame_Ins",
+  "Splice_Site", "Splice_Region", "Translation_Start_Site"
+)
+
+mods <- c("IMPACT", "WES", "WGS")
+stopifnot(file.exists(impact_hg38_file), file.exists(wgs_audit), file.exists(wes_audit),
+          file.exists(clinical_file))
+```
+
+```{r helpers}
+clean_gene <- function(x) {
+  x <- toupper(trimws(as.character(x)))
+  x[x %in% c("", ".", "NA", "N/A")] <- NA_character_
+  x
+}
+
+# TP03-117T, TP03-117_T, JC287-TP08-525 -> TP03-117, TP08-525
+std_id <- function(x) {
+  x <- toupper(trimws(as.character(x)))
+  x <- sub("^JC287-", "", x)
+  x <- sub("(_T|-T|\\.T)$", "", x)
+  x <- sub("(?<=[0-9])T$", "", x, perl = TRUE)
+  # TP09-09 and TP09-9 are the same tumor: drop leading zeros of the number after the dash
+  sub("-0+(?=[0-9])", "-", x, perl = TRUE)
+}
+
+natural_sample_order <- function(samples) {
+  samples <- unique(as.character(samples))
+  tp  <- suppressWarnings(as.integer(sub("^TP([0-9]+).*", "\\1", samples)))
+  tp[is.na(tp)] <- 9999L
+  rest <- suppressWarnings(as.integer(gsub("[^0-9]", "", sub("^TP[0-9]+[-_]*", "", samples))))
+  rest[is.na(rest)] <- 9999L
+  samples[order(tp, rest, samples)]
+}
+
+save_plot <- function(file_base, width, height, draw_fn, res = 300) {
+  pdf(paste0(file_base, ".pdf"), width = width, height = height)
+  draw_fn(); dev.off()
+  png(paste0(file_base, ".png"), width = width, height = height, units = "in", res = res)
+  draw_fn(); dev.off()
+  cat("Saved:", paste0(file_base, c(".pdf", ".png")), sep = "\n  "); cat("\n")
+}
+
+# Variant key chr:pos:ref:alt. MAF "-" insertions use the left-flank position.
+# Identical PREFIX is removed first (shifts pos), then the suffix, so VCF-style
+# and MAF-style indels get the same key.
+edit_key <- function(chr, pos, ref, alt, maf_format = TRUE) {
+  chr <- sub("^CHR", "", toupper(trimws(as.character(chr))))
+  pos <- suppressWarnings(as.integer(pos))
+  ref <- toupper(trimws(as.character(ref)))
+  alt <- toupper(trimws(as.character(alt)))
+
+  if (anyNA(c(chr, pos, ref, alt)) || !nzchar(chr) || pos < 1L ||
+      !grepl("^([ACGTN]+|-)$", ref) || !grepl("^([ACGTN]+|-)$", alt)) {
+    return(NA_character_)
+  }
+  if (maf_format && ref == "-") pos <- pos + 1L
+  if (ref == "-") ref <- ""
+  if (alt == "-") alt <- ""
+
+  while (nzchar(ref) && nzchar(alt) && substr(ref, 1, 1) == substr(alt, 1, 1)) {
+    ref <- substring(ref, 2); alt <- substring(alt, 2); pos <- pos + 1L
+  }
+  while (nzchar(ref) && nzchar(alt) &&
+         substr(ref, nchar(ref), nchar(ref)) == substr(alt, nchar(alt), nchar(alt))) {
+    ref <- substr(ref, 1, nchar(ref) - 1L); alt <- substr(alt, 1, nchar(alt) - 1L)
+  }
+  if (!nzchar(ref) && !nzchar(alt)) return(NA_character_)
+  paste(chr, pos, ifelse(nzchar(ref), ref, "-"), ifelse(nzchar(alt), alt, "-"), sep = ":")
+}
+
+# dt needs: Sample, Gene, Class, VAF, Chromosome, Pos, Ref, Alt
+# -> one row per Sample + Variant_key (highest VAF kept)
+finish_calls <- function(dt, label) {
+  dt[, Type := fifelse(nchar(Ref) == 1L & nchar(Alt) == 1L & Ref != "-" & Alt != "-",
+                       "SNV", "indel")]
+  dt[, Variant_key := mapply(edit_key, Chromosome, Pos, Ref, Alt,
+                             MoreArgs = list(maf_format = TRUE), USE.NAMES = FALSE)]
+  cat(label, ": rows", nrow(dt), "| rows with unusable variant key:",
+      sum(is.na(dt$Variant_key)), "\n")
+  dt <- dt[!is.na(Variant_key)]
+  dt[, .(Gene  = Gene[which.max(VAF)], Class = Class[which.max(VAF)],
+         Type  = Type[which.max(VAF)], VAF = max(VAF)),
+     by = .(Sample, Variant_key)]
+}
+```
+
+```{r read_data}
+min_thr  <- min(VAF_THRESHOLDS)
+universe <- list()
+calls    <- list()
+
+# ---- IMPACT (hg38 after liftover) -----------------------------
+imp_raw <- fread(impact_hg38_file, sep = "\t", na.strings = c("", "NA"))
+need <- c("TUMOR_SAMPLE", "SYMBOL", "Variant_Classification", "TUMOR_MAF",
+          "CHROM_hg38", "POS_hg38", "REF", "ALT")
+if (length(setdiff(need, names(imp_raw)))) {
+  stop("IMPACT hg38 file lacks: ", paste(setdiff(need, names(imp_raw)), collapse = ", "))
+}
+imp_raw[, Sample := std_id(TUMOR_SAMPLE)]
+universe$IMPACT <- union(unique(imp_raw$Sample), extra_universe$IMPACT)
+
+imp <- imp_raw[Variant_Classification %in% nonsilent_classes &
+                 !is.na(TUMOR_MAF) & as.numeric(TUMOR_MAF) >= min_thr]
+cat("IMPACT non-silent variants at VAF >=", min_thr * 100, "%:", nrow(imp),
+    "| without hg38 position:", sum(is.na(imp$POS_hg38)), "\n")
+imp <- imp[!is.na(POS_hg38),
+           .(Sample, Gene = clean_gene(SYMBOL), Class = Variant_Classification,
+             VAF = as.numeric(TUMOR_MAF), Chromosome = CHROM_hg38, Pos = POS_hg38,
+             Ref = REF, Alt = ALT)]
+calls$IMPACT <- finish_calls(imp, "IMPACT")
+
+# ---- WES ------------------------------------------------------
+wes_raw <- fread(wes_audit, sep = "\t", na.strings = c("", "NA", "."))
+need <- c("Hugo_Symbol", "Tumor_Sample_Barcode", "Variant_Classification",
+          "Chromosome", "Start_Position", "Reference_Allele", "Tumor_Seq_Allele2",
+          "VAF_TUMOR_fraction")
+if (length(setdiff(need, names(wes_raw)))) {
+  stop("WES audit lacks: ", paste(setdiff(need, names(wes_raw)), collapse = ", "))
+}
+wes_raw[, Sample := std_id(Tumor_Sample_Barcode)]
+universe$WES <- union(unique(wes_raw$Sample), extra_universe$WES)
+
+wes <- wes_raw[Variant_Classification %in% nonsilent_classes &
+                 !is.na(VAF_TUMOR_fraction) & VAF_TUMOR_fraction >= min_thr,
+               .(Sample, Gene = clean_gene(Hugo_Symbol), Class = Variant_Classification,
+                 VAF = as.numeric(VAF_TUMOR_fraction), Chromosome,
+                 Pos = Start_Position, Ref = Reference_Allele, Alt = Tumor_Seq_Allele2)]
+calls$WES <- finish_calls(wes, "WES")
+rm(wes_raw, wes)
+
+# ---- WGS ------------------------------------------------------
+wgs_raw <- fread(wgs_audit, sep = "\t", na.strings = c("", "NA"))
+need <- c("Sample_key", "Hugo_Symbol", "Variant_Classification", "Chromosome",
+          "Start_Position", "Reference_Allele", "Tumor_Seq_Allele2",
+          "VAF_TUMOR_fraction", "matched", "is_nonsilent")
+if (length(setdiff(need, names(wgs_raw)))) {
+  stop("WGS audit lacks: ", paste(setdiff(need, names(wgs_raw)), collapse = ", "))
+}
+wgs_raw[, Sample := std_id(Sample_key)]
+wgs_folders <- std_id(list.dirs(wgs_pcgr_dir, recursive = FALSE, full.names = FALSE))
+universe$WGS <- union(union(unique(wgs_raw$Sample), wgs_folders), extra_universe$WGS)
+
+wgs <- wgs_raw[as.logical(is_nonsilent) & as.logical(matched) &
+                 !is.na(VAF_TUMOR_fraction) & VAF_TUMOR_fraction >= min_thr,
+               .(Sample, Gene = clean_gene(Hugo_Symbol), Class = Variant_Classification,
+                 VAF = as.numeric(VAF_TUMOR_fraction), Chromosome,
+                 Pos = Start_Position, Ref = Reference_Allele, Alt = Tumor_Seq_Allele2)]
+calls$WGS <- finish_calls(wgs, "WGS")
+rm(wgs_raw, wgs)
+
+# ---- Panel genes ------------------------------------------------
+if (!is.na(panel_file) && file.exists(panel_file)) {
+  pg <- fread(panel_file, header = FALSE, sep = "\t", fill = TRUE)
+  panel_genes <- setdiff(unique(na.omit(clean_gene(pg[[1]]))), c("GENE", "HUGO_SYMBOL", "SYMBOL"))
+  cat("Panel genes read from file:", length(panel_genes), "\n")
+} else {
+  panel_genes <- unique(na.omit(clean_gene(imp_raw$SYMBOL)))
+  warning("panel_file not set: using the ", length(panel_genes),
+          " genes seen in the IMPACT table as the panel.")
+}
+
+cat("\nTumors per modality:\n"); print(sapply(universe, length))
+cat("Tumors sequenced by all three:", length(Reduce(intersect, universe)), "\n")
+
+# Review tumors found in only one modality: near-duplicate IDs (e.g. zero-padding, a
+# missing suffix) would show up here as two similar IDs from different assays.
+single_ids <- natural_sample_order(Filter(function(s) sum(vapply(universe, function(u) s %in% u, logical(1))) == 1,
+                                          unique(unlist(universe))))
+cat("\nTumors found in only one modality (look for pairs that are the same tumor):\n")
+print(data.table(Sample = single_ids,
+                 Only_in = vapply(single_ids, function(s) names(universe)[vapply(universe, function(u) s %in% u, logical(1))], character(1))))
+```
+
+```{r match_rate_check}
+# ============================================================
+# Sanity check of the key: when IMPACT and WES call the same gene in the same
+# tumor, how often is it the same variant? Reported by SNV vs indel, so a
+# problem with indel normalization would show up here.
+# ============================================================
+ss <- intersect(universe$IMPACT, universe$WES)
+for (thr in VAF_THRESHOLDS) {
+  iv <- calls$IMPACT[VAF >= thr & Sample %in% ss & Gene %in% panel_genes]
+  wv <- calls$WES[VAF >= thr & Sample %in% ss & Gene %in% panel_genes]
+  gene_hit <- paste(wv$Sample, wv$Gene)
+  both_gene <- iv[paste(Sample, Gene) %in% gene_hit]
+  both_gene[, same_variant := paste(Sample, Variant_key) %in% paste(wv$Sample, wv$Variant_key)]
+  cat("\nVAF >=", thr * 100, "%: IMPACT variants in genes that WES also calls in that tumor\n")
+  print(both_gene[, .(n = .N, same_variant = sum(same_variant),
+                      pct_same = round(100 * mean(same_variant), 1)), by = Type])
+}
+```
+
+```{r variant_level}
+set_metrics <- function(a, b) {
+  both <- length(intersect(a, b)); uni <- length(union(a, b))
+  data.table(
+    n_A = length(a), n_B = length(b), n_both = both,
+    only_A = length(a) - both, only_B = length(b) - both,
+    Jaccard = if (uni == 0) NA_real_ else round(both / uni, 3),
+    A_found_by_B_pct = if (length(a) == 0) NA_real_ else round(100 * both / length(a), 1),
+    B_confirmed_by_A_pct = if (length(b) == 0) NA_real_ else round(100 * both / length(b), 1)
+  )
+}
+
+pairs <- list(c("IMPACT", "WES"), c("IMPACT", "WGS"), c("WES", "WGS"))
+
+get_v <- function(m, thr, samples) {
+  calls[[m]][VAF >= thr & Sample %in% samples & Gene %in% panel_genes]
+}
+vkeys <- function(dt) unique(paste(dt$Sample, dt$Variant_key, sep = "|"))
+
+all_metrics <- list()
+
+for (thr in VAF_THRESHOLDS) {
+
+  tag <- sprintf("VAFge%dpct", as.integer(round(100 * thr)))
+  lab <- sprintf("VAF >= %d%%", as.integer(round(100 * thr)))
+  cat("\n\n##########", lab, "##########\n")
+
+  # ---- 1. Pairwise variant-level metrics on shared tumors ----
+  for (p in pairs) {
+    A <- p[1]; B <- p[2]
+    shared <- intersect(universe[[A]], universe[[B]])
+    cA <- get_v(A, thr, shared); cB <- get_v(B, thr, shared)
+    all_metrics[[length(all_metrics) + 1]] <-
+      cbind(Threshold = lab, A = A, B = B, Variant_type = "all",
+            Shared_tumors = length(shared), set_metrics(vkeys(cA), vkeys(cB)))
+    for (ty in c("SNV", "indel")) {
+      all_metrics[[length(all_metrics) + 1]] <-
+        cbind(Threshold = lab, A = A, B = B, Variant_type = ty,
+              Shared_tumors = length(shared),
+              set_metrics(vkeys(cA[Type == ty]), vkeys(cB[Type == ty])))
+    }
+  }
+
+  # ---- 2. Status of every IMPACT variant versus WES and WGS ----
+  status_for <- function(m) {
+    ss <- intersect(universe$IMPACT, universe[[m]])
+    iv <- get_v("IMPACT", thr, ss)
+    ov <- get_v(m, thr, ss)
+    iv[, Status := fifelse(paste(Sample, Variant_key) %in% paste(ov$Sample, ov$Variant_key),
+                           "same variant detected",
+                    fifelse(paste(Sample, Gene) %in% paste(ov$Sample, ov$Gene),
+                            "same gene, different variant", "gene not detected"))]
+    iv[, Comparator := m]
+    iv
+  }
+  status_all <- rbindlist(lapply(c("WES", "WGS"), status_for))
+  cat("\nStatus of IMPACT variants in tumors that also have the other assay:\n")
+  print(dcast(status_all[, .N, by = .(Comparator, Status)], Comparator ~ Status, value.var = "N", fill = 0))
+  fwrite(status_all, file.path(out_dir, paste0("IMPACT_variant_status_vs_WES_WGS_", tag, ".tsv")),
+         sep = "\t")
+
+  # ---- 3. Recovery of IMPACT variants by WES according to IMPACT VAF ----
+  ss <- intersect(universe$IMPACT, universe$WES)
+  iv <- get_v("IMPACT", thr, ss); wv <- get_v("WES", thr, ss)
+  brk <- unique(c(thr, 0.05, 0.10, 0.20, 1.01))
+  iv[, VAF_bin := cut(VAF, brk, include.lowest = TRUE, right = FALSE)]
+  iv[, found_by_WES := paste(Sample, Variant_key) %in% paste(wv$Sample, wv$Variant_key)]
+  vb <- iv[, .(IMPACT_variants = .N, found_by_WES = sum(found_by_WES),
+               pct = round(100 * mean(found_by_WES), 1)), by = VAF_bin][order(VAF_bin)]
+  cat("\nRecovery of IMPACT variants by WES, by IMPACT VAF (", length(ss), "tumors):\n")
+  print(vb)
+  fwrite(vb, file.path(out_dir, paste0("WES_recovery_by_IMPACT_VAF_", tag, ".tsv")), sep = "\t")
+
+  # ---- 4. Tumors with all three assays ----
+  S3 <- Reduce(intersect, universe)
+  i3 <- get_v("IMPACT", thr, S3)
+  w3 <- get_v("WES", thr, S3)
+  g3 <- get_v("WGS", thr, S3)
+
+  i3[, `:=`(WES_same = paste(Sample, Variant_key) %in% paste(w3$Sample, w3$Variant_key),
+            WGS_same = paste(Sample, Variant_key) %in% paste(g3$Sample, g3$Variant_key))]
+  cat("\nTumors with all three assays:", length(S3), "\n")
+  cat("IMPACT variants:", nrow(i3),
+      "| also in WES:", sum(i3$WES_same),
+      "| also in WGS:", sum(i3$WGS_same),
+      "| in both:", sum(i3$WES_same & i3$WGS_same),
+      "| IMPACT+WES variants also in WGS:", sum(i3$WES_same & i3$WGS_same),
+      "of", sum(i3$WES_same), "\n")
+  print(i3[WES_same | WGS_same, .(Sample, Gene, Class, Type, IMPACT_VAF = round(VAF, 3), WES_same, WGS_same)][order(Sample, Gene)])
+  fwrite(i3[, .(Sample, Gene, Variant_key, Class, Type, IMPACT_VAF = VAF, WES_same, WGS_same)],
+         file.path(out_dir, paste0("IMPACT_variants_in_4_tumors_", tag, ".tsv")), sep = "\t")
+
+  # ---- 5. UpSet at variant level, tumors with all three assays ----
+  lst <- list(IMPACT = vkeys(i3), WES = vkeys(w3), WGS = vkeys(g3))
+  if (length(S3) >= 1 && sum(lengths(lst)) > 0) {
+    tryCatch({
+      cm <- make_comb_mat(lst)
+      up <- UpSet(cm,
+                  comb_order = order(-comb_size(cm)),
+                  top_annotation = upset_top_annotation(cm, add_numbers = TRUE,
+                                                        gp = gpar(fill = "steelblue", col = NA)),
+                  right_annotation = upset_right_annotation(cm, add_numbers = TRUE,
+                                                            gp = gpar(fill = "grey35", col = NA)),
+                  column_title = paste0("Variant-level calls (hg38), ", length(S3),
+                                        " tumors in all 3 modalities, ", lab))
+      save_plot(file.path(out_dir, paste0("UpSet_variant_level_", tag)),
+                width = 7, height = 4.5, draw_fn = function() draw(up))
+    }, error = function(e) { graphics.off(); message("UpSet failed: ", e$message) })
+  }
+}
+
+metrics_dt <- rbindlist(all_metrics)
+fwrite(metrics_dt, file.path(out_dir, paste0("pairwise_variant_level_metrics.tsv")), sep = "\t")
+print(metrics_dt[Variant_type == "all"])
+```
+
+```{r clinical}
+# ============================================================
+# Clinical annotation (same parsing and colors as the oncoplot script)
+# ============================================================
+parse_percent_value <- function(x) {
+  x <- trimws(as.character(x))
+  x[x %in% c("", "NA", "N/A", "NaN", "nan")] <- NA_character_
+  is_less_than <- grepl("^<", x)
+  val <- suppressWarnings(as.numeric(gsub("[^0-9.]", "", x)))
+  val[is_less_than & !is.na(val)] <- val[is_less_than & !is.na(val)] / 2
+  val
+}
+clean_receptor_status <- function(x) {
+  x <- gsub("\\s+", " ", trimws(as.character(x)))
+  out <- rep("Unknown", length(x))
+  out[grepl("^Positive", x, ignore.case = TRUE)] <- "Positive"
+  out[grepl("^Negative", x, ignore.case = TRUE)] <- "Negative"
+  out[x %in% c("", "NA", "N/A", "NaN", "nan") | is.na(x)] <- "Unknown"
+  out
+}
+clean_grade_status <- function(x) {
+  x <- gsub("\\s+", " ", trimws(as.character(x)))
+  x[x %in% c("", "NA", "N/A", "NaN", "nan") | is.na(x)] <- "Unknown"
+  x
+}
+
+grade_cols <- c(
+  "Grade I" = "#A6CEE3", "Grade II" = "#33A02C", "Grade III" = "#1F78B4",
+  "Cell type not determined" = "#E31A1C", "Unknown" = "#BDBDBD"
+)
+binary_receptor_cols <- c("Negative" = "#1F78B4", "Positive" = "#E31A1C", "Unknown" = "#BDBDBD")
+
+clinical_dt <- fread(clinical_file, sep = ",", header = TRUE, data.table = TRUE,
+                     fill = TRUE, na.strings = c("", "NA", "NaN", "N/A"))
+clinical_dt[, Sample_key := std_id(Sample)]
+clinical_dt[, tumor_cellularity_pct := parse_percent_value(`tumor_cellularity (%)`)]
+clinical_dt[, pleomorphic_component_cellularity_pct := parse_percent_value(
+  `pleomorphic_invasive_compoent_cellularity (%)`)]
+clinical_dt[, TILs_pct := parse_percent_value(`TILs (%)`)]
+clinical_dt[, Grade_clean := clean_grade_status(`Grade/Differentiation-Desc`)]
+clinical_dt[, HER2_status := clean_receptor_status(`BREAST: Her-2/Neu-Desc`)]
+clinical_dt[, ER_status := clean_receptor_status(`Tumor Marker #1 (ER)`)]
+clinical_dt[, PR_status := clean_receptor_status(`Tumor Marker #2 (PR)`)]
+
+clinical_plot_dt <- unique(
+  clinical_dt[, .(Sample_key, tumor_cellularity_pct, pleomorphic_component_cellularity_pct,
+                  TILs_pct, Grade_clean, HER2_status, ER_status, PR_status)],
+  by = "Sample_key"
+)
+ids_any <- unique(unlist(universe))
+cat("Clinical samples:", nrow(clinical_plot_dt), "| tumors matched:",
+    sum(ids_any %in% clinical_plot_dt$Sample_key), "of", length(ids_any), "\n")
+```
+
+```{r variant_level_heatmap}
+# ============================================================
+# Variant-level concordance heatmap: top genes x tumors.
+# Cell colour = which assays detect the SAME variant (the variant detected by the
+# most assays is shown when a gene has several variants in a tumor).
+# Black dot = another assay calls the same gene in that tumor, but a different variant.
+# ============================================================
+combo_palette <- c(
+  "IMPACT" = "#E26A8A", "IMPACT+WES" = "#C58B00", "IMPACT+WES+WGS" = "#7BA000",
+  "IMPACT+WGS" = "#00A86B", "WES" = "#00A9C5", "WES+WGS" = "#7F8FE0",
+  "WGS" = "#D166D1", "None" = "grey92"
+)
+combo_label <- function(m_vec) paste(mods[mods %in% m_vec], collapse = "+")
+
+for (thr in VAF_THRESHOLDS) {
+
+  tag <- sprintf("VAFge%dpct", as.integer(round(100 * thr)))
+  lab <- sprintf("VAF >= %d%%", as.integer(round(100 * thr)))
+
+  # one row per tumor + variant, with the assays that carry it
+  vt <- rbindlist(lapply(mods, function(m) {
+    calls[[m]][VAF >= thr & Gene %in% panel_genes, .(Sample, Gene, Variant_key, Modality = m)]
+  }))
+  vv <- vt[, .(Gene = Gene[1], Mods = list(unique(Modality))), by = .(Sample, Variant_key)]
+  vv[, n_mod := lengths(Mods)]
+  vv[, Combo := vapply(Mods, combo_label, character(1))]
+  vv[, has_impact := vapply(Mods, function(z) "IMPACT" %in% z, logical(1))]
+
+  # assays that call the gene in the tumor (any variant)
+  gm <- vv[, .(All_mods = list(unique(unlist(Mods)))), by = .(Sample, Gene)]
+
+  # best variant per tumor-gene: detected by most assays, IMPACT first on ties
+  setorder(vv, Sample, Gene, -n_mod, -has_impact)
+  best <- vv[, .SD[1], by = .(Sample, Gene)]
+  best <- merge(best, gm, by = c("Sample", "Gene"))
+  best[, Other_variant := lengths(All_mods) > n_mod]
+
+  hm_samples <- if (HEATMAP_TUMORS == "all") {
+    natural_sample_order(unique(unlist(universe)))
+  } else {
+    natural_sample_order(intersect(universe$IMPACT, universe$WES))
+  }
+  b <- best[Sample %in% hm_samples]
+  if (nrow(b) == 0) next
+
+  gene_rank <- b[, .(n = uniqueN(Sample)), by = Gene][order(-n, Gene)]
+  hm_genes  <- head(gene_rank$Gene, TOP_N_HEATMAP)
+
+  mat   <- matrix("None", nrow = length(hm_genes), ncol = length(hm_samples),
+                  dimnames = list(hm_genes, hm_samples))
+  diffm <- matrix(FALSE, nrow = length(hm_genes), ncol = length(hm_samples),
+                  dimnames = list(hm_genes, hm_samples))
+  bb <- b[Gene %in% hm_genes]
+  mat[cbind(bb$Gene, bb$Sample)]   <- bb$Combo
+  diffm[cbind(bb$Gene, bb$Sample)] <- bb$Other_variant
+
+  # ---- Right: tumors per gene by detection class + % altered ----
+  combos <- intersect(names(combo_palette)[names(combo_palette) != "None"], unique(as.vector(mat)))
+  bar_mat <- do.call(cbind, lapply(combos, function(cb) rowSums(mat == cb)))
+  colnames(bar_mat) <- combos
+  rownames(bar_mat) <- rownames(mat)
+  pct_altered <- round(100 * rowSums(mat != "None") / ncol(mat))
+
+  right_ha <- rowAnnotation(
+    `Tumors by detection` = anno_barplot(
+      bar_mat,
+      gp = gpar(fill = combo_palette[colnames(bar_mat)], col = NA),
+      border = FALSE, bar_width = 0.90, axis = TRUE,
+      axis_param = list(gp = gpar(fontsize = 7), side = "bottom")
+    ),
+    `% altered` = anno_text(paste0(pct_altered, "%"), gp = gpar(fontsize = 8),
+                            just = "left", location = 0),
+    width = unit(4.2, "cm"), show_annotation_name = FALSE
+  )
+
+  # ---- Bottom: sequencing strips + clinical annotation ----
+  clin <- merge(data.table(Sample_key = hm_samples), clinical_plot_dt,
+                by = "Sample_key", all.x = TRUE, sort = FALSE)
+  clin <- clin[match(hm_samples, Sample_key)]
+  cat(lab, "- heatmap tumors matched to clinical file:",
+      sum(hm_samples %in% clinical_plot_dt$Sample_key), "of", length(hm_samples), "\n")
+
+  clinical_anno_df <- data.frame(
+    `IMPACT seq.` = ifelse(hm_samples %in% universe$IMPACT, "Sequenced", "Not sequenced"),
+    `WES seq.`    = ifelse(hm_samples %in% universe$WES,    "Sequenced", "Not sequenced"),
+    `WGS seq.`    = ifelse(hm_samples %in% universe$WGS,    "Sequenced", "Not sequenced"),
+    `Tumor cell. (%)` = clin$tumor_cellularity_pct,
+    `Pleomorphic (%)` = clin$pleomorphic_component_cellularity_pct,
+    `TILs (%)` = clin$TILs_pct,
+    Grade = clin$Grade_clean, HER2 = clin$HER2_status,
+    ER = clin$ER_status, PR = clin$PR_status,
+    check.names = FALSE
+  )
+  rownames(clinical_anno_df) <- hm_samples
+
+  extra_grades <- setdiff(unique(na.omit(clinical_anno_df$Grade)), names(grade_cols))
+  grade_cols_local <- grade_cols
+  if (length(extra_grades) > 0) {
+    eg <- hcl.colors(length(extra_grades), palette = "Dark 3"); names(eg) <- extra_grades
+    grade_cols_local <- c(grade_cols_local, eg)
+  }
+  seq_cols <- c("Sequenced" = "black", "Not sequenced" = "grey85")
+
+  ha <- HeatmapAnnotation(
+    df = clinical_anno_df,
+    col = list(
+      `IMPACT seq.` = seq_cols, `WES seq.` = seq_cols, `WGS seq.` = seq_cols,
+      `Tumor cell. (%)` = colorRamp2(c(0, 50, 100), c("#F7FBFF", "#6BAED6", "#08306B")),
+      `Pleomorphic (%)` = colorRamp2(c(0, 50, 100), c("#F7FCF5", "#74C476", "#00441B")),
+      `TILs (%)` = colorRamp2(c(0, 30, 100), c("#FFF5F0", "#FB6A4A", "#67000D")),
+      Grade = grade_cols_local, HER2 = binary_receptor_cols,
+      ER = binary_receptor_cols, PR = binary_receptor_cols
+    ),
+    na_col = "grey90", which = "column",
+    annotation_name_side = "left", annotation_name_rot = 0,
+    annotation_name_gp = gpar(fontsize = 8),
+    simple_anno_size = unit(0.30, "cm"), gap = unit(1.1, "mm")
+  )
+
+  dot_lgd <- Legend(
+    title = "Gene-level only", labels = "Another assay: same gene, different variant",
+    type = "points", pch = 16, size = unit(1.5, "mm"),
+    legend_gp = gpar(col = "black")
+  )
+
+  ht <- Heatmap(
+    mat, name = "Same variant detected by", col = combo_palette[names(combo_palette) %in% unique(c(as.vector(mat), "None"))],
+    cluster_rows = FALSE, cluster_columns = FALSE,
+    row_names_side = "left", show_column_names = TRUE,
+    column_names_gp = gpar(fontsize = 7), row_names_gp = gpar(fontsize = 8),
+    rect_gp = gpar(col = "white", lwd = 0.5),
+    width = unit(max(60, 4 * ncol(mat)), "mm"),
+    height = unit(max(40, 4 * nrow(mat)), "mm"),
+    bottom_annotation = ha, right_annotation = right_ha,
+    column_title = paste0("Top ", length(hm_genes), " genes | variant level (hg38) | ", ncol(mat),
+                          if (HEATMAP_TUMORS == "all") " tumors (all, >= 1 modality) | " else " tumors with IMPACT + WES | ",
+                          lab),
+    column_title_gp = gpar(fontsize = 11, fontface = "bold"),
+    layer_fun = function(j, i, x, y, w, h, fill) {
+      v <- pindex(diffm, i, j)
+      if (any(v)) grid.points(x[v], y[v], pch = 16, size = unit(1.3, "mm"), gp = gpar(col = "black"))
+    }
+  )
+
+  save_plot(
+    file.path(out_dir, paste0("Concordance_heatmap_top", TOP_N_HEATMAP, "_variant_level_", tag)),
+    width  = max(13, 4 * ncol(mat) / 25.4 + 10),
+    height = max(8, 4 * nrow(mat) / 25.4 + 6),
+    draw_fn = function() draw(ht, heatmap_legend_list = list(dot_lgd), merge_legends = FALSE,
+                              padding = unit(c(4, 28, 6, 4), "mm"))
+  )
+
+  fwrite(b[, .(Sample, Gene, Variant_key, Combo, Other_variant_other_assay = Other_variant)],
+         file.path(out_dir, paste0("variant_level_cell_table_", tag, ".tsv")), sep = "\t")
+}
+```
+
+```{r finish}
+writeLines(capture.output(sessionInfo()),
+           file.path(out_dir, paste0("sessionInfo_variant_level.txt")))
+cat("All done. Outputs are in:\n", out_dir, "\n")
+```
+
+# How to read the results
+
+- **Key check chunk:** if IMPACT and WES call the same gene in a tumor, most should be the same variant. A high percentage for SNVs and a low one for indels would point to an indel-representation problem, not a biological difference.
+- **Status table:** "same variant", "same gene, different variant" and "gene not detected" separate true agreement from agreement only at gene level.
+- **Recovery by IMPACT VAF:** if recovery by WES rises with IMPACT VAF, the IMPACT-only calls are mainly low-VAF calls.

@@ -1,0 +1,226 @@
+---
+title: "pILC_IMPACT_Oncoplot"
+output: html_document
+date: "2026-03-08"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+############################################
+## Oncoplot from IMPACT using OncoVar genes
+############################################
+library(dplyr)
+library(data.table)
+library(stringr)
+library(maftools)
+```
+
+
+```{r}
+impact <- read.delim(
+  "/ix1/alee/LO_LAB/Personal/Rahul/pILC/MSK_IMPACT/pILC_IMPACT_filtered.tsv",
+  header = TRUE,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+unique(impact$Variant_Classification)
+```
+
+
+```{r}
+
+# ========= Input file =========
+input_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/MSK_IMPACT/pILC_IMPACT_filtered.tsv"
+
+# ========= Read IMPACT TSV =========
+impact <- read.delim(
+  input_file,
+  header = TRUE,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+# ========= Merge Splice_Region into Splice_Site =========
+impact <- impact %>%
+  mutate(
+    Variant_Classification = ifelse(
+      Variant_Classification == "Splice_Region",
+      "Splice_Site",
+      Variant_Classification
+    )
+  )
+
+# ========= Define non-synonymous classes =========
+nonsyn_classes <- c(
+  "Missense_Mutation",
+  "Nonsense_Mutation",
+  "Frame_Shift_Del",
+  "Frame_Shift_Ins",
+  "In_Frame_Del",
+  "In_Frame_Ins",
+  "Splice_Site",
+  "Translation_Start_Site"
+)
+
+# ========= Filter to non-synonymous only =========
+impact_filt <- impact %>%
+  filter(Variant_Classification %in% nonsyn_classes)
+```
+
+
+```{r}
+# ===============================
+# Load and merge OncoVar annotations
+# ===============================
+tcga_df <- fread("/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Reference/TCGA.BRCA.onco.genes.OncoVar.tsv") %>%
+  mutate(Source = "TCGA")
+
+icgc_df <- fread("/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Reference/ICGC.BRCA.onco.genes.OncoVar.tsv") %>%
+  mutate(Source = "ICGC")
+
+combined_df <- bind_rows(tcga_df, icgc_df)
+
+gene_roles <- combined_df %>%
+  group_by(Gene_symbol) %>%
+  summarise(
+    is_oncogene = any(
+      str_detect(
+        paste(OncoKB, OncoVar, `2020Rule`, CTAT, HCD, Intogen, Oncogene),
+        regex("oncogene", ignore_case = TRUE)
+      ),
+      na.rm = TRUE
+    ),
+    is_tsg = any(
+      str_detect(
+        paste(OncoKB, OncoVar, `2020Rule`, CTAT, HCD, Intogen, TSgene),
+        regex("tsg", ignore_case = TRUE)
+      ),
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    cancer_role = case_when(
+      is_oncogene & !is_tsg ~ "Oncogene",
+      is_tsg & !is_oncogene ~ "TSG",
+      is_tsg & is_oncogene  ~ "Dual",
+      TRUE ~ "Other"
+    )
+  )
+
+metadata_cols <- c(
+  "Gene_symbol", "Gene_biotype", "OncoKB", "OncoVar", "MutPanning",
+  "2020Rule", "CTAT", "HCD", "Intogen", "Oncogene", "TSgene"
+)
+
+gene_metadata_full <- combined_df %>%
+  arrange(Gene_symbol, desc(Source)) %>%
+  distinct(Gene_symbol, .keep_all = TRUE) %>%
+  select(all_of(metadata_cols))
+
+cgc_df <- left_join(gene_roles, gene_metadata_full, by = "Gene_symbol") %>%
+  rename(OverlapGenes = Gene_symbol)
+
+cgc_genes <- unique(cgc_df$OverlapGenes)
+```
+
+
+```{r}
+# ========= Build MAF-like data.frame =========
+maf_df <- impact_filt %>%
+  mutate(
+    Variant_Type = case_when(
+      nchar(REF) == 1 & nchar(ALT) == 1 ~ "SNP",
+      nchar(REF) == 1 & nchar(ALT) > 1 ~ "INS",
+      nchar(REF) > 1 & nchar(ALT) == 1 ~ "DEL",
+      TRUE ~ "ONP"
+    ),
+    t_alt_count = round(TUMOR_DP * TUMOR_MAF),
+    t_ref_count = pmax(TUMOR_DP - t_alt_count, 0),
+    n_alt_count = round(NORMAL_DP * NORMAL_MAF),
+    n_ref_count = pmax(NORMAL_DP - n_alt_count, 0)
+  ) %>%
+  transmute(
+    Hugo_Symbol = SYMBOL,
+    Chromosome = CHROM,
+    Start_Position = POS,
+    End_Position = POS,
+    Reference_Allele = REF,
+    Tumor_Seq_Allele1 = REF,
+    Tumor_Seq_Allele2 = ALT,
+    Variant_Classification = Variant_Classification,
+    Variant_Type = Variant_Type,
+    Tumor_Sample_Barcode = TUMOR_SAMPLE,
+    Matched_Norm_Sample_Barcode = NORMAL_SAMPLE,
+    t_depth = TUMOR_DP,
+    n_depth = NORMAL_DP,
+    t_ref_count = t_ref_count,
+    t_alt_count = t_alt_count,
+    n_ref_count = n_ref_count,
+    n_alt_count = n_alt_count,
+    TUMOR_MAF = TUMOR_MAF,
+    NORMAL_MAF = NORMAL_MAF,
+    AF = AF,
+    ExAC_AF = ExAC_AF,
+    LOH = LOH,
+    HOTSPOT = HOTSPOT,
+    variantCaller = variantCaller,
+    HGVSp_Short = HGVSp_Short,
+    ID = ID
+  )
+
+# ========= Keep only OncoVar genes =========
+maf_df_oncovar <- maf_df %>%
+  filter(Hugo_Symbol %in% cgc_genes)
+
+cat("Total mutations in MAF:", nrow(maf_df), "\n")
+cat("Mutations in OncoVar genes:", nrow(maf_df_oncovar), "\n")
+cat("Unique OncoVar genes mutated:", length(unique(maf_df_oncovar$Hugo_Symbol)), "\n")
+```
+
+
+```{r}
+# ========= Create MAF object =========
+impact_maf_oncovar <- read.maf(maf = maf_df_oncovar)
+
+# ========= Order genes by mutation frequency =========
+gene_order <- getGeneSummary(impact_maf_oncovar) %>%
+  dplyr::arrange(desc(MutatedSamples), desc(total)) %>%
+  dplyr::pull(Hugo_Symbol)
+
+print(getSampleSummary(impact_maf_oncovar)[1:5, ])
+print(getGeneSummary(impact_maf_oncovar)[1:10, ])
+
+# ========= Plot =========
+oncoplot(
+  maf = impact_maf_oncovar,
+  genes = gene_order,
+  sortByAnnotation = TRUE,
+  removeNonMutated = TRUE
+)
+```
+
+
+```{r}
+# ========= Save as PDF =========
+pdf("Oncoplot_IMPACT_OncoVar_genes.pdf", width = 12, height = 7, bg = "white")
+oncoplot(
+  maf = impact_maf_oncovar,
+  genes = gene_order,
+  sortByAnnotation = TRUE,
+  removeNonMutated = TRUE
+)
+dev.off()
+
+# ========= Save as PNG =========
+png("Oncoplot_IMPACT_OncoVar_genes.png", width = 3000, height = 1800, res = 300, bg = "white")
+oncoplot(
+  maf = impact_maf_oncovar,
+  genes = gene_order,
+  sortByAnnotation = TRUE,
+  removeNonMutated = TRUE
+)
+dev.off()
+```
+

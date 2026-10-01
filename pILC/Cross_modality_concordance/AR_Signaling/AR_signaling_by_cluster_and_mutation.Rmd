@@ -1,0 +1,434 @@
+---
+title: "AR signaling by RNA-seq cluster and AR mutation status (pILC)"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    theme: readable
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(grid)
+})
+
+set.seed(42)
+graphics.off()
+```
+
+# Questions
+
+1. Does cluster 3 have higher AR signaling than clusters 1 and 2?
+2. Do AR-mutated tumors have higher AR signaling than wild-type tumors, also after adjusting for cluster?
+
+AR signaling score = mean z-score (across tumors) of a set of AR target genes, AR itself excluded.
+
+```{r paths_and_parameters}
+vst_file     <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/NMF/vst_transformed_data.csv"
+
+# k = 3 consensus clustering (GCT, column 'membership.ordered'). Adjust if it is stored elsewhere.
+cluster_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/NMF/GenePattern_NMFConsensus/vst_transformed_data.consensus.k.3.gct"
+
+impact_file  <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/MSK_IMPACT/pILC_IMPACT_filtered.tsv"
+
+# Optional: MSigDB .gmt file (e.g. h.all.v*.Hs.symbols.gmt) and the set name to use.
+# If NA, the built-in AR target list below is used.
+gmt_file     <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/GSEA/Dataset/h.all.v2025.1.Hs.symbols.gmt"
+gmt_set_name <- "HALLMARK_ANDROGEN_RESPONSE"
+
+out_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/Cross_modality_concordance/AR_Signaling"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+MIN_SET_GENES <- 10   # minimum number of AR target genes found in the VST matrix
+
+# Built-in AR target genes (AR itself excluded)
+builtin_ar_targets <- c(
+  "KLK3", "KLK2", "TMPRSS2", "NKX3-1", "FKBP5", "STEAP2", "PMEPA1", "ZBTB16", "SGK1",
+  "ABCC4", "ACSL3", "ALDH1A3", "NDRG1", "SLC45A3", "TPD52", "UAP1", "ELL2", "MAF",
+  "CAMKK2", "SPDEF", "ZMIZ1", "TSC22D1", "PDLIM5", "INPP4B", "HPGD", "AKAP12"
+)
+
+cluster_cols <- c("1" = "#4C78A8", "2" = "#F58518", "3" = "#54A24B")
+status_cols  <- c("Mutated" = "#D62728", "Wild-type" = "#9AA5B1", "No IMPACT" = "white")
+
+stopifnot(file.exists(vst_file), file.exists(impact_file))
+if (!file.exists(cluster_file)) stop("Cluster file not found: ", cluster_file, "\nSet cluster_file to its location.")
+```
+
+```{r helpers}
+# One ID format for every file: TP09-09T, TP09.9_S34, TP09-9  ->  TP09-9
+std_id <- function(x) {
+  x <- toupper(trimws(as.character(x)))
+  x <- sub("^X(?=TP)", "", x, perl = TRUE)   # R adds X to names that start with a letter-digit mix
+  x <- sub("_S[0-9]+$", "", x)       # RNA-seq library suffix
+  x <- gsub("\\.", "-", x)           # TP05.791 -> TP05-791
+  x <- sub("^JC287-", "", x)
+  x <- sub("(_T|-T)$", "", x)
+  x <- sub("(?<=[0-9])T$", "", x, perl = TRUE)
+  sub("-0+(?=[0-9])", "-", x, perl = TRUE)   # TP09-09 -> TP09-9
+}
+
+save_plot <- function(file_base, width, height, draw_fn, res = 300) {
+  pdf(paste0(file_base, ".pdf"), width = width, height = height)
+  draw_fn(); dev.off()
+  png(paste0(file_base, ".png"), width = width, height = height, units = "in", res = res)
+  draw_fn(); dev.off()
+  cat("Saved:", paste0(file_base, c(".pdf", ".png")), sep = "\n  "); cat("\n")
+}
+```
+
+```{r read_expression}
+# ============================================================
+# VST matrix: genes x tumors (or tumors x genes; detected automatically)
+# ============================================================
+x <- fread(vst_file)
+cat("VST file:", nrow(x), "rows x", ncol(x), "columns\n")
+cat("First columns:", paste(head(names(x), 6), collapse = " | "), "\n")
+
+sample_like <- function(v) mean(grepl("^X?TP[0-9]+[.-]", toupper(as.character(v)))) > 0.5
+
+if (sample_like(names(x)[-1])) {            # genes in rows
+  genes <- as.character(x[[1]])
+  mat <- as.matrix(x[, -1])
+  rownames(mat) <- genes
+} else if (sample_like(x[[1]])) {           # tumors in rows
+  smp <- as.character(x[[1]])
+  mat <- t(as.matrix(x[, -1]))
+  colnames(mat) <- smp
+} else {
+  stop("Could not tell which axis holds the tumors. Please paste head(names(x)) and head(x[[1]]).")
+}
+storage.mode(mat) <- "numeric"
+
+# Gene identifiers -> symbols
+ids <- sub("\\..*$", "", rownames(mat))
+if (mean(grepl("^ENSG", ids)) > 0.5) {
+  if (!requireNamespace("org.Hs.eg.db", quietly = TRUE)) {
+    stop("Genes are Ensembl IDs but org.Hs.eg.db is not installed. ",
+         "Install it (BiocManager::install('org.Hs.eg.db')) or provide a symbol-annotated matrix.")
+  }
+  sym <- AnnotationDbi::mapIds(org.Hs.eg.db::org.Hs.eg.db, keys = ids, column = "SYMBOL",
+                               keytype = "ENSEMBL", multiVals = "first")
+  rownames(mat) <- ifelse(is.na(sym), ids, sym)
+} else {
+  rownames(mat) <- toupper(rownames(mat))
+}
+
+# Several rows per symbol: average
+d <- as.data.table(mat, keep.rownames = "Gene")
+d <- d[, lapply(.SD, mean, na.rm = TRUE), by = Gene]
+mat <- as.matrix(d[, -1]); rownames(mat) <- d$Gene
+
+colnames(mat) <- std_id(colnames(mat))
+stopifnot(!anyDuplicated(colnames(mat)))
+cat("Tumors in VST matrix:", ncol(mat), "| genes:", nrow(mat), "\n")
+cat("AR present:", "AR" %in% rownames(mat), "\n")
+```
+
+```{r clusters_and_mutation}
+# ============================================================
+# Cluster membership (k = 3)
+# ============================================================
+cl <- fread(cluster_file, skip = 2)
+cl_col <- grep("membership", names(cl), value = TRUE)[1]
+cl <- cl[, .(Tumor = std_id(Name), Cluster = as.character(get(cl_col)))]
+cat("Cluster sizes:\n"); print(table(cl$Cluster))
+
+tumors <- intersect(colnames(mat), cl$Tumor)
+cat("Tumors with expression and cluster:", length(tumors), "of", ncol(mat), "\n")
+if (length(setdiff(colnames(mat), cl$Tumor))) {
+  cat("In VST but not in cluster file:", paste(setdiff(colnames(mat), cl$Tumor), collapse = ", "), "\n")
+}
+
+# ============================================================
+# AR mutation status from IMPACT
+# ============================================================
+imp <- fread(impact_file, sep = "\t", na.strings = c("", "NA"))
+imp[, Tumor := std_id(TUMOR_SAMPLE)]
+impact_tumors <- unique(imp$Tumor)
+
+ar <- imp[SYMBOL == "AR", .(AR_variants = paste(HGVSp_Short, collapse = "; "),
+                            AR_type = if (any(Variant_Classification == "Missense_Mutation")) "Missense"
+                                      else "In-frame indel"), by = Tumor]
+
+meta <- data.table(Tumor = tumors)
+meta <- merge(meta, cl, by = "Tumor", all.x = TRUE)
+meta <- merge(meta, ar, by = "Tumor", all.x = TRUE)
+meta[, AR_status := fifelse(!is.na(AR_variants), "Mutated",
+                    fifelse(Tumor %in% impact_tumors, "Wild-type", "No IMPACT"))]
+meta[is.na(AR_type), AR_type := "None"]
+
+cat("\nAR status of the tumors with expression:\n"); print(meta[, .N, by = AR_status])
+cat("AR-mutated tumors without RNA-seq:",
+    paste(setdiff(ar$Tumor, tumors), collapse = ", "), "\n")
+```
+
+```{r ar_score}
+# ============================================================
+# AR target gene set and score
+# ============================================================
+if (!is.na(gmt_file) && file.exists(gmt_file)) {
+  lines <- strsplit(readLines(gmt_file), "\t")
+  hit <- which(vapply(lines, `[`, "", 1) == gmt_set_name)
+  if (length(hit) != 1) stop("Gene set '", gmt_set_name, "' not found exactly once in ", gmt_file)
+  gs <- lines[[hit]]
+  ar_targets <- toupper(gs[-(1:2)])
+  set_label <- gmt_set_name
+} else {
+  ar_targets <- builtin_ar_targets
+  set_label <- "built-in AR target list"
+}
+ar_targets <- setdiff(ar_targets, "AR")
+present <- intersect(ar_targets, rownames(mat))
+cat("AR target set:", set_label, "| genes in set:", length(ar_targets),
+    "| found in VST:", length(present), "\n")
+cat("Missing:", paste(setdiff(ar_targets, present), collapse = ", "), "\n")
+if (length(present) < MIN_SET_GENES) stop("Fewer than ", MIN_SET_GENES, " AR target genes found.")
+
+z <- t(scale(t(mat[present, tumors, drop = FALSE])))   # z-score each gene across tumors
+meta[, AR_score := colMeans(z, na.rm = TRUE)[Tumor]]
+meta[, AR_expr  := mat["AR", Tumor]]
+meta[, Cluster  := factor(Cluster, levels = c("1", "2", "3"))]
+
+fwrite(meta, file.path(out_dir, paste0("AR_score_per_tumor.tsv")), sep = "\t")
+fwrite(data.table(Gene = present, Set = set_label),
+       file.path(out_dir, paste0("AR_gene_set_used.tsv")), sep = "\t")
+print(meta[order(Cluster, -AR_score), .(Tumor, Cluster, AR_status, AR_variants, round(AR_score, 2), round(AR_expr, 2))])
+```
+
+```{r waterfall}
+# ============================================================
+# Figure 0: waterfall plot of AR expression across all tumors with RNA-seq.
+# Bars = AR expression (VST) relative to the cohort median, ranked high to low,
+# coloured by cluster. Strips below: cluster, IMPACT AR status and AR variant type.
+# The row under the strips shows the AR signaling score (mean z of AR target genes).
+# ============================================================
+ord <- meta[order(-AR_expr), Tumor]
+mm  <- meta[match(ord, Tumor)]
+med <- median(mm$AR_expr)
+dev <- mm$AR_expr - med
+
+wf_tab <- data.table(Rank = seq_len(nrow(mm)), Tumor = mm$Tumor, Cluster = mm$Cluster,
+                     AR_expr_VST = round(mm$AR_expr, 3), Diff_from_median = round(dev, 3),
+                     AR_score = round(mm$AR_score, 3), IMPACT_AR_status = mm$AR_status,
+                     AR_variants = mm$AR_variants)
+fwrite(wf_tab, file.path(out_dir, paste0("AR_waterfall_table.tsv")), sep = "\t")
+print(wf_tab)
+
+top_ha <- HeatmapAnnotation(
+  `AR expr. vs median (VST)` = anno_barplot(
+    dev, gp = gpar(fill = cluster_cols[as.character(mm$Cluster)], col = NA),
+    baseline = 0, bar_width = 0.85, height = unit(4.5, "cm"),
+    axis_param = list(gp = gpar(fontsize = 8))
+  ),
+  Cluster = as.character(mm$Cluster),
+  `IMPACT AR status` = as.character(mm$AR_status),
+  `IMPACT AR variant` = mm$AR_type,
+  col = list(
+    Cluster = cluster_cols,
+    `IMPACT AR status` = status_cols,
+    `IMPACT AR variant` = c("None" = "white", "In-frame indel" = "#2CA02C", "Missense" = "#1F77B4")
+  ),
+  border = TRUE, simple_anno_size = unit(0.4, "cm"), gap = unit(1.2, "mm"),
+  annotation_name_side = "left", annotation_name_gp = gpar(fontsize = 8)
+)
+
+score_mat <- matrix(mm$AR_score, nrow = 1, dimnames = list("AR signaling score", mm$Tumor))
+rng <- max(abs(score_mat), na.rm = TRUE)
+
+ht_wf <- Heatmap(
+  score_mat, name = "AR signaling\nscore (mean z)",
+  col = colorRamp2(c(-rng, 0, rng), c("#2166AC", "white", "#B2182B")),
+  cluster_rows = FALSE, cluster_columns = FALSE,
+  show_row_names = TRUE, row_names_side = "left", row_names_gp = gpar(fontsize = 8),
+  show_column_names = TRUE, column_names_gp = gpar(fontsize = 7),
+  rect_gp = gpar(col = "white", lwd = 0.5),
+  width = unit(max(90, 4.2 * ncol(score_mat)), "mm"), height = unit(0.5, "cm"),
+  top_annotation = top_ha,
+  column_title = paste0("AR expression across ", ncol(score_mat), " tumors with RNA-seq (ranked high to low)"),
+  column_title_gp = gpar(fontsize = 11, fontface = "bold")
+)
+
+save_plot(file.path(out_dir, paste0("AR_waterfall")), width = 11, height = 6.5,
+          draw_fn = function() draw(ht_wf, padding = unit(c(4, 4, 4, 8), "mm")))
+```
+
+```{r statistics}
+# ============================================================
+# Tests (exploratory; small groups, non-parametric)
+# ============================================================
+res <- list()
+add <- function(...) res[[length(res) + 1]] <<- data.table(...)
+
+for (v in c("AR_score", "AR_expr")) {
+  lab <- if (v == "AR_score") "AR signaling score" else "AR expression (VST)"
+  y <- meta[[v]]
+
+  kw <- kruskal.test(y ~ meta$Cluster)
+  add(Variable = lab, Test = "Kruskal-Wallis across clusters", Group = "1 vs 2 vs 3",
+      n = length(y), Statistic = unname(kw$statistic), p = kw$p.value)
+
+  pw <- pairwise.wilcox.test(y, meta$Cluster, p.adjust.method = "BH", exact = FALSE)
+  for (a in rownames(pw$p.value)) for (b in colnames(pw$p.value)) {
+    if (!is.na(pw$p.value[a, b])) {
+      add(Variable = lab, Test = "Pairwise Wilcoxon (BH-adjusted)", Group = paste(b, "vs", a),
+          n = sum(meta$Cluster %in% c(a, b)), Statistic = NA_real_, p = pw$p.value[a, b])
+    }
+  }
+
+  w3 <- wilcox.test(y[meta$Cluster == "3"], y[meta$Cluster != "3"], exact = FALSE)
+  add(Variable = lab, Test = "Wilcoxon", Group = "cluster 3 vs clusters 1+2",
+      n = length(y), Statistic = unname(w3$statistic), p = w3$p.value)
+
+  tested <- meta[AR_status %in% c("Mutated", "Wild-type")]
+  wm <- wilcox.test(tested[[v]][tested$AR_status == "Mutated"],
+                    tested[[v]][tested$AR_status == "Wild-type"], exact = FALSE)
+  add(Variable = lab, Test = "Wilcoxon", Group = "AR-mutated vs wild-type",
+      n = nrow(tested), Statistic = unname(wm$statistic), p = wm$p.value)
+
+  fit <- lm(tested[[v]] ~ tested$Cluster + I(tested$AR_status == "Mutated"))
+  cf <- summary(fit)$coefficients
+  add(Variable = lab, Test = "Linear model: AR mutation, adjusted for cluster",
+      Group = "AR-mutated vs wild-type", n = nrow(tested),
+      Statistic = cf[nrow(cf), "Estimate"], p = cf[nrow(cf), "Pr(>|t|)"])
+}
+stats_dt <- rbindlist(res)
+stats_dt[, p := signif(p, 3)]
+fwrite(stats_dt, file.path(out_dir, paste0("AR_signaling_statistics.tsv")), sep = "\t")
+print(stats_dt)
+
+cat("\nMedian AR signaling score per cluster:\n")
+print(meta[, .(n = .N, median_score = round(median(AR_score), 2), median_AR_expr = round(median(AR_expr), 2)), by = Cluster][order(Cluster)])
+```
+
+```{r boxplots}
+# ============================================================
+# Figure 1: AR score and AR expression by cluster, Nature-style statistics.
+# Exact P values (no stars), brackets for the pairwise tests (Wilcoxon, BH-adjusted),
+# overall Kruskal-Wallis P in each panel, n per cluster on the x axis.
+# ============================================================
+long <- melt(meta, id.vars = c("Tumor", "Cluster", "AR_status"),
+             measure.vars = c("AR_score", "AR_expr"), variable.name = "Measure", value.name = "Value")
+meas_levels <- c("AR signaling score (mean z)", "AR expression (VST)")
+long[, Measure := factor(Measure, c("AR_score", "AR_expr"), meas_levels)]
+long[, AR_status := factor(AR_status, c("Mutated", "Wild-type", "No IMPACT"))]
+
+p_expr <- function(p) if (p < 0.001) "italic(P) < 0.001" else paste0("italic(P) == ", sprintf("%.3f", p))
+
+var_map <- c("AR signaling score" = meas_levels[1], "AR expression (VST)" = meas_levels[2])
+
+# pairwise brackets from the statistics table (BH-adjusted P)
+pw <- stats_dt[Test == "Pairwise Wilcoxon (BH-adjusted)"]
+pw[, `:=`(g1 = as.integer(sub(" vs .*", "", Group)), g2 = as.integer(sub(".* vs ", "", Group)),
+          Measure = factor(var_map[Variable], meas_levels))]
+pw[, level := fifelse(g2 - g1 == 1L, 1L, 2L)]
+
+rng <- long[, .(lo = min(Value), hi = max(Value)), by = Measure][, span := hi - lo]
+pw <- merge(pw, rng, by = "Measure")
+pw[, y := hi + span * (0.05 + 0.11 * (level - 1))]
+pw[, tick := span * 0.025]
+pw[, label := vapply(p, p_expr, character(1))]
+
+kw <- stats_dt[Test == "Kruskal-Wallis across clusters"]
+kw[, Measure := factor(var_map[Variable], meas_levels)]
+kw <- merge(kw, rng, by = "Measure")
+kw[, `:=`(y = hi + span * 0.40, label = paste0("'Kruskal-Wallis'~", vapply(p, p_expr, character(1))))]
+
+# make room above the brackets in each panel
+blank <- rbind(rng[, .(Measure, y = lo - span * 0.03)], kw[, .(Measure, y = y + span * 0.06)])
+
+n_per <- table(meta$Cluster)
+xlab_fn <- function(x) paste0(x, "\n(n = ", n_per[x], ")")
+
+mut_p <- stats_dt[Test == "Wilcoxon" & Group == "AR-mutated vs wild-type"]
+cap <- paste0(
+  "Boxes: median and interquartile range; whiskers: 1.5 x IQR. Pairwise two-sided Wilcoxon rank-sum tests, ",
+  "Benjamini-Hochberg adjusted. Triangles: AR-mutated tumors; open circles: no IMPACT data. ",
+  "AR-mutated vs wild-type (n = ", mut_p$n[1], "): score P = ", sprintf("%.2f", mut_p[Variable == "AR signaling score"]$p),
+  ", AR expression P = ", sprintf("%.3f", mut_p[Variable == "AR expression (VST)"]$p), " (Wilcoxon, unadjusted)."
+)
+cap <- paste(strwrap(cap, 118), collapse = "\n")
+
+p <- ggplot(long, aes(Cluster, Value)) +
+  geom_boxplot(aes(fill = Cluster), alpha = 0.35, outlier.shape = NA, width = 0.55,
+               colour = "grey25", linewidth = 0.35) +
+  geom_point(aes(colour = AR_status, shape = AR_status), size = 1.9,
+             position = position_jitter(width = 0.12, height = 0, seed = 42)) +
+  geom_segment(data = pw, aes(x = g1, xend = g2, y = y, yend = y), inherit.aes = FALSE, linewidth = 0.3) +
+  geom_segment(data = pw, aes(x = g1, xend = g1, y = y, yend = y - tick), inherit.aes = FALSE, linewidth = 0.3) +
+  geom_segment(data = pw, aes(x = g2, xend = g2, y = y, yend = y - tick), inherit.aes = FALSE, linewidth = 0.3) +
+  geom_text(data = pw, aes(x = (g1 + g2) / 2, y = y, label = label), inherit.aes = FALSE,
+            parse = TRUE, vjust = -0.35, size = 2.5) +
+  geom_text(data = kw, aes(x = 0.45, y = y, label = label), inherit.aes = FALSE,
+            parse = TRUE, hjust = 0, size = 2.5) +
+  geom_blank(data = blank, aes(y = y), inherit.aes = FALSE) +
+  scale_x_discrete(labels = xlab_fn) +
+  scale_fill_manual(values = cluster_cols, guide = "none") +
+  scale_colour_manual(values = c("Mutated" = "#D62728", "Wild-type" = "#52606D", "No IMPACT" = "#9AA5B1"), name = NULL) +
+  scale_shape_manual(values = c("Mutated" = 17, "Wild-type" = 16, "No IMPACT" = 1), name = NULL) +
+  facet_wrap(~Measure, scales = "free_y") +
+  labs(x = "RNA-seq cluster (k = 3)", y = NULL, caption = cap) +
+  theme_classic(base_size = 8, base_family = "Helvetica") +
+  theme(strip.background = element_blank(), strip.text = element_text(face = "bold", size = 8),
+        axis.line = element_line(linewidth = 0.35), axis.ticks = element_line(linewidth = 0.35),
+        legend.position = "bottom", legend.key.size = unit(3, "mm"),
+        plot.caption = element_text(hjust = 0, size = 6, colour = "grey30"),
+        plot.margin = margin(4, 6, 4, 4))
+
+# Nature double-column width: 183 mm = 7.2 in
+save_plot(file.path(out_dir, "AR_signaling_boxplots"), width = 7.2, height = 3.9,
+          draw_fn = function() print(p))
+```
+
+```{r heatmap}
+# ============================================================
+# Figure 2: AR target genes by cluster, with AR status
+# ============================================================
+ord <- meta[order(Cluster, -AR_score), Tumor]
+zz  <- z[, ord, drop = FALSE]
+mm  <- meta[match(ord, Tumor)]
+
+ha <- HeatmapAnnotation(
+  `AR score` = anno_barplot(mm$AR_score, gp = gpar(fill = "grey45", col = NA), height = unit(1.6, "cm")),
+  `AR expr (VST)` = anno_barplot(mm$AR_expr, gp = gpar(fill = "grey70", col = NA), height = unit(1.6, "cm")),
+  Cluster = as.character(mm$Cluster),
+  `AR status` = mm$AR_status,
+  `AR variant` = mm$AR_type,
+  col = list(Cluster = cluster_cols, `AR status` = status_cols,
+             `AR variant` = c("None" = "white", "In-frame indel" = "#2CA02C", "Missense" = "#1F77B4")),
+  annotation_name_side = "left", annotation_name_gp = gpar(fontsize = 8),
+  simple_anno_size = unit(0.35, "cm"), gap = unit(1.2, "mm"),
+  border = TRUE
+)
+
+ht <- Heatmap(
+  zz, name = "z-score", col = colorRamp2(c(-2, 0, 2), c("#2166AC", "white", "#B2182B")),
+  cluster_columns = FALSE, cluster_rows = TRUE, show_row_dend = FALSE,
+  column_split = factor(mm$Cluster, levels = c("1", "2", "3")), column_gap = unit(2, "mm"),
+  column_title = paste0("Cluster ", c("1", "2", "3")),
+  top_annotation = ha, row_names_gp = gpar(fontsize = 8), column_names_gp = gpar(fontsize = 7),
+  rect_gp = gpar(col = "white", lwd = 0.4),
+  width = unit(max(80, 4.2 * ncol(zz)), "mm"), height = unit(max(50, 4 * nrow(zz)), "mm")
+)
+
+save_plot(file.path(out_dir, paste0("AR_target_heatmap_by_cluster")),
+          width = 11, height = 7.5, draw_fn = function() draw(ht, padding = unit(c(4, 4, 4, 8), "mm")))
+```
+
+```{r finish}
+writeLines(capture.output(sessionInfo()), file.path(out_dir, paste0("sessionInfo_AR_signaling.txt")))
+cat("All done. Outputs are in:\n", out_dir, "\n")
+```
+
+# How to read the results
+
+- **Is cluster 3 high in AR signaling?** Compare the median score per cluster and the Kruskal-Wallis and pairwise tests. A clearly higher score in cluster 3 supports the label; if it is not higher, the label needs another source.
+- **Do AR mutations change the score?** See "AR-mutated vs wild-type" and the model adjusted for cluster. With 6 AR-mutated tumors, a non-significant result does not rule out an effect.
+- **Most AR variants are in-frame repeat indels** (polyQ/polyG), which may be repeat-length variation rather than functional mutations. The heatmap shows the variant type for this reason.
