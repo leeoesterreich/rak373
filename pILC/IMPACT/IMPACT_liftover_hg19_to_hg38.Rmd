@@ -1,0 +1,122 @@
+---
+title: "MSK-IMPACT liftover hg19 -> hg38"
+output:
+  html_document:
+    toc: true
+    theme: readable
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+suppressPackageStartupMessages({
+  library(data.table)
+  library(GenomicRanges)
+  library(rtracklayer)   # Bioconductor: BiocManager::install(c("rtracklayer", "GenomicRanges"))
+})
+set.seed(42)
+```
+
+# Approach
+
+1. Lift the first base of each IMPACT variant (VCF position) from hg19 to hg38 with the UCSC chain file.
+2. Keep only variants that lift to exactly one position on the same strand.
+3. Optionally check that the SNV reference base matches the hg38 reference.
+4. Save the lifted file and a QC table. REF and ALT are not changed.
+
+Download the chain file once (on a node with internet):
+
+```bash
+wget https://hgdownload.soe.ucsc.edu/goldenPath/hg19/liftOver/hg19ToHg38.over.chain.gz
+gunzip hg19ToHg38.over.chain.gz
+```
+
+```{r paths}
+impact_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/MSK_IMPACT/pILC_IMPACT_filtered.tsv"
+chain_file  <- "/ix1/alee/LO_LAB/Personal/Rahul/Reference_genome/liftOver/hg19ToHg38.over.chain"   # set your path
+
+# Optional: hg38 reference FASTA (with .fai index) for the REF-base check on SNVs.
+# Leave as NA to skip the check.
+ref_fasta   <- NA_character_
+
+out_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/MSK_IMPACT/pILC_IMPACT_filtered_hg38.tsv"
+qc_file  <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/MSK_IMPACT/IMPACT_liftover_QC.tsv"
+
+stopifnot(file.exists(impact_file), file.exists(chain_file))
+```
+
+```{r liftover}
+imp <- fread(impact_file, sep = "\t", na.strings = c("", "NA"))
+need <- c("CHROM", "POS", "REF", "ALT", "SYMBOL", "TUMOR_SAMPLE")
+stopifnot(all(need %in% names(imp)))
+
+imp[, row_id := .I]
+imp[, chr_hg19 := paste0("chr", sub("^chr", "", CHROM))]
+
+gr <- GRanges(seqnames = imp$chr_hg19,
+              ranges = IRanges(start = as.integer(imp$POS), width = 1L))
+chain <- import.chain(chain_file)
+lifted <- liftOver(gr, chain)
+
+n_hits <- lengths(lifted)
+ok <- n_hits == 1L
+ul <- unlist(lifted[ok])
+
+imp[, `:=`(CHROM_hg38 = NA_character_, POS_hg38 = NA_integer_, strand_hg38 = NA_character_)]
+imp[ok, CHROM_hg38   := sub("^chr", "", as.character(seqnames(ul)))]
+imp[ok, POS_hg38     := start(ul)]
+imp[ok, strand_hg38  := as.character(strand(ul))]
+
+imp[, lift_status := fifelse(n_hits == 0L, "unmapped",
+                      fifelse(n_hits > 1L, "multiple_hits",
+                      fifelse(strand_hg38 == "-", "minus_strand", "lifted")))]
+
+# Only plain lifted variants are usable for variant-level matching
+imp[lift_status != "lifted", `:=`(CHROM_hg38 = NA_character_, POS_hg38 = NA_integer_)]
+
+cat("Liftover status:\n")
+print(imp[, .N, by = lift_status][order(-N)])
+```
+
+```{r reference_check}
+# SNV REF-base check against hg38 (only if a FASTA is provided)
+imp[, ref_check := NA_character_]
+
+if (!is.na(ref_fasta) && file.exists(ref_fasta)) {
+  suppressPackageStartupMessages(library(Rsamtools))
+  fa <- FaFile(ref_fasta)
+  snv <- imp[lift_status == "lifted" & nchar(REF) == 1L & nchar(ALT) == 1L]
+  gr38 <- GRanges(paste0("chr", snv$CHROM_hg38), IRanges(snv$POS_hg38, width = 1L))
+  ref38 <- as.character(getSeq(fa, gr38))
+  imp[match(snv$row_id, row_id), ref_check := fifelse(toupper(ref38) == toupper(snv$REF), "match", "mismatch")]
+  cat("\nSNV REF check against hg38:\n")
+  print(imp[!is.na(ref_check), .N, by = ref_check])
+  # Mismatching SNVs lifted badly: exclude them from variant-level matching
+  imp[ref_check == "mismatch", `:=`(CHROM_hg38 = NA_character_, POS_hg38 = NA_integer_)]
+} else {
+  cat("\nref_fasta not set: REF-base check skipped.\n")
+}
+```
+
+```{r gene_sanity}
+# Gene-region sanity check: lifted CDH1 / TP53 / PIK3CA should be in hg38 gene regions.
+# Approximate hg38 spans (Mb): CDH1 chr16 68.74-68.84, TP53 chr17 7.66-7.69, PIK3CA chr3 179.15-179.24
+chk <- imp[SYMBOL %in% c("CDH1", "TP53", "PIK3CA") & lift_status == "lifted",
+           .(CHROM_hg38 = CHROM_hg38[1], min_pos_Mb = round(min(POS_hg38) / 1e6, 3),
+             max_pos_Mb = round(max(POS_hg38) / 1e6, 3), n = .N), by = SYMBOL]
+print(chk)
+```
+
+```{r save}
+qc <- imp[, .(n_variants = .N,
+              n_lifted = sum(lift_status == "lifted"),
+              n_unmapped = sum(lift_status == "unmapped"),
+              n_multiple = sum(lift_status == "multiple_hits"),
+              n_minus_strand = sum(lift_status == "minus_strand"),
+              n_ref_mismatch = sum(ref_check == "mismatch", na.rm = TRUE))]
+print(qc)
+
+fwrite(qc, qc_file, sep = "\t")
+fwrite(imp[, !c("row_id", "chr_hg19")], out_file, sep = "\t", na = "NA")
+cat("\nSaved:\n", out_file, "\n", qc_file, "\n")
+```
