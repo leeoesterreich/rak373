@@ -1,0 +1,285 @@
+---
+title: "Single-gene oncoplot by assay (default: FOXA1), all tumors"
+output:
+  html_document:
+    toc: true
+    theme: readable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(grid)
+})
+set.seed(42)
+graphics.off()
+```
+
+# Layout
+
+One gene, all tumors with at least one assay as columns. Rows are grouped by VAF cutoff:
+first the VAF >= 3% block, then the VAF >= 5% block. Within each block: IMPACT, WES, WGS and
+Combined (which assays detected the gene).
+
+- IMPACT, WES and WGS rows: coloured by variant class; the number in a cell is the VAF (%).
+  Multi_Hit = more than one variant in the gene in that assay.
+- Combined row: coloured by the assays that detected the gene; the number is the highest VAF.
+- White = not sequenced by that assay; grey = sequenced, no call.
+- Right: stacked bars of mutated tumors per row and % mutated (of tumors sequenced by that assay;
+  Combined: of all tumors). Top: highest FOXA1 VAF per tumor (any assay, lowest cutoff).
+- Bottom: sequencing strips and the clinical annotation used in the oncoplots.
+
+```{r paths_and_parameters}
+GENE <- "FOXA1"
+
+impact_file   <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/MSK_IMPACT/pILC_IMPACT_filtered.tsv"
+wes_audit     <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Compare_TumorOnly_vs_WithPON/maftools/Tier_1_common/Combined_MAF/Full_MAF_nonsilent_variant_PCGR_VAF_match_audit_2026-09-23.tsv"
+wgs_audit     <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WGS/PCGR/Downstream/Variant_classification/Top_Mutated_Genes_Cohort/Full_MAF_nonsilent_variant_PCGR_VAF_match_audit_2026-09-29.tsv"
+wgs_pcgr_dir  <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WGS/PCGR/pcgr_outputs"
+clinical_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/Clinical_correlation/pILC_ClinicoPathological_details.csv"
+
+out_dir <- file.path("/ix1/alee/LO_LAB/Personal/Rahul/pILC/Cross_modality_concordance", paste0("gene_status_", GENE))
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+VAF_THRESHOLDS <- c(0.03, 0.05)     # first block = first value
+CELL_W_MM <- 4.6                    # cell width
+CELL_H_MM <- 6.5                    # cell height
+
+nonsilent_classes <- c(
+  "Missense_Mutation", "Nonsense_Mutation", "Nonstop_Mutation",
+  "Frame_Shift_Del", "Frame_Shift_Ins", "In_Frame_Del", "In_Frame_Ins",
+  "Splice_Site", "Splice_Region", "Translation_Start_Site"
+)
+mods <- c("IMPACT", "WES", "WGS")
+stopifnot(file.exists(impact_file), file.exists(wes_audit), file.exists(wgs_audit), file.exists(clinical_file))
+```
+
+```{r helpers}
+std_id <- function(x) {
+  x <- toupper(trimws(as.character(x)))
+  x <- sub("^JC287-", "", x)
+  x <- sub("(_T|-T|\\.T)$", "", x)
+  x <- sub("(?<=[0-9])T$", "", x, perl = TRUE)
+  sub("-0+(?=[0-9])", "-", x, perl = TRUE)     # TP09-09 = TP09-9
+}
+natural_sample_order <- function(s) {
+  s <- unique(as.character(s))
+  tp <- suppressWarnings(as.integer(sub("^TP([0-9]+).*", "\\1", s))); tp[is.na(tp)] <- 9999L
+  rest <- suppressWarnings(as.integer(gsub("[^0-9]", "", sub("^TP[0-9]+[-_]*", "", s)))); rest[is.na(rest)] <- 9999L
+  s[order(tp, rest, s)]
+}
+save_plot <- function(file_base, width, height, draw_fn, res = 300) {
+  pdf(paste0(file_base, ".pdf"), width = width, height = height); draw_fn(); dev.off()
+  png(paste0(file_base, ".png"), width = width, height = height, units = "in", res = res); draw_fn(); dev.off()
+  cat("Saved:", paste0(file_base, c(".pdf", ".png")), sep = "\n  "); cat("\n")
+}
+parse_percent_value <- function(x) {
+  x <- trimws(as.character(x)); x[x %in% c("", "NA", "N/A", "NaN", "nan")] <- NA_character_
+  lt <- grepl("^<", x)
+  v <- suppressWarnings(as.numeric(gsub("[^0-9.]", "", x)))
+  v[lt & !is.na(v)] <- v[lt & !is.na(v)] / 2
+  v
+}
+clean_receptor_status <- function(x) {
+  x <- gsub("\\s+", " ", trimws(as.character(x)))
+  out <- rep("Unknown", length(x))
+  out[grepl("^Positive", x, ignore.case = TRUE)] <- "Positive"
+  out[grepl("^Negative", x, ignore.case = TRUE)] <- "Negative"
+  out
+}
+clean_grade_status <- function(x) {
+  x <- gsub("\\s+", " ", trimws(as.character(x)))
+  x[x %in% c("", "NA", "N/A", "NaN", "nan") | is.na(x)] <- "Unknown"
+  x
+}
+```
+
+```{r read_calls}
+min_thr <- min(VAF_THRESHOLDS)
+universe <- list()
+
+imp <- fread(impact_file, sep = "\t", na.strings = c("", "NA"))
+imp[, Tumor := std_id(TUMOR_SAMPLE)]
+universe$IMPACT <- unique(imp$Tumor)
+ci <- imp[toupper(SYMBOL) == GENE & Variant_Classification %in% nonsilent_classes & !is.na(TUMOR_MAF),
+          .(Assay = "IMPACT", Tumor, Class = Variant_Classification, VAF = as.numeric(TUMOR_MAF))]
+rm(imp)
+
+wes <- fread(wes_audit, sep = "\t", na.strings = c("", "NA", "."),
+             select = c("Hugo_Symbol", "Tumor_Sample_Barcode", "Variant_Classification", "VAF_TUMOR_fraction"))
+wes[, Tumor := std_id(Tumor_Sample_Barcode)]
+universe$WES <- unique(wes$Tumor)
+cw <- wes[toupper(Hugo_Symbol) == GENE & Variant_Classification %in% nonsilent_classes & !is.na(VAF_TUMOR_fraction),
+          .(Assay = "WES", Tumor, Class = Variant_Classification, VAF = as.numeric(VAF_TUMOR_fraction))]
+rm(wes)
+
+wgs <- fread(wgs_audit, sep = "\t", na.strings = c("", "NA"),
+             select = c("Sample_key", "Hugo_Symbol", "Variant_Classification", "VAF_TUMOR_fraction", "matched", "is_nonsilent"))
+wgs[, Tumor := std_id(Sample_key)]
+universe$WGS <- union(unique(wgs$Tumor), std_id(list.dirs(wgs_pcgr_dir, recursive = FALSE, full.names = FALSE)))
+cg <- wgs[toupper(Hugo_Symbol) == GENE & as.logical(is_nonsilent) & !is.na(VAF_TUMOR_fraction),
+          .(Assay = "WGS", Tumor, Class = Variant_Classification, VAF = as.numeric(VAF_TUMOR_fraction))]
+rm(wgs)
+
+calls <- rbind(ci, cw, cg)
+tumors <- natural_sample_order(unique(unlist(universe)))
+cat("Tumors in total:", length(tumors), "\n"); print(sapply(universe, length))
+cat(GENE, "non-silent calls at VAF >=", min_thr * 100, "% by assay:\n")
+print(calls[VAF >= min_thr, .(tumors = uniqueN(Tumor), variants = .N), by = Assay])
+```
+
+```{r clinical}
+clin <- fread(clinical_file, sep = ",", header = TRUE, data.table = TRUE, fill = TRUE,
+              na.strings = c("", "NA", "NaN", "N/A"))
+clin[, Tumor := std_id(Sample)]
+clin <- unique(clin[, .(Tumor,
+  tumor_cellularity_pct = parse_percent_value(`tumor_cellularity (%)`),
+  pleomorphic_pct = parse_percent_value(`pleomorphic_invasive_compoent_cellularity (%)`),
+  TILs_pct = parse_percent_value(`TILs (%)`),
+  Grade = clean_grade_status(`Grade/Differentiation-Desc`),
+  HER2 = clean_receptor_status(`BREAST: Her-2/Neu-Desc`),
+  ER = clean_receptor_status(`Tumor Marker #1 (ER)`),
+  PR = clean_receptor_status(`Tumor Marker #2 (PR)`))], by = "Tumor")
+clin <- clin[match(tumors, Tumor)]
+cat("Tumors matched to the clinical file:", sum(tumors %in% clin$Tumor), "of", length(tumors), "\n")
+```
+
+```{r build_matrix}
+class_cols <- c(
+  "Missense_Mutation" = "#1F77B4", "Nonsense_Mutation" = "#D62728", "Frame_Shift_Del" = "#9467BD",
+  "Frame_Shift_Ins" = "#8C564B", "In_Frame_Del" = "#2CA02C", "In_Frame_Ins" = "#17BECF",
+  "Splice_Site" = "#FF7F0E", "Splice_Region" = "#FFBB78", "Translation_Start_Site" = "#E377C2",
+  "Nonstop_Mutation" = "#BCBD22", "Multi_Hit" = "#000000"
+)
+combo_cols <- c(
+  "IMPACT" = "#E26A8A", "IMPACT+WES" = "#C58B00", "IMPACT+WES+WGS" = "#7BA000",
+  "IMPACT+WGS" = "#00A86B", "WES" = "#00A9C5", "WES+WGS" = "#7F8FE0", "WGS" = "#D166D1"
+)
+state_cols <- c("None" = "grey92", "Not sequenced" = "white")
+all_cols <- c(class_cols, combo_cols, state_cols)
+
+blank_row <- function(fill) setNames(rep(fill, length(tumors)), tumors)
+
+rows <- list(); vtxt <- list(); row_lab <- character(); row_blk <- character(); row_den <- integer()
+cell_low <- NULL
+
+for (thr in VAF_THRESHOLDS) {
+  blk <- sprintf("VAF \u2265 %d%%", as.integer(round(100 * thr)))
+  cell <- calls[VAF >= thr, .(Class = if (.N > 1) "Multi_Hit" else Class[1], MaxVAF = max(VAF)), by = .(Assay, Tumor)]
+  if (is.null(cell_low)) cell_low <- cell
+
+  for (a in mods) {
+    r <- blank_row("None"); v <- blank_row("")
+    d <- cell[Assay == a]
+    r[d$Tumor] <- d$Class; v[d$Tumor] <- sprintf("%.0f", 100 * d$MaxVAF)
+    r[!(tumors %in% universe[[a]])] <- "Not sequenced"
+    rows[[length(rows) + 1]] <- r; vtxt[[length(vtxt) + 1]] <- v
+    row_lab <- c(row_lab, a); row_blk <- c(row_blk, blk); row_den <- c(row_den, length(universe[[a]]))
+  }
+  r <- blank_row("None"); v <- blank_row("")
+  comb <- cell[, .(Combo = paste(mods[mods %in% Assay], collapse = "+"), MaxVAF = max(MaxVAF)), by = Tumor]
+  r[comb$Tumor] <- comb$Combo; v[comb$Tumor] <- sprintf("%.0f", 100 * comb$MaxVAF)
+  rows[[length(rows) + 1]] <- r; vtxt[[length(vtxt) + 1]] <- v
+  row_lab <- c(row_lab, "Combined"); row_blk <- c(row_blk, blk); row_den <- c(row_den, length(tumors))
+}
+
+mat <- do.call(rbind, rows); vaf_mat <- do.call(rbind, vtxt)
+rownames(mat) <- rownames(vaf_mat) <- paste(row_blk, row_lab, sep = " | ")
+fwrite(data.table(Row = rownames(mat), mat), file.path(out_dir, paste0(GENE, "_oncoplot_matrix.tsv")), sep = "\t")
+
+cats <- setdiff(unique(as.vector(mat)), c("None", "Not sequenced"))
+bar_mat <- do.call(cbind, lapply(cats, function(cn) rowSums(mat == cn)))
+colnames(bar_mat) <- cats; rownames(bar_mat) <- rownames(mat)
+pct <- paste0(round(100 * rowSums(mat != "None" & mat != "Not sequenced") / row_den), "%")
+print(data.table(Row = rownames(mat), Mutated = rowSums(mat != "None" & mat != "Not sequenced"),
+                 Denominator = row_den, Percent = pct))
+```
+
+```{r draw}
+# ---- annotations ----
+top_v <- setNames(rep(0, length(tumors)), tumors)
+top_v[cell_low[, .(v = max(MaxVAF)), by = Tumor]$Tumor] <- 100 * cell_low[, .(v = max(MaxVAF)), by = Tumor]$v
+top_ha <- HeatmapAnnotation(
+  `Max VAF (%)` = anno_barplot(top_v, gp = gpar(fill = "grey45", col = NA), border = FALSE, bar_width = 0.85,
+                               height = unit(2, "cm"), axis_param = list(gp = gpar(fontsize = 7))),
+  annotation_name_gp = gpar(fontsize = 8), annotation_name_side = "left"
+)
+
+right_ha <- rowAnnotation(
+  `Mutated tumors` = anno_barplot(bar_mat, gp = gpar(fill = all_cols[colnames(bar_mat)], col = NA),
+                                  border = FALSE, bar_width = 0.85, axis_param = list(gp = gpar(fontsize = 7), side = "bottom")),
+  `% mutated` = anno_text(pct, gp = gpar(fontsize = 8), just = "left", location = 0),
+  width = unit(3.6, "cm"), show_annotation_name = FALSE
+)
+
+grade_cols <- c("Grade I" = "#A6CEE3", "Grade II" = "#33A02C", "Grade III" = "#1F78B4",
+                "Cell type not determined" = "#E31A1C", "Unknown" = "#BDBDBD")
+rec_cols <- c("Negative" = "#1F78B4", "Positive" = "#E31A1C", "Unknown" = "#BDBDBD")
+seq_cols <- c("Sequenced" = "black", "Not sequenced" = "grey85")
+extra_g <- setdiff(unique(na.omit(clin$Grade)), names(grade_cols))
+if (length(extra_g)) { eg <- hcl.colors(length(extra_g), "Dark 3"); names(eg) <- extra_g; grade_cols <- c(grade_cols, eg) }
+
+anno_df <- data.frame(
+  `IMPACT seq.` = ifelse(tumors %in% universe$IMPACT, "Sequenced", "Not sequenced"),
+  `WES seq.`    = ifelse(tumors %in% universe$WES,    "Sequenced", "Not sequenced"),
+  `WGS seq.`    = ifelse(tumors %in% universe$WGS,    "Sequenced", "Not sequenced"),
+  `Tumor cell. (%)` = clin$tumor_cellularity_pct, `Pleomorphic (%)` = clin$pleomorphic_pct,
+  `TILs (%)` = clin$TILs_pct, Grade = clin$Grade, HER2 = clin$HER2, ER = clin$ER, PR = clin$PR,
+  check.names = FALSE, row.names = tumors
+)
+bottom_ha <- HeatmapAnnotation(
+  df = anno_df,
+  col = list(`IMPACT seq.` = seq_cols, `WES seq.` = seq_cols, `WGS seq.` = seq_cols,
+             `Tumor cell. (%)` = colorRamp2(c(0, 50, 100), c("#F7FBFF", "#6BAED6", "#08306B")),
+             `Pleomorphic (%)` = colorRamp2(c(0, 50, 100), c("#F7FCF5", "#74C476", "#00441B")),
+             `TILs (%)` = colorRamp2(c(0, 30, 100), c("#FFF5F0", "#FB6A4A", "#67000D")),
+             Grade = grade_cols, HER2 = rec_cols, ER = rec_cols, PR = rec_cols),
+  na_col = "grey90", annotation_name_side = "left", annotation_name_gp = gpar(fontsize = 8),
+  simple_anno_size = unit(0.32, "cm"), gap = unit(1, "mm"), border = TRUE
+)
+
+# ---- legends for the main matrix ----
+used_class <- intersect(names(class_cols), unique(as.vector(mat)))
+used_combo <- intersect(names(combo_cols), unique(as.vector(mat)))
+lgd_class <- Legend(title = "Variant class (assay rows)", at = used_class, legend_gp = gpar(fill = class_cols[used_class]),
+                    labels_gp = gpar(fontsize = 8), title_gp = gpar(fontsize = 9, fontface = "bold"))
+lgd_combo <- Legend(title = "Assays detecting (Combined rows)", at = used_combo, legend_gp = gpar(fill = combo_cols[used_combo]),
+                    labels_gp = gpar(fontsize = 8), title_gp = gpar(fontsize = 9, fontface = "bold"))
+lgd_state <- Legend(title = "Cell state", at = c("Sequenced, no call", "Not sequenced"),
+                    legend_gp = gpar(fill = c("grey92", "white"), col = "grey60"),
+                    labels_gp = gpar(fontsize = 8), title_gp = gpar(fontsize = 9, fontface = "bold"))
+
+ht <- Heatmap(
+  mat, name = GENE, col = all_cols,
+  cluster_rows = FALSE, cluster_columns = FALSE,
+  row_split = factor(row_blk, levels = unique(row_blk)), row_gap = unit(3, "mm"),
+  row_labels = row_lab, row_names_side = "left", row_names_gp = gpar(fontsize = 9),
+  row_title_gp = gpar(fontsize = 10, fontface = "bold"),
+  show_column_names = TRUE, column_names_gp = gpar(fontsize = 7),
+  rect_gp = gpar(col = "white", lwd = 0.6),
+  width = unit(CELL_W_MM * length(tumors), "mm"), height = unit(CELL_H_MM * nrow(mat), "mm"),
+  top_annotation = top_ha, bottom_annotation = bottom_ha, right_annotation = right_ha,
+  column_title = paste0(GENE, " mutation status by assay (", length(tumors), " tumors)"),
+  column_title_gp = gpar(fontsize = 11, fontface = "bold"),
+  layer_fun = function(j, i, x, y, w, h, fill) {
+    txt <- pindex(vaf_mat, i, j)
+    ok <- txt != ""
+    if (any(ok)) grid.text(txt[ok], x[ok], y[ok], gp = gpar(fontsize = 5.5, col = "white", fontface = "bold"))
+  },
+  show_heatmap_legend = FALSE
+)
+
+draw_fig <- function() {
+  draw(ht, heatmap_legend_list = list(lgd_class, lgd_combo, lgd_state),
+       heatmap_legend_side = "right", annotation_legend_side = "right", merge_legends = FALSE,
+       padding = unit(c(4, 4, 4, 8), "mm"))
+}
+# Page size = heatmap body + left labels (row titles, row names, annotation names, ~70 mm)
+# + right panel (bars and % text, ~45 mm) + legends (~135 mm) + margins.
+fig_w <- (CELL_W_MM * length(tumors) + 70 + 45 + 135 + 10) / 25.4
+fig_h <- (CELL_H_MM * nrow(mat) + 20 + 22 + 45 + 15) / 25.4
+save_plot(file.path(out_dir, paste0(GENE, "_oncoplot_by_assay")), width = max(fig_w, 15), height = max(fig_h, 7), draw_fn = draw_fig)
+```

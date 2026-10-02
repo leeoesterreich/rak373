@@ -1,0 +1,175 @@
+---
+title: "Gene mutation status across IMPACT, WES and WGS (default: FOXA1)"
+output:
+  html_document:
+    toc: true
+    theme: readable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+})
+set.seed(42)
+```
+
+# Approach
+
+For one gene, list every tumor and show what each assay reports: the variant and VAF in
+IMPACT, and the class and VAF in WES and WGS. Calls are not cut at a VAF threshold here.
+Instead each call is labelled by VAF band (>= 5%, 3-5%, < 3%), so near-threshold
+disagreements are visible. Tumors an assay did not sequence are labelled as such, so they
+are not mistaken for wild-type.
+
+```{r paths_and_parameters}
+GENE <- "FOXA1"
+
+impact_file  <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/MSK_IMPACT/pILC_IMPACT_filtered.tsv"
+wes_audit    <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Compare_TumorOnly_vs_WithPON/maftools/Tier_1_common/Combined_MAF/Full_MAF_nonsilent_variant_PCGR_VAF_match_audit_2026-09-23.tsv"
+wgs_audit    <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WGS/PCGR/Downstream/Variant_classification/Top_Mutated_Genes_Cohort/Full_MAF_nonsilent_variant_PCGR_VAF_match_audit_2026-09-29.tsv"
+wgs_pcgr_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WGS/PCGR/pcgr_outputs"
+
+out_dir <- file.path("/ix1/alee/LO_LAB/Personal/Rahul/pILC/Cross_modality_concordance", paste0("gene_status_", GENE))
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# tumors shown in the figure: "any_call" = tumors with a non-silent call in any assay; "all" = every tumor
+SHOW <- "any_call"
+
+nonsilent_classes <- c(
+  "Missense_Mutation", "Nonsense_Mutation", "Nonstop_Mutation",
+  "Frame_Shift_Del", "Frame_Shift_Ins", "In_Frame_Del", "In_Frame_Ins",
+  "Splice_Site", "Splice_Region", "Translation_Start_Site"
+)
+stopifnot(file.exists(impact_file), file.exists(wes_audit), file.exists(wgs_audit))
+```
+
+```{r helpers}
+std_id <- function(x) {
+  x <- toupper(trimws(as.character(x)))
+  x <- sub("^JC287-", "", x)
+  x <- sub("(_T|-T|\\.T)$", "", x)
+  x <- sub("(?<=[0-9])T$", "", x, perl = TRUE)
+  sub("-0+(?=[0-9])", "-", x, perl = TRUE)     # TP09-09 = TP09-9
+}
+natural_sample_order <- function(s) {
+  s <- unique(as.character(s))
+  tp <- suppressWarnings(as.integer(sub("^TP([0-9]+).*", "\\1", s))); tp[is.na(tp)] <- 9999L
+  rest <- suppressWarnings(as.integer(gsub("[^0-9]", "", sub("^TP[0-9]+[-_]*", "", s)))); rest[is.na(rest)] <- 9999L
+  s[order(tp, rest, s)]
+}
+vaf_band <- function(v) fifelse(is.na(v), NA_character_,
+                         fifelse(v >= 0.05, "VAF >= 5%", fifelse(v >= 0.03, "VAF 3-5%", "VAF < 3%")))
+save_plot <- function(file_base, width, height, draw_fn, res = 300) {
+  pdf(paste0(file_base, ".pdf"), width = width, height = height); draw_fn(); dev.off()
+  png(paste0(file_base, ".png"), width = width, height = height, units = "in", res = res); draw_fn(); dev.off()
+}
+```
+
+```{r read_calls}
+# ---- IMPACT (all rows of the gene, with protein change) ----
+imp <- fread(impact_file, sep = "\t", na.strings = c("", "NA"))
+imp[, Tumor := std_id(TUMOR_SAMPLE)]
+universe <- list(IMPACT = unique(imp$Tumor))
+ci <- imp[SYMBOL == GENE & Variant_Classification %in% nonsilent_classes,
+          .(Tumor, Assay = "IMPACT", Class = Variant_Classification,
+            Change = sub("^p\\.", "", HGVSp_Short), VAF = as.numeric(TUMOR_MAF))]
+
+# ---- WES ----
+wes <- fread(wes_audit, sep = "\t", na.strings = c("", "NA", "."))
+wes[, Tumor := std_id(Tumor_Sample_Barcode)]
+universe$WES <- unique(wes$Tumor)
+cw <- wes[toupper(Hugo_Symbol) == GENE & Variant_Classification %in% nonsilent_classes,
+          .(Tumor, Assay = "WES", Class = Variant_Classification,
+            Change = paste0("chr", Chromosome, ":", Start_Position), VAF = as.numeric(VAF_TUMOR_fraction))]
+rm(wes)
+
+# ---- WGS (audit holds PCGR-matched coding rows) ----
+wgs <- fread(wgs_audit, sep = "\t", na.strings = c("", "NA"))
+wgs[, Tumor := std_id(Sample_key)]
+universe$WGS <- union(unique(wgs$Tumor), std_id(list.dirs(wgs_pcgr_dir, recursive = FALSE, full.names = FALSE)))
+cg <- wgs[toupper(Hugo_Symbol) == GENE & as.logical(is_nonsilent),
+          .(Tumor, Assay = "WGS", Class = Variant_Classification,
+            Change = paste0("chr", Chromosome, ":", Start_Position), VAF = as.numeric(VAF_TUMOR_fraction))]
+rm(wgs)
+
+calls <- rbind(ci, cw, cg)
+calls[, Band := vaf_band(VAF)]
+cat("Tumors per assay:\n"); print(sapply(universe, length))
+cat("\nTumors with a non-silent", GENE, "call, by assay (any VAF):\n")
+print(calls[, .(tumors = uniqueN(Tumor), variants = .N), by = Assay])
+```
+
+```{r per_tumor_table}
+all_tumors <- natural_sample_order(unique(unlist(universe)))
+
+summ <- function(assay) {
+  d <- calls[Assay == assay]
+  d[, .(Detail = paste0(Change, " ", Class, " (", round(100 * VAF, 1), "%)", collapse = "; "),
+        MaxVAF = max(VAF, na.rm = TRUE)), by = Tumor]
+}
+
+tab <- data.table(Tumor = all_tumors)
+for (a in c("IMPACT", "WES", "WGS")) {
+  s <- summ(a)
+  tab <- merge(tab, s, by = "Tumor", all.x = TRUE, sort = FALSE)
+  setnames(tab, c("Detail", "MaxVAF"), paste0(a, c("_calls", "_maxVAF")))
+  seq_flag <- tab$Tumor %in% universe[[a]]
+  tab[[paste0(a, "_status")]] <- fifelse(!seq_flag, "Not sequenced",
+                                  fifelse(is.na(tab[[paste0(a, "_maxVAF")]]), "Wild-type",
+                                          vaf_band(tab[[paste0(a, "_maxVAF")]])))
+}
+tab <- tab[match(all_tumors, Tumor)]
+tab[, any_call := !is.na(IMPACT_calls) | !is.na(WES_calls) | !is.na(WGS_calls)]
+
+fwrite(tab, file.path(out_dir, paste0(GENE, "_status_per_tumor.tsv")), sep = "\t", na = "")
+print(tab[any_call == TRUE, .(Tumor, IMPACT_status, IMPACT_calls, WES_status, WES_calls, WGS_status)])
+
+cat("\nAssay agreement (tumors sequenced by both; mutated = any call at VAF >= 3%):\n")
+mut3 <- function(s) s %in% c("VAF >= 5%", "VAF 3-5%")
+for (p in list(c("IMPACT", "WES"), c("IMPACT", "WGS"), c("WES", "WGS"))) {
+  both <- tab[get(paste0(p[1], "_status")) != "Not sequenced" & get(paste0(p[2], "_status")) != "Not sequenced"]
+  cat(p[1], "vs", p[2], ": n =", nrow(both), "\n")
+  print(table(setNames(list(mut3(both[[paste0(p[1], "_status")]]), mut3(both[[paste0(p[2], "_status")]])), p)))
+}
+```
+
+```{r figure}
+long <- melt(tab, id.vars = "Tumor", measure.vars = paste0(c("IMPACT", "WES", "WGS"), "_status"),
+             variable.name = "Assay", value.name = "Status")
+long[, Assay := factor(sub("_status", "", Assay), c("WGS", "WES", "IMPACT"))]
+vmax <- melt(tab, id.vars = "Tumor", measure.vars = paste0(c("IMPACT", "WES", "WGS"), "_maxVAF"),
+             variable.name = "Assay", value.name = "MaxVAF")
+vmax[, Assay := factor(sub("_maxVAF", "", Assay), c("WGS", "WES", "IMPACT"))]
+long <- merge(long, vmax, by = c("Tumor", "Assay"))
+long[, Label := fifelse(is.na(MaxVAF), "", sprintf("%.0f", 100 * MaxVAF))]
+
+keep <- if (SHOW == "all") all_tumors else tab[any_call == TRUE, Tumor]
+long <- long[Tumor %in% keep]
+long[, Tumor := factor(Tumor, levels = natural_sample_order(keep))]
+long[, Status := factor(Status, c("VAF >= 5%", "VAF 3-5%", "VAF < 3%", "Wild-type", "Not sequenced"))]
+
+status_cols <- c("VAF >= 5%" = "#B2182B", "VAF 3-5%" = "#EF8A62", "VAF < 3%" = "#FDDBC7",
+                 "Wild-type" = "grey88", "Not sequenced" = "white")
+
+p <- ggplot(long, aes(Tumor, Assay, fill = Status)) +
+  geom_tile(colour = "grey60", linewidth = 0.3) +
+  geom_text(aes(label = Label), size = 2.4) +
+  scale_fill_manual(values = status_cols, drop = FALSE, name = paste0(GENE, " status\n(number = VAF %)")) +
+  labs(x = NULL, y = NULL, title = paste0(GENE, " mutation status across the three assays")) +
+  coord_fixed() +
+  theme_minimal(base_size = 9) +
+  theme(panel.grid = element_blank(), axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+        plot.title = element_text(face = "bold"))
+
+save_plot(file.path(out_dir, paste0(GENE, "_status_across_assays")),
+          width = max(6, 0.32 * length(keep) + 3), height = 2.6, draw_fn = function() print(p))
+cat("Outputs are in:", out_dir, "\n")
+```
+
+# How to read the result
+
+- **VAF >= 5% in two assays** is strong agreement. **3-5%** and **< 3%** show calls near the detection limit.
+- **Mutated in one assay and wild-type in another** (both sequenced) is a true discordance. Check the VAF band first: many are just below the threshold in the other assay.
+- **Not sequenced** is not wild-type. WGS exists for only 10 tumors, so most tumors cannot be assessed by WGS.
