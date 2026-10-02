@@ -22,11 +22,6 @@ suppressPackageStartupMessages({
 # ============================================================
 # pILC RNA-seq differential expression across three clusters
 #
-# Usage:
-# Rscript pILC_DESeq2_3clusters_2026-09-23.R \
-#   /path/to/htseq_raw_counts_with_gene_names.csv \
-#   /path/to/output_directory
-#
 # Analyses:
 # 1. Global LRT: any expression difference among Clusters 1, 2, 3
 # 2. Wald tests:
