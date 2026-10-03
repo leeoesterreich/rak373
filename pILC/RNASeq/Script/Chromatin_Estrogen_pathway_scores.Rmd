@@ -1,0 +1,991 @@
+---
+title: "Chromatin_Estrogen_pathway_scores"
+output: html_document
+date: "2026-10-02"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+############################################################
+## Script   : pILC_03_Chromatin_Estrogen_pathway_scores.Rmd
+## PURPOSE
+##   Chromatin and estrogen pathway scores across 3 RNA clusters,
+##   and correlation between chromatin and estrogen pathway scores.
+##   All gene sets come from databases (MSigDB: GO, Hallmark,
+##   Reactome, KEGG Medicus). No hand-typed gene lists.
+## INPUT
+##   - VST_data_GENCODEv47/htseq_raw_counts_with_gene_names.csv
+##   - VST_data_GENCODEv47/gene_annotation_from_GTF.tsv
+##   - NMF consensus k=3 GCT (cluster membership)
+##   - MSigDB C5 GMT (local) + msigdbr package for the other collections
+## NOTE
+##   Clusters were derived from the same expression data; results
+##   characterize the clusters and are not independent validation.
+############################################################
+```
+
+
+```{r}
+set.seed(42)
+
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(data.table)
+  library(GSVA)
+  library(ggplot2)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(grid)
+  library(msigdbr)
+})
+
+# ----------------------------
+# Paths (fixed names, no date/time stamps)
+# ----------------------------
+input_dir  <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/4_Count_file_pILC/VST_data_GENCODEv47"
+count_file <- file.path(input_dir, "htseq_raw_counts_with_gene_names.csv")
+annot_file <- file.path(input_dir, "gene_annotation_from_GTF.tsv")
+
+cluster_gct_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/NMF/GenePattern_NMFConsensus/vst_transformed_data.consensus.k.3.gct"
+c5_gmt_file      <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/GSEA/Dataset/c5.all.v2025.1.Hs.symbols.gmt"
+
+out_dir   <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/Downstream/Chromatin_Estrogen_pathway_scores"
+table_dir <- file.path(out_dir, "tables")
+plot_dir  <- file.path(out_dir, "plots")
+dir.create(table_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(plot_dir,  recursive = TRUE, showWarnings = FALSE)
+
+for (f in c(count_file, annot_file, cluster_gct_file, c5_gmt_file)) {
+  if (!file.exists(f)) stop("Input file not found: ", f)
+}
+
+# ----------------------------
+# Settings
+# ----------------------------
+min_set_size <- 10
+max_set_size <- 500
+jaccard_cutoff <- 0.5     # sets overlapping more than this are collapsed
+n_top_heatmap <- 20       # top sets per family in the cluster heatmap
+n_top_box <- 8            # top sets per family in boxplots
+n_top_scatter <- 6        # top correlated pairs shown as scatter plots
+
+cluster_colors <- c("Cluster 1" = "#1B9E77", "Cluster 2" = "#D95F02", "Cluster 3" = "#7570B3")
+
+# ----------------------------
+# Helper functions
+# ----------------------------
+clean_sample <- function(x) sub("_S[0-9]+$", "", trimws(as.character(x)))
+
+read_gmt <- function(file) {
+  lines <- strsplit(readLines(file), "\t")
+  setNames(lapply(lines, function(v) toupper(v[-(1:2)])),
+           vapply(lines, `[`, character(1), 1))
+}
+
+zscore_rows <- function(mat, cap = 2.5) {
+  z <- t(scale(t(mat)))
+  z[!is.finite(z)] <- 0
+  z[z > cap] <- cap
+  z[z < -cap] <- -cap
+  z
+}
+
+save_ht <- function(ht, stem, w, h) {
+  for (ext in c("pdf", "png")) {
+    f <- file.path(plot_dir, paste0(stem, ".", ext))
+    if (ext == "pdf") pdf(f, width = w, height = h) else png(f, width = w, height = h, units = "in", res = 300)
+    draw(ht, merge_legends = TRUE, padding = unit(c(4, 4, 6, 4), "mm"))
+    dev.off()
+  }
+}
+
+# ----------------------------
+# Clusters from the NMF GCT file
+# ----------------------------
+cluster_dt <- fread(cluster_gct_file, skip = 2, data.table = TRUE)
+membership_col <- grep("^membership", names(cluster_dt), value = TRUE)
+if (length(membership_col) != 1) stop("Expected exactly one membership column.")
+cluster_dt <- cluster_dt[, .(Sample = clean_sample(Name),
+                             Cluster = factor(paste0("Cluster ", as.integer(get(membership_col))),
+                                              levels = c("Cluster 1", "Cluster 2", "Cluster 3")))]
+if (anyNA(cluster_dt$Cluster)) stop("Cluster membership must be 1, 2 or 3.")
+if (anyDuplicated(cluster_dt$Sample)) stop("Duplicate samples in cluster file.")
+setorder(cluster_dt, Cluster)
+print(table(cluster_dt$Cluster))   # expected 10 / 10 / 11
+fwrite(cluster_dt, file.path(table_dir, "cluster_metadata.tsv"), sep = "\t")
+
+# ----------------------------
+# Counts -> DESeq2 -> unsupervised VST (blind = TRUE)
+# ----------------------------
+count_dt <- fread(count_file, data.table = TRUE)
+if (!("Gene" %in% names(count_dt))) stop("Count file needs a 'Gene' column.")
+if (anyDuplicated(count_dt$Gene)) stop("Duplicate gene labels in count file.")
+count_dt <- count_dt[!grepl("^__", Gene)]
+
+sample_cols <- setdiff(names(count_dt), "Gene")
+if (length(setdiff(cluster_dt$Sample, sample_cols))) {
+  stop("Cluster samples missing in counts: ", paste(setdiff(cluster_dt$Sample, sample_cols), collapse = ", "))
+}
+if (length(setdiff(sample_cols, cluster_dt$Sample))) {
+  stop("Count samples without cluster: ", paste(setdiff(sample_cols, cluster_dt$Sample), collapse = ", "))
+}
+
+count_matrix <- as.matrix(count_dt[, cluster_dt$Sample, with = FALSE])
+rownames(count_matrix) <- count_dt$Gene
+if (anyNA(count_matrix) || any(count_matrix < 0) || any(count_matrix != round(count_matrix))) {
+  stop("Counts must be non-negative integers without missing values.")
+}
+storage.mode(count_matrix) <- "integer"
+
+metadata <- data.frame(Cluster = cluster_dt$Cluster, row.names = cluster_dt$Sample)
+dds <- DESeqDataSetFromMatrix(count_matrix, metadata, design = ~ Cluster)
+dds <- dds[rowSums(counts(dds) >= 10) >= 3, ]
+message("Genes after prefilter: ", nrow(dds))
+
+# blind = TRUE: the cluster labels do not influence the scores tested against them
+vst_mat <- assay(vst(dds, blind = TRUE))
+
+# ----------------------------
+# Convert labels to gene symbols (needed to match MSigDB)
+# ----------------------------
+annot <- fread(annot_file)
+sym_dt <- data.table(
+  Gene = rownames(vst_mat),
+  Symbol = toupper(annot$gene_symbol[match(rownames(vst_mat), annot$Gene)]),
+  Mean_VST = rowMeans(vst_mat)
+)
+sym_dt <- sym_dt[!is.na(Symbol) & !grepl("^ENSG[0-9]+", Symbol)]   # bare ENSG IDs cannot match databases
+setorder(sym_dt, -Mean_VST)
+sym_dt <- sym_dt[!duplicated(Symbol)]                                # shared symbol: keep the most expressed gene
+expr <- vst_mat[sym_dt$Gene, , drop = FALSE]
+rownames(expr) <- sym_dt$Symbol
+expressed_genes <- rownames(expr)
+message("Symbols available for pathway scoring: ", length(expressed_genes))
+
+# ----------------------------
+# Gene sets from databases only
+# ----------------------------
+get_msig <- function(collection, subcollection = NULL) {
+  res <- tryCatch(
+    msigdbr(species = "Homo sapiens", collection = collection, subcollection = subcollection),
+    error = function(e) NULL
+  )
+  if (is.null(res)) {   # older msigdbr versions use category / subcategory
+    res <- tryCatch(
+      msigdbr(species = "Homo sapiens", category = collection, subcategory = subcollection),
+      error = function(e) NULL
+    )
+  }
+  if (is.null(res) || nrow(res) == 0) {
+    message("Collection not available in msigdbr: ", collection, " ", subcollection)
+    return(list())
+  }
+  res <- as.data.table(res)
+  lapply(split(res$gene_symbol, res$gs_name), function(g) unique(toupper(g)))
+}
+
+go_all  <- read_gmt(c5_gmt_file)
+go_sets <- go_all[grepl("^(GOBP|GOCC|GOMF)_", names(go_all))]
+
+db_sets <- c(
+  go_sets,
+  get_msig("H"),
+  get_msig("C2", "CP:REACTOME"),
+  get_msig("C2", "CP:KEGG_MEDICUS")
+)
+db_sets <- db_sets[!duplicated(names(db_sets))]
+
+set_source <- fifelse(grepl("^(GOBP|GOCC|GOMF)_", names(db_sets)), "GO",
+              fifelse(grepl("^HALLMARK_", names(db_sets)), "Hallmark",
+              fifelse(grepl("^REACTOME_", names(db_sets)), "Reactome",
+              fifelse(grepl("^KEGG_MEDICUS", names(db_sets)), "KEGG_Medicus", "Other"))))
+names(set_source) <- names(db_sets)
+
+# ----------------------------
+# Rule-based family assignment on database set NAMES
+# (this is the only selection step; every decision is saved in the audit table)
+# ----------------------------
+estrogen_include <- "ESTROGEN|ESTRADIOL|ESR_MEDIATED"
+estrogen_exclude <- paste(c("BIOSYNTH", "METABOL", "CATABOL", "SECRETION", "TRANSPORT",
+                            "GLUCURON", "SULFO", "AROMATASE", "HYDROXYLASE", "ANTIESTROGEN"),
+                          collapse = "|")
+
+chromatin_include <- paste(c("CHROMATIN", "HETEROCHROMATIN", "EUCHROMATIN", "NUCLEOSOME",
+                             "HISTONE.*(ACETYL|DEACETYL|METHYL|DEMETHYL|UBIQUITIN|DEUBIQUITIN|PHOSPH|SUMO)",
+                             "(ACETYL|DEACETYL|METHYL|DEMETHYL|UBIQUITIN|DEUBIQUITIN|PHOSPH|SUMO).*HISTONE",
+                             "DNA_METHYLATION", "DNA_DEMETHYLATION", "SWI.*SNF", "BAF_COMPLEX",
+                             "PBAF", "POLYCOMB", "PRC1", "PRC2", "NURD", "NURF", "INO80", "SWR1"),
+                           collapse = "|")
+chromatin_exclude <- paste(c("(^|_)RNA_", "MRNA", "RRNA", "TRNA", "RIBOSOM", "METHYLADENOSINE",
+                             "N6_METHYL", "PSEUDOURID", "HISTONE_MRNA", "ZYGOTIC", "GERM_CELL",
+                             "SPERM", "OOCYTE", "ANTIBODY", "IMMUNOGLOBULIN"),
+                           collapse = "|")
+
+audit <- data.table(
+  Set = names(db_sets),
+  Source = unname(set_source),
+  Estrogen_include = grepl(estrogen_include, names(db_sets)),
+  Estrogen_exclude = grepl(estrogen_exclude, names(db_sets)),
+  Chromatin_include = grepl(chromatin_include, names(db_sets)),
+  Chromatin_exclude = grepl(chromatin_exclude, names(db_sets))
+)
+audit[, Family := fifelse(Estrogen_include & !Estrogen_exclude, "Estrogen",
+                  fifelse(Chromatin_include & !Chromatin_exclude & !Estrogen_include, "Chromatin",
+                          NA_character_))]
+audit[, Original_size := lengths(db_sets[Set])]
+audit[, Expressed_size := vapply(db_sets[Set], function(g) sum(g %in% expressed_genes), integer(1))]
+audit[, Size_ok := Expressed_size >= min_set_size & Expressed_size <= max_set_size]
+
+cand <- audit[!is.na(Family) & Size_ok]
+cat("Candidate sets before redundancy collapse:\n")
+print(cand[, .N, by = .(Family, Source)])
+
+# ----------------------------
+# Collapse near-duplicate sets inside each family
+# Priority: Hallmark > Reactome > KEGG Medicus > GO, then larger sets first
+# ----------------------------
+priority <- c(Hallmark = 1, Reactome = 2, KEGG_Medicus = 3, GO = 4, Other = 5)
+cand[, Priority := priority[Source]]
+setorder(cand, Family, Priority, -Expressed_size)
+
+jaccard <- function(a, b) length(intersect(a, b)) / length(union(a, b))
+expressed_sets <- lapply(db_sets[cand$Set], intersect, y = expressed_genes)
+
+cand[, Kept := FALSE]
+cand[, Collapsed_into := NA_character_]
+for (fam in unique(cand$Family)) {
+  kept <- character()
+  for (s in cand[Family == fam, Set]) {
+    hit <- NULL
+    for (k in kept) {
+      if (jaccard(expressed_sets[[s]], expressed_sets[[k]]) >= jaccard_cutoff) { hit <- k; break }
+    }
+    if (is.null(hit)) {
+      kept <- c(kept, s)
+      cand[Set == s, Kept := TRUE]
+    } else {
+      cand[Set == s, Collapsed_into := hit]
+    }
+  }
+}
+
+audit <- merge(audit, cand[, .(Set, Kept, Collapsed_into)], by = "Set", all.x = TRUE, sort = FALSE)
+audit[, Final_decision := fifelse(is.na(Family), "Not chromatin/estrogen by name rule",
+                          fifelse(!Size_ok, "Excluded by gene-set size",
+                          fifelse(Kept %in% TRUE, "Retained", "Collapsed (redundant)")))]
+fwrite(audit, file.path(table_dir, "geneset_selection_audit.tsv"), sep = "\t")
+
+final <- cand[Kept == TRUE]
+final_sets <- expressed_sets[final$Set]
+set_family <- setNames(final$Family, final$Set)
+cat("Final sets retained:\n")
+print(final[, .N, by = .(Family, Source)])
+if (!all(c("Chromatin", "Estrogen") %in% final$Family)) stop("A family has no retained sets.")
+
+fwrite(final[, .(Set, Family, Source, Expressed_size)],
+       file.path(table_dir, "retained_gene_sets.tsv"), sep = "\t")
+
+# Readable labels for figures (IDs stay unchanged in all tables)
+clean_label <- function(ids) {
+  x <- sub("^(GOBP|GOCC|GOMF|HALLMARK|REACTOME|KEGG_MEDICUS_REFERENCE|KEGG_MEDICUS)_", "", ids)
+  x <- tolower(gsub("_", " ", x))
+  x <- paste0(toupper(substr(x, 1, 1)), substring(x, 2))
+  x <- gsub("\\bdna\\b", "DNA", x, perl = TRUE)
+  x <- gsub("\\bprc([12])\\b", "PRC\\1", x, perl = TRUE)
+  x <- gsub("\\bswi snf\\b", "SWI/SNF", x, perl = TRUE)
+  x <- gsub("\\bhdacs?\\b", "HDAC", x, perl = TRUE)
+  make.unique(paste0(x, " [", set_source[ids], "]"), sep = " #")
+}
+label_map <- setNames(clean_label(names(final_sets)), names(final_sets))
+
+# ----------------------------
+# ssGSEA scores (sample level)
+# ----------------------------
+if ("ssgseaParam" %in% getNamespaceExports("GSVA")) {
+  param <- GSVA::ssgseaParam(exprData = expr, geneSets = final_sets,
+                             minSize = min_set_size, maxSize = max_set_size, normalize = TRUE)
+  scores <- GSVA::gsva(param, verbose = FALSE)
+} else {
+  scores <- GSVA::gsva(expr = expr, gset.idx.list = final_sets, method = "ssgsea",
+                       kcdf = "Gaussian", min.sz = min_set_size, max.sz = max_set_size,
+                       abs.ranking = TRUE, ssgsea.norm = TRUE, verbose = FALSE)
+}
+scores <- as.matrix(scores)[, cluster_dt$Sample, drop = FALSE]
+
+fwrite(data.table(Set = rownames(scores), Family = set_family[rownames(scores)],
+                  Label = label_map[rownames(scores)], scores),
+       file.path(table_dir, "ssGSEA_scores.tsv"), sep = "\t")
+
+# ----------------------------
+# Cluster comparisons (FDR inside each family)
+# ----------------------------
+score_long <- melt(as.data.table(scores, keep.rownames = "Set"),
+                   id.vars = "Set", variable.name = "Sample", value.name = "Score")
+score_long <- merge(score_long, cluster_dt, by = "Sample", sort = FALSE)
+score_long[, Family := set_family[Set]]
+score_long[, Label := label_map[Set]]
+
+global_tests <- score_long[, {
+  k <- kruskal.test(Score ~ Cluster)
+  list(KW_statistic = unname(k$statistic), P_value = k$p.value,
+       Median_Cluster1 = median(Score[Cluster == "Cluster 1"]),
+       Median_Cluster2 = median(Score[Cluster == "Cluster 2"]),
+       Median_Cluster3 = median(Score[Cluster == "Cluster 3"]))
+}, by = .(Family, Set, Label)]
+global_tests[, FDR := p.adjust(P_value, method = "BH"), by = Family]
+setorder(global_tests, Family, FDR, P_value)
+fwrite(global_tests, file.path(table_dir, "cluster_global_tests.tsv"), sep = "\t", na = "")
+
+pair_defs <- list(Cluster2_vs_Cluster1 = c("Cluster 2", "Cluster 1"),
+                  Cluster3_vs_Cluster1 = c("Cluster 3", "Cluster 1"),
+                  Cluster3_vs_Cluster2 = c("Cluster 3", "Cluster 2"))
+
+pairwise_tests <- rbindlist(lapply(names(pair_defs), function(cmp) {
+  p <- pair_defs[[cmp]]
+  out <- score_long[Cluster %in% p, {
+    x <- Score[Cluster == p[1]]; y <- Score[Cluster == p[2]]
+    list(Median_A = median(x), Median_B = median(y),
+         Median_difference_A_minus_B = median(x) - median(y),
+         P_value = wilcox.test(x, y, exact = FALSE)$p.value)
+  }, by = .(Family, Set, Label)]
+  out[, Comparison := cmp]
+  out[, FDR := p.adjust(P_value, method = "BH"), by = Family]
+  out
+}))
+setorder(pairwise_tests, Comparison, Family, FDR, P_value)
+fwrite(pairwise_tests, file.path(table_dir, "cluster_pairwise_tests.tsv"), sep = "\t", na = "")
+
+# ----------------------------
+# Heatmap: top sets per family, grouped by cluster
+# ----------------------------
+top_sets <- global_tests[, head(.SD, n_top_heatmap), by = Family]
+hm_mat <- zscore_rows(scores[top_sets$Set, cluster_dt$Sample, drop = FALSE])
+
+ht_scores <- Heatmap(
+  hm_mat, name = "Score Z",
+  col = colorRamp2(c(-2.5, 0, 2.5), c("#2166AC", "white", "#B2182B")),
+  cluster_rows = TRUE, cluster_columns = FALSE,
+  row_split = factor(top_sets$Family, levels = c("Chromatin", "Estrogen")),
+  column_split = cluster_dt$Cluster, column_order = cluster_dt$Sample,
+  top_annotation = HeatmapAnnotation(Cluster = cluster_dt$Cluster,
+                                     col = list(Cluster = cluster_colors),
+                                     annotation_name_side = "left"),
+  row_labels = label_map[rownames(hm_mat)],
+  row_names_gp = gpar(fontsize = 8),
+  show_column_names = FALSE, border = TRUE,
+  column_title = "Chromatin and estrogen pathway scores by RNA cluster"
+)
+save_ht(ht_scores, "pathway_scores_cluster_heatmap", w = 15, h = max(8, 0.2 * nrow(hm_mat) + 4))
+
+# ----------------------------
+# Boxplots of the top sets per family
+# ----------------------------
+box_sets <- global_tests[, head(.SD, n_top_box), by = Family]
+box_dt <- score_long[Set %in% box_sets$Set]
+box_dt[, Label := factor(Label, levels = box_sets$Label)]
+
+box_plot <- ggplot(box_dt, aes(Cluster, Score, color = Cluster)) +
+  geom_boxplot(outlier.shape = NA, width = 0.65) +
+  geom_jitter(width = 0.12, size = 1.8, alpha = 0.8) +
+  facet_wrap(~ Label, scales = "free_y", ncol = 4, labeller = label_wrap_gen(width = 35)) +
+  scale_color_manual(values = cluster_colors) +
+  labs(title = "Top chromatin and estrogen pathway scores across RNA clusters",
+       subtitle = "Ranked by Kruskal-Wallis FDR within each family", x = NULL, y = "ssGSEA score") +
+  theme_bw(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"), legend.position = "none",
+        strip.text = element_text(size = 8), axis.text.x = element_text(angle = 30, hjust = 1))
+ggsave(file.path(plot_dir, "pathway_scores_top_boxplots.pdf"), box_plot, width = 16, height = 11)
+ggsave(file.path(plot_dir, "pathway_scores_top_boxplots.png"), box_plot, width = 16, height = 11, dpi = 300)
+
+# ----------------------------
+# Correlation: chromatin vs estrogen pathway scores
+#   Overall: all samples
+#   Within-cluster: scores first adjusted for cluster (residuals)
+# ----------------------------
+chr_ids <- names(set_family)[set_family == "Chromatin"]
+est_ids <- names(set_family)[set_family == "Estrogen"]
+
+resid_mat <- t(apply(scores, 1, function(v) resid(lm(v ~ cluster_dt$Cluster))))
+colnames(resid_mat) <- colnames(scores)
+
+cor_dt <- data.table(Chromatin_set = rep(chr_ids, each = length(est_ids)),
+                     Estrogen_set  = rep(est_ids, times = length(chr_ids)))
+
+cor_res <- rbindlist(lapply(seq_len(nrow(cor_dt)), function(i) {
+  a <- cor_dt$Chromatin_set[i]; b <- cor_dt$Estrogen_set[i]
+  t_all <- suppressWarnings(cor.test(scores[a, ], scores[b, ], method = "spearman", exact = FALSE))
+  t_win <- suppressWarnings(cor.test(resid_mat[a, ], resid_mat[b, ], method = "spearman", exact = FALSE))
+  data.table(Rho_overall = unname(t_all$estimate), P_overall = t_all$p.value,
+             Rho_within_cluster = unname(t_win$estimate), P_within_cluster = t_win$p.value,
+             Shared_genes = length(intersect(final_sets[[a]], final_sets[[b]])))
+}))
+cor_dt <- cbind(cor_dt, cor_res)
+cor_dt[, FDR_overall := p.adjust(P_overall, method = "BH")]
+cor_dt[, FDR_within_cluster := p.adjust(P_within_cluster, method = "BH")]
+cor_dt[, Chromatin_label := label_map[Chromatin_set]]
+cor_dt[, Estrogen_label := label_map[Estrogen_set]]
+setorder(cor_dt, FDR_overall, P_overall)
+fwrite(cor_dt, file.path(table_dir, "chromatin_vs_estrogen_correlations.tsv"), sep = "\t", na = "")
+
+to_matrix <- function(value_col) {
+  m <- matrix(cor_dt[[value_col]][match(paste(rep(chr_ids, each = length(est_ids)),
+                                              rep(est_ids, times = length(chr_ids))),
+                                        paste(cor_dt$Chromatin_set, cor_dt$Estrogen_set))],
+              nrow = length(chr_ids), ncol = length(est_ids), byrow = TRUE,
+              dimnames = list(chr_ids, est_ids))
+  m
+}
+
+draw_cor_heatmap <- function(rho_col, fdr_col, title, stem) {
+  rho <- to_matrix(rho_col); fdr <- to_matrix(fdr_col)
+  ht <- Heatmap(
+    rho, name = "Spearman rho",
+    col = colorRamp2(c(-1, 0, 1), c("#2166AC", "white", "#B2182B")),
+    row_labels = label_map[rownames(rho)], column_labels = label_map[colnames(rho)],
+    row_names_gp = gpar(fontsize = 7), column_names_gp = gpar(fontsize = 8),
+    column_names_rot = 60, border = TRUE,
+    row_title = "Chromatin pathways", column_title = title,
+    cell_fun = function(j, i, x, y, w, h, fill) {
+      if (!is.na(fdr[i, j]) && fdr[i, j] < 0.05) grid.text("*", x, y, gp = gpar(fontsize = 9))
+    }
+  )
+  save_ht(ht, stem, w = max(12, 0.45 * ncol(rho) + 9), h = max(9, 0.17 * nrow(rho) + 5))
+}
+
+draw_cor_heatmap("Rho_overall", "FDR_overall",
+                 "Chromatin vs estrogen scores, all tumors (* FDR < 0.05)",
+                 "chromatin_vs_estrogen_correlation_overall")
+draw_cor_heatmap("Rho_within_cluster", "FDR_within_cluster",
+                 "Chromatin vs estrogen scores, adjusted for cluster (* FDR < 0.05)",
+                 "chromatin_vs_estrogen_correlation_within_cluster")
+
+# Scatter plots of the strongest pairs (overall FDR)
+top_pairs <- head(cor_dt, n_top_scatter)
+scatter_dt <- rbindlist(lapply(seq_len(nrow(top_pairs)), function(i) {
+  pair_label <- paste0(top_pairs$Chromatin_label[i], "\nvs ", top_pairs$Estrogen_label[i],
+                       "\nrho = ", round(top_pairs$Rho_overall[i], 2),
+                       ", FDR = ", signif(top_pairs$FDR_overall[i], 2),
+                       "; within-cluster rho = ", round(top_pairs$Rho_within_cluster[i], 2))
+  data.table(Pair = pair_label, Sample = cluster_dt$Sample, Cluster = cluster_dt$Cluster,
+             Chromatin_score = scores[top_pairs$Chromatin_set[i], cluster_dt$Sample],
+             Estrogen_score  = scores[top_pairs$Estrogen_set[i], cluster_dt$Sample])
+}))
+scatter_dt[, Pair := factor(Pair, levels = unique(Pair))]
+
+scatter_plot <- ggplot(scatter_dt, aes(Chromatin_score, Estrogen_score, color = Cluster)) +
+  geom_point(size = 2.5, alpha = 0.9) +
+  geom_smooth(aes(group = 1), method = "lm", se = FALSE, color = "grey30", linewidth = 0.6) +
+  facet_wrap(~ Pair, scales = "free", ncol = 2) +
+  scale_color_manual(values = cluster_colors) +
+  labs(title = "Strongest chromatin vs estrogen pathway-score correlations",
+       x = "Chromatin pathway ssGSEA score", y = "Estrogen pathway ssGSEA score") +
+  theme_bw(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"), strip.text = element_text(size = 7))
+ggsave(file.path(plot_dir, "chromatin_vs_estrogen_top_scatter.pdf"), scatter_plot, width = 13, height = 12)
+ggsave(file.path(plot_dir, "chromatin_vs_estrogen_top_scatter.png"), scatter_plot, width = 13, height = 12, dpi = 300)
+
+# ----------------------------
+# Summary, README and provenance (fixed file names)
+# ----------------------------
+summary_dt <- data.table(
+  Metric = c("Samples", "Cluster_1", "Cluster_2", "Cluster_3", "Genes_after_prefilter",
+             "Symbols_for_scoring", "Chromatin_sets_retained", "Estrogen_sets_retained",
+             "Chromatin_sets_FDR_lt_0.05_across_clusters", "Estrogen_sets_FDR_lt_0.05_across_clusters",
+             "Correlation_pairs_tested", "Pairs_FDR_lt_0.05_overall", "Pairs_FDR_lt_0.05_within_cluster",
+             "Significant_overall_pairs_sharing_genes"),
+  Value = c(ncol(expr), sum(cluster_dt$Cluster == "Cluster 1"), sum(cluster_dt$Cluster == "Cluster 2"),
+            sum(cluster_dt$Cluster == "Cluster 3"), nrow(dds), nrow(expr),
+            length(chr_ids), length(est_ids),
+            sum(global_tests$Family == "Chromatin" & global_tests$FDR < 0.05, na.rm = TRUE),
+            sum(global_tests$Family == "Estrogen" & global_tests$FDR < 0.05, na.rm = TRUE),
+            nrow(cor_dt), sum(cor_dt$FDR_overall < 0.05, na.rm = TRUE),
+            sum(cor_dt$FDR_within_cluster < 0.05, na.rm = TRUE),
+            sum(cor_dt$FDR_overall < 0.05 & cor_dt$Shared_genes > 0, na.rm = TRUE))
+)
+fwrite(summary_dt, file.path(table_dir, "analysis_summary.tsv"), sep = "\t")
+
+writeLines(
+  c("pILC chromatin and estrogen pathway-score analysis",
+    "Seed: 42",
+    "Gene sets: MSigDB GO (local C5 GMT), Hallmark, Reactome, KEGG Medicus; no hand-typed gene lists.",
+    "Family assignment: keyword rules on database set names (see geneset_selection_audit.tsv).",
+    paste0("Set size: ", min_set_size, "-", max_set_size, " expressed genes; sets with Jaccard >= ", jaccard_cutoff, " collapsed within family."),
+    "Expression: DESeq2 prefilter (count >= 10 in >= 3 samples), VST with blind = TRUE, ssGSEA (GSVA).",
+    "Cluster comparison: Kruskal-Wallis and pairwise Wilcoxon; BH FDR within each family.",
+    "Correlation: Spearman, overall and after adjusting scores for cluster; BH FDR across all pairs.",
+    "Pairs sharing genes (Shared_genes > 0) are partly correlated by construction.",
+    "Clusters were derived from the same expression data; results are not independent validation.",
+    "RNA pathway scores show coordinated expression, not causal or mechanistic links."),
+  file.path(out_dir, "README_chromatin_estrogen_pathway_scores.txt")
+)
+
+writeLines(
+  c(paste0("msigdbr version: ", as.character(packageVersion("msigdbr"))),
+    paste0("GSVA version: ", as.character(packageVersion("GSVA"))),
+    paste0("C5 GMT: ", c5_gmt_file),
+    paste0("C5 GMT md5: ", unname(tools::md5sum(c5_gmt_file)))),
+  file.path(out_dir, "database_provenance.txt")
+)
+writeLines(capture.output(sessionInfo()), file.path(out_dir, "sessionInfo.txt"))
+
+message("Done. Output: ", out_dir)
+print(summary_dt)
+```
+```{r}
+out_dir   <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/Downstream/Chromatin_Estrogen_pathway_scores"
+table_dir <- file.path(out_dir, "tables")
+plot_dir  <- file.path(out_dir, "plots")
+
+score_file  <- file.path(table_dir, "ssGSEA_scores.tsv")
+meta_file   <- file.path(table_dir, "cluster_metadata.tsv")
+global_file <- file.path(table_dir, "cluster_global_tests.tsv")
+cor_file    <- file.path(table_dir, "chromatin_vs_estrogen_correlations.tsv")
+for (f in c(score_file, meta_file, global_file, cor_file)) if (!file.exists(f)) stop("Missing: ", f)
+
+# Settings
+n_top_chromatin <- 25          # chromatin sets shown in the bubble plot (estrogen: all)
+cluster_colors  <- c("Cluster 1" = "#1B9E77", "Cluster 2" = "#D95F02", "Cluster 3" = "#7570B3")
+panel_levels    <- c("All tumors", "Cluster 1", "Cluster 2", "Cluster 3")
+
+# ----------------------------
+# Read data
+# ----------------------------
+meta <- fread(meta_file)
+meta[, Cluster := factor(Cluster, levels = names(cluster_colors))]
+
+scores_dt <- fread(score_file)
+score_mat <- as.matrix(scores_dt[, meta$Sample, with = FALSE])
+rownames(score_mat) <- scores_dt$Set
+label_map  <- setNames(scores_dt$Label,  scores_dt$Set)
+family_map <- setNames(scores_dt$Family, scores_dt$Set)
+
+gt <- fread(global_file)   # Kruskal-Wallis across clusters, FDR inside each family
+
+chr_ids <- names(family_map)[family_map == "Chromatin"]
+est_ids <- names(family_map)[family_map == "Estrogen"]
+
+save_plot <- function(p, stem, w, h) {
+  ggsave(file.path(plot_dir, paste0(stem, ".pdf")), p, width = w, height = h)
+  ggsave(file.path(plot_dir, paste0(stem, ".png")), p, width = w, height = h, dpi = 300)
+}
+
+# ============================================================
+# FIGURE 1: bubble plot, chromatin and estrogen pathways by cluster
+# ============================================================
+
+# Z-score each pathway across the 31 tumors, then take the median per cluster
+z_mat <- t(scale(t(score_mat)))
+z_mat[!is.finite(z_mat)] <- 0
+z_long <- melt(as.data.table(z_mat, keep.rownames = "Set"),
+               id.vars = "Set", variable.name = "Sample", value.name = "Z")
+z_long <- merge(z_long, meta, by = "Sample")
+bub <- z_long[, .(Median_Z = median(Z)), by = .(Set, Cluster)]
+
+# Choose pathways: all estrogen sets, top N chromatin sets by global FDR
+setorder(gt, Family, FDR, P_value)
+sel <- rbind(gt[Family == "Chromatin", head(.SD, n_top_chromatin)],
+             gt[Family == "Estrogen"])
+bub <- merge(bub, sel[, .(Set, Family, Label, FDR)], by = "Set")
+bub[, Family := factor(Family, levels = c("Chromatin", "Estrogen"))]
+bub[, minus_log10_FDR := -log10(pmax(FDR, 1e-10))]
+
+# Row order inside each family: cluster the cluster-level profiles
+row_levels <- unlist(lapply(c("Chromatin", "Estrogen"), function(fam) {
+  w <- dcast(bub[Family == fam], Label ~ Cluster, value.var = "Median_Z")
+  m <- as.matrix(w[, -"Label"]); rownames(m) <- w$Label
+  rownames(m)[hclust(dist(m))$order]
+}))
+bub[, Label := factor(Label, levels = rev(row_levels))]
+
+fwrite(bub[order(Family, Label)], file.path(table_dir, "bubble_plot_data.tsv"), sep = "\t")
+
+bubble_plot <- ggplot(bub, aes(Cluster, Label, fill = Median_Z, size = minus_log10_FDR)) +
+  geom_point(shape = 21, color = "grey20", stroke = 0.4) +
+  facet_grid(Family ~ ., scales = "free_y", space = "free_y") +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B", midpoint = 0,
+                       name = "Median score\n(Z across tumors)") +
+  scale_size_continuous(name = "-log10 FDR\n(3-cluster test)",
+                        limits = c(0, 2.5),                      
+                        breaks = c(0.5, 1.3, 2),
+                        labels = c("0.5", "1.3 (FDR 0.05)", "2"),
+                        range = c(2, 9)) +
+  labs(title = "Chromatin and estrogen pathway scores across pILC RNA clusters",
+       subtitle = "Colour: relative score in the cluster; size: Kruskal-Wallis FDR (same for every cluster in a row)",
+       x = NULL, y = NULL,
+       caption = "ssGSEA on blind VST. FDR computed within each family. Clusters were derived from the same expression data.") +
+  theme_bw(base_size = 11) +
+  theme(plot.title.position = "plot",                            # NEW: title starts at the figure edge
+        plot.caption.position = "plot",                          # NEW: caption starts at the figure edge
+        plot.title = element_text(face = "bold"),
+        strip.text.y = element_text(face = "bold", size = 11),
+        axis.text.y = element_text(size = 8),
+        panel.grid.minor = element_blank(),
+        plot.caption = element_text(hjust = 0, size = 8))
+
+save_plot(bubble_plot, "chromatin_estrogen_bubble_by_cluster",
+          w = 14, h = max(8, 0.24 * nrow(unique(bub[, .(Label)])) + 3))   # NEW: w = 14
+
+# ============================================================
+# FIGURE 2: correlation, all tumors (main result) and cluster-wise (descriptive)
+# ============================================================
+
+cor_one <- function(x, y) {
+  t <- suppressWarnings(cor.test(x, y, method = "spearman", exact = FALSE))
+  list(Rho = unname(t$estimate), P_value = t$p.value)
+}
+
+# CJ with sorted = FALSE: chromatin is the outer index, estrogen the inner index
+pairs_dt <- CJ(Chromatin_set = chr_ids, Estrogen_set = est_ids, sorted = FALSE)
+
+res <- rbindlist(lapply(panel_levels, function(panel) {
+  samples <- if (panel == "All tumors") meta$Sample else meta$Sample[meta$Cluster == panel]
+  out <- rbindlist(lapply(seq_len(nrow(pairs_dt)), function(i) {
+    cor_one(score_mat[pairs_dt$Chromatin_set[i], samples],
+            score_mat[pairs_dt$Estrogen_set[i],  samples])
+  }))
+  out <- cbind(pairs_dt, out)
+  out[, Panel := panel]
+  out[, N_samples := length(samples)]
+  out[, FDR := p.adjust(P_value, method = "BH")]      # FDR inside each panel
+  out
+}))
+res[, Chromatin_label := label_map[Chromatin_set]]
+res[, Estrogen_label  := label_map[Estrogen_set]]
+
+# NEW: number of genes shared by each pair (from the pILC_03 output).
+# match() keeps the row order of res, which the heatmap matrices rely on.
+shared <- fread(cor_file)[, .(Chromatin_set, Estrogen_set, Shared_genes)]
+res[, Shared_genes := shared$Shared_genes[
+  match(paste(Chromatin_set, Estrogen_set), paste(shared$Chromatin_set, shared$Estrogen_set))]]
+if (anyNA(res$Shared_genes)) stop("Shared_genes missing for some pairs; check cor_file.")
+
+fwrite(res, file.path(table_dir, "chromatin_vs_estrogen_correlations_all_and_cluster_wise.tsv"),
+       sep = "\t", na = "")
+
+# ------------------------------------------------------------
+# NEW: main result table = pooled test (all 31 tumors)
+# FDR < 0.05, no shared genes, positive rho
+# ------------------------------------------------------------
+pooled <- res[Panel == "All tumors"]
+pooled_sig <- pooled[FDR < 0.05 & Shared_genes == 0]
+setorder(pooled_sig, -Rho, FDR)             # repeats grouped by estrogen pathway
+
+fwrite(pooled_sig[, .(Chromatin_label, Estrogen_label, Rho, P_value, FDR, Shared_genes)],
+       file.path(table_dir, "chromatin_vs_estrogen_pairs_FDR_overall_sig.tsv"), sep = "\t")
+
+cat("Pairs tested:", nrow(pooled), "\n")
+cat("FDR < 0.05 (all tumors):", sum(pooled$FDR < 0.05), "\n")
+cat("  of these sharing genes (flagged '#'):", sum(pooled$FDR < 0.05 & pooled$Shared_genes > 0), "\n")
+cat("Reported pairs (FDR < 0.05, no shared genes):", nrow(pooled_sig),
+    "| positive:", sum(pooled_sig$Rho > 0), "| negative:", sum(pooled_sig$Rho < 0), "\n")
+cat("Unique chromatin pathways:", uniqueN(pooled_sig$Chromatin_set),
+    "| unique estrogen pathways:", uniqueN(pooled_sig$Estrogen_set), "\n")
+
+# ------------------------------------------------------------
+# Heatmap: one fixed order for every panel, taken from the all-tumor result
+# ------------------------------------------------------------
+rho_all <- matrix(res[Panel == "All tumors", Rho], nrow = length(chr_ids),
+                  ncol = length(est_ids), byrow = TRUE,
+                  dimnames = list(chr_ids, est_ids))
+chr_order <- rownames(rho_all)[hclust(dist(rho_all))$order]
+est_order <- colnames(rho_all)[hclust(dist(t(rho_all)))$order]
+
+res[, Chromatin_label := factor(Chromatin_label, levels = rev(label_map[chr_order]))]
+res[, Estrogen_label  := factor(Estrogen_label,  levels = label_map[est_order])]
+res[, Panel_label := factor(paste0(Panel, " (n = ", N_samples, ")"),
+                            levels = unique(paste0(panel_levels, " (n = ", res[match(panel_levels, Panel), N_samples], ")")))]
+
+# * = FDR < 0.05 and no shared genes; # = FDR < 0.05 but shared genes; + = nominal P < 0.05 only
+res[, Mark := fifelse(FDR < 0.05 & Shared_genes == 0, "*",
+              fifelse(FDR < 0.05, "#",
+              fifelse(P_value < 0.05, "+", "")))]
+
+cor_plot <- ggplot(res, aes(Estrogen_label, Chromatin_label, fill = Rho)) +
+  geom_tile(color = "white", linewidth = 0.2) +
+  geom_text(aes(label = Mark), size = 3, vjust = 0.75) +
+  facet_grid(. ~ Panel_label) +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                       midpoint = 0, limits = c(-1, 1), name = "Spearman rho") +
+  labs(title = "Chromatin vs estrogen pathway scores: whole cohort and within each cluster",
+       subtitle = paste0("* FDR < 0.05 (no shared genes);  # FDR < 0.05 but gene sets share genes;  ",
+                         "+ nominal P < 0.05 only. FDR computed within each panel; cluster panels are descriptive."),
+       x = "Estrogen pathways", y = "Chromatin pathways") +
+  theme_bw(base_size = 10) +
+  theme(plot.title = element_text(face = "bold"),
+        axis.text.x = element_text(angle = 60, hjust = 1, size = 7),
+        axis.text.y = element_text(size = 7),
+        panel.grid = element_blank(),
+        strip.text = element_text(face = "bold"))
+
+save_plot(cor_plot, "chromatin_vs_estrogen_correlation_all_and_cluster_wise",
+          w = 24, h = max(9, 0.2 * length(chr_ids) + 4))
+
+# ------------------------------------------------------------
+# NEW: scatter plots of every pooled-significant pair (repeats allowed),
+# grouped by estrogen pathway, one pooled regression line per panel
+# ------------------------------------------------------------
+if (nrow(pooled_sig) > 0) {
+  sc <- rbindlist(lapply(seq_len(nrow(pooled_sig)), function(i) {
+    ttl <- paste0(pooled_sig$Chromatin_label[i], "\nvs ", pooled_sig$Estrogen_label[i],
+                  "\nrho = ", round(pooled_sig$Rho[i], 2),
+                  ", FDR = ", signif(pooled_sig$FDR[i], 2))
+    data.table(Pair = ttl, Cluster = meta$Cluster,
+               Chromatin_score = score_mat[pooled_sig$Chromatin_set[i], meta$Sample],
+               Estrogen_score  = score_mat[pooled_sig$Estrogen_set[i],  meta$Sample])
+  }))
+  sc[, Pair := factor(Pair, levels = unique(Pair))]   # keeps the grouped order
+
+  sc_plot <- ggplot(sc, aes(Chromatin_score, Estrogen_score)) +
+    geom_point(aes(color = Cluster), size = 2.3, alpha = 0.9) +
+    geom_smooth(method = "lm", se = FALSE, color = "grey25", linewidth = 0.8) +  # pooled line
+    facet_wrap(~ Pair, scales = "free", ncol = 3) +
+    scale_color_manual(values = cluster_colors) +
+    labs(title = "Chromatin vs estrogen pathway scores across all 31 tumors",
+         subtitle = "Spearman, FDR < 0.05 across 400 pairs; shared-gene pairs excluded; cluster colours for display only",
+         x = "Chromatin pathway ssGSEA score", y = "Estrogen pathway ssGSEA score") +
+    theme_bw(base_size = 11) +
+    theme(plot.title = element_text(face = "bold"), strip.text = element_text(size = 7))
+
+  save_plot(sc_plot, "chromatin_vs_estrogen_pairs_FDR_overall_scatter",
+            w = 15, h = max(6, 3.6 * ceiling(nrow(pooled_sig) / 3)))
+}
+# ============================================================
+# TABLE: consistency across clusters (best pairs to report)
+# ============================================================
+cl <- res[Panel != "All tumors"]
+cl[, Cl := gsub(" ", "", as.character(Panel))]
+wide <- dcast(cl, Chromatin_set + Estrogen_set ~ Cl, value.var = c("Rho", "P_value"))
+rho_cols <- paste0("Rho_Cluster", 1:3)
+wide[, Mean_rho_clusters := rowMeans(.SD), .SDcols = rho_cols]
+wide[, Min_rho_clusters  := do.call(pmin, .SD), .SDcols = rho_cols]
+wide[, Positive_in_all_clusters := Min_rho_clusters > 0]
+wide[, Clusters_with_P_lt_0.05 := rowSums(.SD < 0.05), .SDcols = paste0("P_value_Cluster", 1:3)]
+
+all_tbl <- res[Panel == "All tumors", .(Chromatin_set, Estrogen_set, Rho_all = Rho,
+                                        P_all = P_value, FDR_all = FDR)]
+shared  <- fread(cor_file)[, .(Chromatin_set, Estrogen_set, Shared_genes)]
+wide <- Reduce(function(a, b) merge(a, b, by = c("Chromatin_set", "Estrogen_set"), all.x = TRUE),
+               list(wide, all_tbl, shared))
+wide[, Chromatin_label := label_map[Chromatin_set]]
+wide[, Estrogen_label  := label_map[Estrogen_set]]
+setorder(wide, FDR_all, -Min_rho_clusters)
+fwrite(wide, file.path(table_dir, "chromatin_vs_estrogen_consistency_across_clusters.tsv"),
+       sep = "\t", na = "")
+
+cat("Pairs tested:", nrow(wide), "\n")
+cat("Significant across the cohort (FDR < 0.05):", sum(wide$FDR_all < 0.05, na.rm = TRUE), "\n")
+cat("Positive in all three clusters:", sum(wide$Positive_in_all_clusters), "\n")
+cat("Both (cohort FDR < 0.05, positive in all clusters, no shared genes):",
+    sum(wide$FDR_all < 0.05 & wide$Positive_in_all_clusters & wide$Shared_genes == 0, na.rm = TRUE), "\n")
+
+# ============================================================
+# Scatter plots of the best pairs (one regression line per cluster)
+# ============================================================
+best <- head(wide[FDR_all < 0.05 & Positive_in_all_clusters == TRUE & Shared_genes == 0], 6)
+if (nrow(best) > 0) {
+  sc <- rbindlist(lapply(seq_len(nrow(best)), function(i) {
+    ttl <- paste0(best$Chromatin_label[i], "\nvs ", best$Estrogen_label[i],
+                  "\nall: rho = ", round(best$Rho_all[i], 2),
+                  "; clusters: ", round(best$Rho_Cluster1[i], 2), " / ",
+                  round(best$Rho_Cluster2[i], 2), " / ", round(best$Rho_Cluster3[i], 2))
+    data.table(Pair = ttl, Cluster = meta$Cluster,
+               Chromatin_score = score_mat[best$Chromatin_set[i], meta$Sample],
+               Estrogen_score  = score_mat[best$Estrogen_set[i],  meta$Sample])
+  }))
+  sc[, Pair := factor(Pair, levels = unique(Pair))]
+
+  sc_plot <- ggplot(sc, aes(Chromatin_score, Estrogen_score, color = Cluster)) +
+    geom_point(size = 2.3, alpha = 0.9) +
+    geom_smooth(method = "lm", se = FALSE, linewidth = 0.8) +
+    facet_wrap(~ Pair, scales = "free", ncol = 2) +
+    scale_color_manual(values = cluster_colors) +
+    labs(title = "Best-supported chromatin vs estrogen pathway pairs",
+         x = "Chromatin pathway ssGSEA score", y = "Estrogen pathway ssGSEA score") +
+    theme_bw(base_size = 11) +
+    theme(plot.title = element_text(face = "bold"), strip.text = element_text(size = 7))
+  save_plot(sc_plot, "chromatin_vs_estrogen_best_pairs_scatter", w = 13, h = 12)
+} else {
+  message("No pair met all criteria; relax the filter or inspect the consistency table.")
+}
+```
+```{r}
+##   Leading-edge genes of the one estrogen pathway that differs between
+##   RNA clusters (Kruskal-Wallis FDR < 0.05), shown as a heatmap with a
+##   cluster bar on top.
+set.seed(42)
+
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(data.table)
+  library(fgsea)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(grid)
+})
+
+# ----------------------------
+# Paths (fixed names, no dates)
+# ----------------------------
+input_dir   <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/4_Count_file_pILC/VST_data_GENCODEv47"
+count_file  <- file.path(input_dir, "htseq_raw_counts_with_gene_names.csv")
+annot_file  <- file.path(input_dir, "gene_annotation_from_GTF.tsv")
+c5_gmt_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/GSEA/Dataset/c5.all.v2025.1.Hs.symbols.gmt"
+
+base_dir  <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/Downstream/Chromatin_Estrogen_pathway_scores"
+table_dir <- file.path(base_dir, "tables")
+plot_dir  <- file.path(base_dir, "plots")
+
+meta_file   <- file.path(table_dir, "cluster_metadata.tsv")
+global_file <- file.path(table_dir, "cluster_global_tests.tsv")
+score_file  <- file.path(table_dir, "ssGSEA_scores.tsv")
+for (f in c(count_file, annot_file, c5_gmt_file, meta_file, global_file, score_file)) {
+  if (!file.exists(f)) stop("Missing: ", f)
+}
+
+n_max_genes    <- 60
+cluster_colors <- c("Cluster 1" = "#1B9E77", "Cluster 2" = "#D95F02", "Cluster 3" = "#7570B3")
+
+# ----------------------------
+# 1. The one significant estrogen pathway
+# ----------------------------
+gt  <- fread(global_file)
+sig <- gt[Family == "Estrogen" & FDR < 0.05]
+if (nrow(sig) != 1) stop("Expected exactly 1 significant estrogen set, found ", nrow(sig))
+set_id    <- sig$Set
+set_label <- sub(" \\[GO\\]$", "", sig$Label)
+cat("Pathway:", sig$Label, "| FDR =", signif(sig$FDR, 3), "\n")
+
+gmt      <- strsplit(readLines(c5_gmt_file), "\t")
+gmt_sets <- setNames(lapply(gmt, function(v) toupper(v[-(1:2)])), vapply(gmt, `[`, character(1), 1))
+if (!(set_id %in% names(gmt_sets))) stop("Set not found in GMT: ", set_id)
+set_genes <- gmt_sets[[set_id]]
+
+# ----------------------------
+# 2. Clusters and target cluster (highest median pathway score)
+# ----------------------------
+meta <- fread(meta_file)
+meta[, Cluster := factor(Cluster, levels = names(cluster_colors))]
+
+sc <- fread(score_file)
+score_row <- as.numeric(sc[Set == set_id, meta$Sample, with = FALSE])
+target_cluster <- names(which.max(tapply(score_row, meta$Cluster, median)))
+cat("Target cluster:", target_cluster, "\n")
+
+# ----------------------------
+# 3. DESeq2 (ranking only): target cluster vs the other two
+# ----------------------------
+count_dt <- fread(count_file)
+count_dt <- count_dt[!grepl("^__", Gene)]
+cm <- as.matrix(count_dt[, meta$Sample, with = FALSE])
+rownames(cm) <- count_dt$Gene
+storage.mode(cm) <- "integer"
+
+coldata <- data.frame(
+  Group = factor(ifelse(meta$Cluster == target_cluster, "Target", "Rest"), levels = c("Rest", "Target")),
+  Cluster = meta$Cluster, row.names = meta$Sample)
+dds <- DESeqDataSetFromMatrix(cm, coldata, design = ~ Group)
+dds <- dds[rowSums(counts(dds) >= 10) >= 3, ]
+dds <- DESeq(dds, test = "Wald", quiet = TRUE)
+res <- as.data.table(as.data.frame(results(dds, contrast = c("Group", "Target", "Rest"))),
+                     keep.rownames = "Gene")
+
+annot <- fread(annot_file)
+res[, Symbol := toupper(annot$gene_symbol[match(Gene, annot$Gene)])]
+res <- res[!is.na(Symbol) & !grepl("^ENSG[0-9]+", Symbol) & !is.na(stat)]
+setorder(res, -baseMean)
+res <- res[!duplicated(Symbol)]
+
+# Blind VST for the heatmap values
+vst_mat <- assay(vst(dds, blind = TRUE))
+expr <- vst_mat[res$Gene, , drop = FALSE]
+rownames(expr) <- res$Symbol
+
+# ----------------------------
+# 4. fgsea on this one pathway -> leading edge
+# ----------------------------
+ranks <- sort(setNames(res$stat, res$Symbol), decreasing = TRUE)
+pathway <- setNames(list(intersect(set_genes, names(ranks))), set_id)
+cat("Genes in set:", length(set_genes), "| in ranking:", length(pathway[[1]]), "\n")
+
+set.seed(42)
+fg <- as.data.table(fgseaMultilevel(pathways = pathway, stats = ranks,
+                                    minSize = 10, maxSize = 500, eps = 0, nproc = 1))
+if (nrow(fg) == 0) stop("fgsea returned no result for this pathway.")
+print(fg[, .(pathway, size, NES, pval, padj)])
+
+leading <- fg$leadingEdge[[1]]
+cat("Leading-edge genes:", length(leading), "\n")
+if (fg$NES < 0) message("NES is negative: the leading edge is enriched in the OTHER clusters, not ", target_cluster)
+
+lead_dt <- res[Symbol %in% leading, .(Symbol, baseMean, log2FoldChange, stat, pvalue)]
+setorder(lead_dt, -stat)                 # ranking only; not drawn on the figure
+fwrite(lead_dt, file.path(table_dir, "response_to_estradiol_leading_edge_genes.tsv"), sep = "\t")
+fwrite(fg[, .(pathway, size, NES, pval, padj, leading_edge_size = length(leading),
+              leading_edge = paste(leading, collapse = ";"))],
+       file.path(table_dir, "response_to_estradiol_fgsea_result.tsv"), sep = "\t")
+
+# ----------------------------
+# 5. Heatmap: leading-edge genes, cluster bar on top only
+# ----------------------------
+shown <- if (fg$NES < 0) tail(lead_dt$Symbol, n_max_genes) else head(lead_dt$Symbol, n_max_genes)
+if (fg$NES < 0) shown <- rev(shown)      # keep the most enriched gene at the top
+
+col_order <- meta[order(Cluster), Sample]
+cl_vec    <- meta$Cluster[match(col_order, meta$Sample)]
+
+mat <- t(scale(t(expr[shown, col_order, drop = FALSE])))
+mat[!is.finite(mat)] <- 0
+mat[mat > 2.5]  <- 2.5
+mat[mat < -2.5] <- -2.5
+
+ht <- Heatmap(
+  mat, name = "Gene Z-score",
+  col = colorRamp2(c(-2.5, 0, 2.5), c("#2166AC", "white", "#B2182B")),
+  cluster_rows = FALSE, cluster_columns = FALSE,
+  column_split = cl_vec,
+  top_annotation = HeatmapAnnotation(Cluster = cl_vec, col = list(Cluster = cluster_colors),
+                                     annotation_name_side = "left"),
+  show_column_names = FALSE,
+  row_names_gp = gpar(fontsize = 9),
+  border = TRUE,
+  column_title = paste0(set_label, ": leading-edge genes (", target_cluster, " vs other clusters)")
+)
+
+h_in <- max(6, 0.18 * nrow(mat) + 3)
+for (ext in c("pdf", "png")) {
+  f <- file.path(plot_dir, paste0("response_to_estradiol_leading_edge_heatmap.", ext))
+  if (ext == "pdf") pdf(f, width = 9, height = h_in) else png(f, width = 9, height = h_in, units = "in", res = 300)
+  draw(ht, merge_legends = TRUE, padding = unit(c(4, 8, 6, 4), "mm"))
+  dev.off()
+}
+
+message("Done. Genes shown: ", nrow(mat), " of ", length(leading), " leading-edge genes")
+```
+```{r}
+# ----------------------------
+# Target cluster vs the other clusters on the pathway score
+# (nominal P: the target cluster was chosen after seeing the data)
+# ----------------------------
+library(data.table)
+table_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/Downstream/Chromatin_Estrogen_pathway_scores/tables"
+
+# 1. Pairwise results already computed (FDR is across the 10 estrogen sets, per comparison)
+pw <- fread(file.path(table_dir, "cluster_pairwise_tests.tsv"))
+print(pw[Label %like% "Response to estradiol \\[GO\\]",
+         .(Comparison, Median_A, Median_B, P_value, FDR)])
+
+# 2. Cluster 3 vs the other two pooled, on the pathway score
+sc   <- fread(file.path(table_dir, "ssGSEA_scores.tsv"))
+meta <- fread(file.path(table_dir, "cluster_metadata.tsv"))
+row  <- sc[Label %like% "Response to estradiol \\[GO\\]"]
+x    <- as.numeric(row[, meta$Sample, with = FALSE])
+is3  <- meta$Cluster == "Cluster 3"
+
+w <- wilcox.test(x[is3], x[!is3], exact = FALSE)
+cat("Median Cluster 3:", round(median(x[is3]), 3),
+    "| median others:", round(median(x[!is3]), 3),
+    "| Wilcoxon P =", signif(w$p.value, 3), "\n")
+```
