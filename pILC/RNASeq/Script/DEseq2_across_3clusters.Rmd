@@ -550,6 +550,8 @@ print(summary_dt)
 ```{r}
 # ============================================================
 # Named-gene-only outputs (bare ENSG IDs removed AFTER testing)
+# DESeq2 ran on all genes that passed the prefilter, named and unnamed together. Every gene got its log2FC, p-value and padj.
+# only afterwards, the rows whose label is a bare ENSG ID were dropped to make the named_genes tables and plots.
 # The full results above are unchanged; padj values are kept as they are.
 # ============================================================
 
@@ -671,4 +673,86 @@ for (comparison_name in names(result_named_list)) {
   ggsave(file.path(named_dir, paste0("pILC_DESeq2_volcano_", comparison_name, "_named_genes.pdf")),
          volcano_named, width = 8.5, height = 7)
 }
+```
+```{r}
+set.seed(42)
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+  library(ggrepel)
+})
+
+# ----------------------------
+# Paths (fixed names, no dates)
+# ----------------------------
+named_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/DESeq2/DESeq2_3clusters/pILC_DESeq2_3clusters/named_genes_only"
+res_file  <- file.path(named_dir, "pILC_DESeq2_all_pairwise_results_named_genes.tsv")
+if (!file.exists(res_file)) stop("Missing: ", res_file)
+
+# ----------------------------
+# Settings
+# ----------------------------
+n_label <- 8                          # genes labelled per side
+protein_coding_labels_only <- FALSE   # TRUE = label protein-coding genes only
+cluster_colors <- c("Cluster 1" = "#1B9E77", "Cluster 2" = "#D95F02", "Cluster 3" = "#7570B3")
+
+x <- fread(res_file)
+x <- x[!is.na(padj)]
+x[, minus_log10_padj := -log10(pmax(padj, .Machine$double.xmin))]
+
+comparisons <- unique(x$Comparison)   # e.g. Cluster1_vs_Cluster2 (positive log2FC = higher in the first)
+
+for (cmp in comparisons) {
+  d <- copy(x[Comparison == cmp])
+  cl <- strsplit(cmp, "_vs_")[[1]]
+  cl <- sub("Cluster", "Cluster ", cl)             # "Cluster 1", "Cluster 2"
+  up_lab   <- paste0("Higher in ", cl[1])
+  down_lab <- paste0("Higher in ", cl[2])
+
+  d[, Group := "Not significant"]
+  d[Significant_FDR05_LFC1 == TRUE & log2FoldChange > 0, Group := up_lab]
+  d[Significant_FDR05_LFC1 == TRUE & log2FoldChange < 0, Group := down_lab]
+
+  # Genes to label: most significant per side
+  cand <- d[Group != "Not significant"]
+  if (protein_coding_labels_only) cand <- cand[gene_biotype == "protein_coding"]
+  lab <- rbind(
+    cand[log2FoldChange > 0][order(padj)][seq_len(min(n_label, .N))],
+    cand[log2FoldChange < 0][order(padj)][seq_len(min(n_label, .N))]
+  )
+
+  cols <- c("Not significant" = "#BDBDBD",
+            setNames(cluster_colors[cl[1]], up_lab),
+            setNames(cluster_colors[cl[2]], down_lab))
+
+  n_sig <- sum(d$Group != "Not significant")
+
+  p <- ggplot(d, aes(log2FoldChange, minus_log10_padj, color = Group)) +
+    geom_point(alpha = 0.6, size = 1.2) +
+    geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "grey35") +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "grey35") +
+    geom_text_repel(data = lab, aes(label = gene_symbol), color = "black",
+                    size = 3, max.overlaps = Inf, box.padding = 0.35,
+                    segment.color = "grey50", segment.size = 0.3, min.segment.length = 0) +
+    scale_color_manual(values = cols, breaks = c(up_lab, down_lab, "Not significant")) +
+    labs(title = paste0(cl[1], " vs ", cl[2], " (named genes only)"),
+         subtitle = paste0(nrow(d), " named genes tested; ", n_sig,
+                           " with FDR < 0.05 and |shrunken log2FC| >= 1; top ", n_label,
+                           " per side labelled"),
+         x = paste0("Log2 fold change (", cl[1], " / ", cl[2], ")"),
+         y = "-log10 adjusted P-value", color = NULL) +
+    theme_bw(base_size = 12) +
+    theme(plot.title.position = "plot",
+          plot.title = element_text(face = "bold"),
+          panel.grid.minor = element_blank(), legend.position = "bottom")
+
+  stem <- file.path(named_dir, paste0("pILC_DESeq2_volcano_", cmp, "_named_genes_labelled"))
+  ggsave(paste0(stem, ".png"), p, width = 9, height = 7.5, dpi = 300)
+  ggsave(paste0(stem, ".pdf"), p, width = 9, height = 7.5)
+
+  fwrite(lab[, .(Comparison, gene_symbol, gene_biotype, log2FoldChange, padj, Group)],
+         file.path(named_dir, paste0("pILC_DESeq2_volcano_", cmp, "_labelled_genes.tsv")), sep = "\t")
+}
+message("Done: labelled volcano plots written to ", named_dir)
 ```
