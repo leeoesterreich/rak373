@@ -1,0 +1,123 @@
+---
+title: "VennDiagram"
+output: html_document
+date: "2026-02-16"
+---
+
+```{r setup, include=FALSE}
+############################################
+## Venn diagram: Bionano, RNAseq, IMPACTseq, WES, WGS
+############################################
+
+library(dplyr)
+library(VennDiagram)
+library(grid)
+
+# ---------- File path ----------
+cohort_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/pILC_cohort.csv"
+
+# ---------- Read and fix cohort table ----------
+cohort_raw <- read.csv(cohort_file,
+                       check.names = FALSE,
+                       stringsAsFactors = FALSE)
+
+# First data row contains the true header
+true_header <- as.character(unlist(cohort_raw[1, ]))
+colnames(cohort_raw) <- trimws(true_header)
+
+# Drop that header row
+cohort <- cohort_raw[-1, ]
+
+# ---------- Clean columns ----------
+# Helper to safely trim a column if it exists
+trim_col <- function(df, col) {
+  if (!col %in% colnames(df)) stop(paste("Missing column in cohort table:", col))
+  df[[col]] <- trimws(as.character(df[[col]]))
+  df
+}
+
+cohort <- cohort %>%
+  trim_col("Sample") %>%
+  trim_col("Bionano") %>%
+  trim_col("RNAseq") %>%
+  trim_col("IMPACTseq") %>%
+  trim_col("WES") %>%
+  trim_col("WGS")
+
+# ---------- Define sets for each modality ----------
+bionano_samples <- cohort$Sample[cohort$Bionano   == "Y"]
+rna_samples     <- cohort$Sample[cohort$RNAseq    == "Y"]
+impact_samples  <- cohort$Sample[cohort$IMPACTseq == "Y"]
+wes_samples     <- cohort$Sample[cohort$WES       == "Y"]
+wgs_samples     <- cohort$Sample[cohort$WGS       == "Y"]
+
+venn_list <- list(
+  Bionano   = bionano_samples,
+  RNAseq    = rna_samples,
+  IMPACTseq = impact_samples,
+  WES       = wes_samples,
+  WGS       = wgs_samples
+)
+
+venn_plot <- venn.diagram(
+  x = venn_list,
+  filename = NULL,   # IMPORTANT
+  fill = c("#1b9e77", "#F8766D", "#7CAE00", "#00BFC4", "#C77CFF"),
+  alpha = 0.5
+)
+
+```
+
+
+```{r}
+# ---------- Draw Venn diagram ----------
+venn_plot <- venn.diagram(
+  x = venn_list,
+  filename = NULL,
+  main = "pILC multi-omics overlap",
+  main.cex = 1.5,
+  fill = c("#1b9e77", "#F8766D", "#7CAE00", "#00BFC4", "#C77CFF"),
+  alpha = 0.5,
+  disable.logging = TRUE,   # no log file
+  cex = 1.1,
+  cat.cex = 1.15,
+  cat.col = "black",
+  cat.pos = 0,
+  cat.dist = 0.05,
+  margin = 0.1,
+  col = "black",
+  lwd = 1,
+  imagetype = "png",
+  background = "white"
+)
+
+grid.newpage()
+grid.draw(venn_plot)
+
+# ---------- Save as PNG ----------
+png("pILC_multiomics_venn_5set.png", width = 2600, height = 2600, res = 300, bg = "white")
+grid.newpage()
+grid.draw(venn_plot)
+dev.off()
+
+# ---------- Save as PDF ----------
+pdf("pILC_multiomics_venn_5set.pdf", width = 7.5, height = 7.5, bg = "white")
+grid.newpage()
+grid.draw(venn_plot)
+dev.off()
+
+```
+
+```{r}
+# ---------- Sanity check: number of samples per modality ----------
+cat("\n==============================\n")
+cat("Sample counts per modality\n")
+cat("==============================\n")
+
+modality_counts <- sapply(venn_list, length)
+
+print(modality_counts)
+
+cat("\nTotal unique samples across all modalities:\n")
+print(length(unique(unlist(venn_list))))
+```
