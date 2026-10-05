@@ -1,0 +1,142 @@
+---
+title: "Pairwise_GSEA_leading_edge_heatmap"
+output: html_document
+date: "2026-10-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+############################################################
+## PURPOSE  : Expression heatmap of leading-edge genes for the Hallmark
+##            pathways with FDR < 0.05 (pairwise preranked GSEA)
+## INPUT    : pairwise_GSEA_all_collections.tsv, raw HTSeq counts,
+##            pILC_DESeq2_all_pairwise_results_named_genes.tsv, cluster_metadata.tsv
+## OUTPUT   : named_genes_only/pairwise_GSEA/
+## NOTES    : Blind VST, Z-score per gene. Rows ordered by the DESeq2 Wald statistic
+##            (ordering only). Clusters were derived from the same expression data.
+############################################################
+```
+
+
+```{r}
+set.seed(42)
+
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(data.table)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(grid)
+})
+
+# ----------------------------
+# Paths (fixed names, no dates)
+# ----------------------------
+named_dir  <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/DESeq2/DESeq2_3clusters/pILC_DESeq2_3clusters/named_genes_only"
+out_dir    <- file.path(named_dir, "pairwise_GSEA")
+gsea_file  <- file.path(out_dir, "pairwise_GSEA_all_collections.tsv")
+res_file   <- file.path(named_dir, "pILC_DESeq2_all_pairwise_results_named_genes.tsv")
+
+input_dir  <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/4_Count_file_pILC/VST_data_GENCODEv47"
+count_file <- file.path(input_dir, "htseq_raw_counts_with_gene_names.csv")
+meta_file  <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/Downstream/Chromatin_Estrogen_pathway_scores/tables/cluster_metadata.tsv"
+
+for (f in c(gsea_file, res_file, count_file, meta_file)) if (!file.exists(f)) stop("Missing: ", f)
+
+collection_to_plot <- "Hallmark"
+n_max_genes <- 60
+cluster_colors <- c("Cluster 1" = "#1B9E77", "Cluster 2" = "#D95F02", "Cluster 3" = "#7570B3")
+
+# ----------------------------
+# Significant pathways
+# ----------------------------
+g <- fread(gsea_file)
+sig <- g[Collection == collection_to_plot & padj < 0.05]
+if (nrow(sig) == 0) stop("No ", collection_to_plot, " pathway with FDR < 0.05.")
+cat("Pathways to plot:\n"); print(sig[, .(Comparison, pathway, NES, padj, Enriched_in)])
+
+# ----------------------------
+# Blind VST (all 31 tumors) with gene symbols
+# ----------------------------
+meta <- fread(meta_file)
+meta[, Cluster := factor(Cluster, levels = names(cluster_colors))]
+
+cd <- fread(count_file)
+cd <- cd[!grepl("^__", Gene)]
+cm <- as.matrix(cd[, meta$Sample, with = FALSE])
+rownames(cm) <- cd$Gene
+storage.mode(cm) <- "integer"
+
+dds <- DESeqDataSetFromMatrix(cm, data.frame(Cluster = meta$Cluster, row.names = meta$Sample), ~ Cluster)
+dds <- dds[rowSums(counts(dds) >= 10) >= 3, ]
+vst_mat <- assay(vst(dds, blind = TRUE))
+
+res_all <- fread(res_file)
+res_all[, gene_symbol := toupper(gene_symbol)]
+
+col_order <- meta[order(Cluster), Sample]
+cl_vec    <- meta$Cluster[match(col_order, meta$Sample)]
+
+# ----------------------------
+# One heatmap per significant pathway
+# ----------------------------
+for (i in seq_len(nrow(sig))) {
+  cmp  <- sig$Comparison[i]
+  pw   <- sig$pathway[i]
+  nes  <- sig$NES[i]
+  lead <- strsplit(sig$leadingEdge[i], ";")[[1]]
+
+  d <- res_all[Comparison == cmp & !is.na(stat)][order(-baseMean)][!duplicated(gene_symbol)]
+  d <- d[gene_symbol %in% lead & Gene %in% rownames(vst_mat)]
+  d <- if (nes > 0) d[order(-stat)] else d[order(stat)]       # most enriched first
+  total <- nrow(d)
+  d <- head(d, n_max_genes)
+
+  mat <- t(scale(t(vst_mat[d$Gene, col_order, drop = FALSE])))
+  mat[!is.finite(mat)] <- 0
+  mat[mat > 2.5]  <- 2.5
+  mat[mat < -2.5] <- -2.5
+  rownames(mat) <- d$gene_symbol
+
+  first  <- sub("_vs_.*", "", cmp); second <- sub(".*_vs_", "", cmp)
+  enr_cl <- sub("Cluster", "Cluster ", if (nes > 0) first else second)
+  nice   <- tools::toTitleCase(tolower(gsub("_", " ", sub("^HALLMARK_", "", pw))))
+
+  ht <- Heatmap(
+    mat, name = "Gene Z-score",
+    col = colorRamp2(c(-2.5, 0, 2.5), c("#2166AC", "white", "#B2182B")),
+    cluster_rows = FALSE, cluster_columns = FALSE,
+    column_split = cl_vec,
+    top_annotation = HeatmapAnnotation(Cluster = cl_vec, col = list(Cluster = cluster_colors),
+                                       annotation_name_side = "left"),
+    show_column_names = FALSE,
+    row_names_gp = gpar(fontsize = 9),
+    border = TRUE,
+    column_title = paste0(nice, ": leading-edge genes (",
+                          gsub("_vs_", " vs ", gsub("Cluster", "Cluster ", cmp)), ")")
+  )
+
+  stem <- file.path(out_dir, paste0("pairwise_GSEA_leading_edge_heatmap_", cmp, "_",
+                                    gsub("[^A-Za-z0-9]+", "_", sub("^HALLMARK_", "", pw))))
+  h_in <- max(6, 0.18 * nrow(mat) + 3)
+  for (ext in c("pdf", "png")) {
+    f <- paste0(stem, ".", ext)
+    if (ext == "pdf") pdf(f, width = 9, height = h_in) else png(f, width = 9, height = h_in, units = "in", res = 300)
+    draw(ht, merge_legends = TRUE, padding = unit(c(4, 8, 6, 4), "mm"))
+    dev.off()
+  }
+
+  # gene table with mean Z per cluster
+  z_all <- t(scale(t(vst_mat[d$Gene, meta$Sample, drop = FALSE])))
+  tab <- data.table(Gene = d$gene_symbol, Wald_stat = d$stat, log2FC = d$log2FoldChange)
+  for (cl in levels(meta$Cluster)) tab[[paste0("Mean_Z_", gsub(" ", "", cl))]] <-
+    rowMeans(z_all[, meta$Cluster == cl, drop = FALSE])
+  fwrite(tab, paste0(stem, "_genes.tsv"), sep = "\t")
+
+  cat(nice, "|", cmp, "| NES =", round(nes, 2), "| enriched in", enr_cl,
+      "| leading-edge genes:", total, "| shown:", nrow(mat), "\n")
+}
+
+cat("Done. Output:", out_dir, "\n")
+```
+

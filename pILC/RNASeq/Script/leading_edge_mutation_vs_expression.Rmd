@@ -1,0 +1,337 @@
+---
+title: "Leading-edge genes: mutation (WES) versus expression and RNA cluster"
+output:
+  html_document:
+    toc: true
+    theme: readable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+suppressPackageStartupMessages({
+  library(data.table)
+  library(ggplot2)
+})
+set.seed(42)
+graphics.off()
+```
+
+# Questions
+
+1. Is the excess of leading-edge gene mutations in cluster 3 real, or does it depend on a few low-VAF calls
+   (check at VAF >= 3%, >= 5% and without indels)?
+2. Is it specific to this gene set, or would a random gene set with the same mutation frequencies show the same?
+   (matched random gene sets; also total WES mutation burden by cluster)
+3. Is a mutated gene expressed higher in the tumor that carries the mutation (same gene, same tumor), also after
+   accounting for cluster?
+4. Is the 16-gene expression score higher in tumors with a leading-edge mutation, after accounting for cluster?
+
+All tests are exploratory (few mutated tumors).
+
+```{r paths_and_parameters}
+leading_edge_genes <- c("CRYAB", "FGF10", "SOCS2", "GPX4", "MAP1B", "DUSP1", "STAT3", "MBD4",
+                        "NCOA3", "ENO2", "ESR2", "SFRP1", "FOXA1", "CASP8", "ITGA2", "MMP2")
+
+vst_file     <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/NMF/vst_transformed_data.csv"
+cluster_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/NMF/GenePattern_NMFConsensus/vst_transformed_data.consensus.k.3.gct"
+wes_audit    <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Compare_TumorOnly_vs_WithPON/maftools/Tier_1_common/Combined_MAF/Full_MAF_nonsilent_variant_PCGR_VAF_match_audit_2026-09-23.tsv"
+
+out_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/Downstream/Chromatin_Estrogen_pathway_scores/plots/mutation_vs_expression"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Scenarios for the mutation calls
+scenarios <- list(
+  `VAF >= 3%`            = list(thr = 0.03, drop_indels = FALSE),
+  `VAF >= 5%`            = list(thr = 0.05, drop_indels = FALSE),
+  `VAF >= 3%, no indels` = list(thr = 0.03, drop_indels = TRUE)
+)
+N_PERM <- 5000
+# Scenarios drawn in Fig 1 (the no-indel scenario gives the same tumor counts at 3%, so it is left out of the main figure)
+FIG1_SCENARIOS <- c("VAF >= 3%", "VAF >= 5%")
+
+nonsilent_classes <- c(
+  "Missense_Mutation", "Nonsense_Mutation", "Nonstop_Mutation",
+  "Frame_Shift_Del", "Frame_Shift_Ins", "In_Frame_Del", "In_Frame_Ins",
+  "Splice_Site", "Splice_Region", "Translation_Start_Site"
+)
+indel_classes <- c("Frame_Shift_Del", "Frame_Shift_Ins", "In_Frame_Del", "In_Frame_Ins")
+cluster_cols <- c("Cluster 1" = "#1B9E77", "Cluster 2" = "#D95F02", "Cluster 3" = "#7570B3")
+
+stopifnot(file.exists(vst_file), file.exists(cluster_file), file.exists(wes_audit))
+```
+
+```{r helpers}
+std_id <- function(x) {
+  x <- toupper(trimws(as.character(x)))
+  x <- sub("^X(?=TP)", "", x, perl = TRUE)
+  x <- sub("_S[0-9]+$", "", x)
+  x <- gsub("\\.", "-", x)
+  x <- sub("^JC287-", "", x)
+  x <- sub("(_T|-T)$", "", x)
+  x <- sub("(?<=[0-9])T$", "", x, perl = TRUE)
+  sub("-0+(?=[0-9])", "-", x, perl = TRUE)      # TP09-09 = TP09-9
+}
+save_plot <- function(file_base, width, height, draw_fn, res = 300) {
+  pdf(paste0(file_base, ".pdf"), width = width, height = height); draw_fn(); dev.off()
+  png(paste0(file_base, ".png"), width = width, height = height, units = "in", res = res); draw_fn(); dev.off()
+  cat("Saved:", paste0(file_base, c(".pdf", ".png")), sep = "\n  "); cat("\n")
+}
+p_txt <- function(p) ifelse(is.na(p), "NA", ifelse(p < 0.001, "P < 0.001", paste0("P = ", sprintf("%.3f", p))))   # vectorised
+theme_nat <- function() theme_classic(base_size = 8, base_family = "Helvetica") +
+  theme(strip.background = element_blank(), strip.text = element_text(face = "bold", size = 8),
+        axis.line = element_line(linewidth = 0.35), axis.ticks = element_line(linewidth = 0.35),
+        plot.caption = element_text(hjust = 0, size = 6, colour = "grey30"),
+        legend.key.size = unit(3, "mm"))
+```
+
+```{r read_data}
+# ---- expression (VST), genes x tumors ----
+x <- fread(vst_file)
+sample_like <- function(v) mean(grepl("^X?TP[0-9]+[.-]", toupper(as.character(v)))) > 0.5
+if (sample_like(names(x)[-1])) {
+  mat <- as.matrix(x[, -1]); rownames(mat) <- as.character(x[[1]])
+} else if (sample_like(x[[1]])) {
+  smp <- as.character(x[[1]]); mat <- t(as.matrix(x[, -1])); colnames(mat) <- smp
+} else stop("Could not tell which axis holds the tumors; check the VST file layout.")
+storage.mode(mat) <- "numeric"
+ids <- sub("\\..*$", "", rownames(mat))
+if (mean(grepl("^ENSG", ids)) > 0.5) {
+  if (!requireNamespace("org.Hs.eg.db", quietly = TRUE)) stop("Ensembl IDs need org.Hs.eg.db.")
+  sym <- AnnotationDbi::mapIds(org.Hs.eg.db::org.Hs.eg.db, keys = ids, column = "SYMBOL", keytype = "ENSEMBL", multiVals = "first")
+  rownames(mat) <- ifelse(is.na(sym), ids, sym)
+} else rownames(mat) <- toupper(rownames(mat))
+d <- as.data.table(mat, keep.rownames = "Gene")
+d <- d[, lapply(.SD, mean, na.rm = TRUE), by = Gene]
+mat <- as.matrix(d[, -1]); rownames(mat) <- d$Gene
+colnames(mat) <- std_id(colnames(mat))
+
+# ---- clusters ----
+cl <- fread(cluster_file, skip = 2)
+cl_col <- grep("membership", names(cl), value = TRUE)[1]
+cl <- cl[, .(Tumor = std_id(Name), Cluster = paste("Cluster", get(cl_col)))]
+
+# ---- WES calls (all genes) ----
+wes <- fread(wes_audit, sep = "\t", na.strings = c("", "NA", "."),
+             select = c("Hugo_Symbol", "Tumor_Sample_Barcode", "Variant_Classification", "VAF_TUMOR_fraction"))
+wes[, Tumor := std_id(Tumor_Sample_Barcode)]
+wes_tumors <- unique(wes$Tumor)
+calls_all <- wes[Variant_Classification %in% nonsilent_classes & !is.na(VAF_TUMOR_fraction),
+                 .(Tumor, Gene = toupper(Hugo_Symbol), Class = Variant_Classification, VAF = VAF_TUMOR_fraction)]
+rm(wes)
+
+# tumors used: WES + RNA cluster + expression
+tt <- Reduce(intersect, list(wes_tumors, cl$Tumor, colnames(mat)))
+tumor_cl <- cl[match(tt, Tumor), Cluster]
+cat("Tumors with WES and RNA-seq:", length(tt), "\n"); print(table(tumor_cl))
+le <- intersect(leading_edge_genes, rownames(mat))
+cat("Leading-edge genes found in the VST matrix:", length(le), "of", length(leading_edge_genes), "\n")
+
+# z-scores of the leading-edge genes across tumors with RNA-seq and the mean-z score
+z <- t(scale(t(mat[le, tt, drop = FALSE])))
+sig <- colMeans(z, na.rm = TRUE)
+```
+
+```{r per_scenario}
+res_tests <- list(); res_perm <- list(); res_pairs <- list(); res_pct <- list(); null_list <- list(); tumor_tabs <- list()
+
+for (sc in names(scenarios)) {
+  s <- scenarios[[sc]]
+  calls <- calls_all[VAF >= s$thr]
+  if (s$drop_indels) calls <- calls[!(Class %in% indel_classes)]
+  calls <- calls[Tumor %in% tt]
+
+  # ---- tumor-level: >= 1 leading-edge mutation ----
+  le_calls <- calls[Gene %in% leading_edge_genes]
+  n_genes <- setNames(rep(0L, length(tt)), tt)
+  ng <- le_calls[, .(n = uniqueN(Gene)), by = Tumor]
+  n_genes[ng$Tumor] <- ng$n
+  any_mut <- n_genes > 0
+  c3 <- tumor_cl == "Cluster 3"
+
+  pct <- data.table(Scenario = sc, Cluster = c("Cluster 1", "Cluster 2", "Cluster 3"))
+  pct[, `:=`(N = sapply(Cluster, function(k) sum(tumor_cl == k)),
+             Mutated = sapply(Cluster, function(k) sum(any_mut[tumor_cl == k])))]
+  res_pct[[sc]] <- pct
+
+  fp <- fisher.test(matrix(c(sum(any_mut[c3]), sum(!any_mut[c3]), sum(any_mut[!c3]), sum(!any_mut[!c3])), nrow = 2))$p.value
+  obs <- mean(any_mut[c3]) - mean(any_mut[!c3])
+
+  # ---- matched random gene sets (same mutation frequency per gene) ----
+  cnt <- calls[, .(n = uniqueN(Tumor)), by = Gene]
+  universe <- union(rownames(mat), cnt$Gene)
+  n_u <- setNames(rep(0L, length(universe)), universe); n_u[cnt$Gene] <- cnt$n
+  mut_genes <- names(n_u)[n_u > 0 & !(names(n_u) %in% leading_edge_genes)]
+  M <- matrix(FALSE, nrow = length(tt), ncol = length(mut_genes), dimnames = list(tt, mut_genes))
+  cm <- calls[Gene %in% mut_genes]
+  M[cbind(cm$Tumor, cm$Gene)] <- TRUE
+  n_le <- sapply(leading_edge_genes, function(g) if (g %in% names(n_u)) n_u[[g]] else 0L)
+  cand <- lapply(n_le, function(k) if (k == 0) NULL else which(abs(n_u[mut_genes] - k) <= 1))
+  null_stat <- replicate(N_PERM, {
+    pick <- unlist(lapply(cand, function(cx) if (is.null(cx) || !length(cx)) NULL else cx[sample.int(length(cx), 1)]))
+    a <- if (length(pick)) rowSums(M[, pick, drop = FALSE]) > 0 else rep(FALSE, length(tt))
+    mean(a[c3]) - mean(a[!c3])
+  })
+  perm_p <- (sum(null_stat >= obs) + 1) / (N_PERM + 1)
+  null_list[[sc]] <- data.table(Scenario = sc, Null = null_stat, Observed = obs)
+
+  # ---- total WES mutation burden by cluster ----
+  burden <- setNames(rep(0L, length(tt)), tt)
+  b <- calls[, .N, by = Tumor]; burden[b$Tumor] <- b$N
+  kw_burden <- kruskal.test(burden ~ factor(tumor_cl))$p.value
+
+  res_perm[[sc]] <- data.table(Scenario = sc, Observed_diff = obs, Null_mean = mean(null_stat),
+                               Empirical_p_one_sided = perm_p, Fisher_p_C3_vs_1_2 = fp,
+                               Burden_KW_p = kw_burden,
+                               Median_burden_C1 = median(burden[tumor_cl == "Cluster 1"]),
+                               Median_burden_C2 = median(burden[tumor_cl == "Cluster 2"]),
+                               Median_burden_C3 = median(burden[tumor_cl == "Cluster 3"]))
+
+  # ---- expression of the mutated gene in the mutated tumor ----
+  cell <- le_calls[Gene %in% le, .(Class = if (.N > 1) "Multi_Hit" else Class[1], VAF = max(VAF)), by = .(Tumor, Gene)]
+  pairs <- cell[Tumor %in% tt]
+  pairs[, `:=`(z = z[cbind(Gene, Tumor)],
+               pct_rank = mapply(function(g, t) mean(z[g, ] <= z[g, t]), Gene, Tumor),
+               Cluster = tumor_cl[match(Tumor, tt)], Scenario = sc)]
+  res_pairs[[sc]] <- pairs
+
+  long <- as.data.table(as.table(z)); setnames(long, c("Gene", "Tumor", "z"))
+  long[, Cluster := tumor_cl[match(Tumor, tt)]]
+  long[, Mutated := paste(Tumor, Gene) %in% paste(pairs$Tumor, pairs$Gene)]
+  if (sum(long$Mutated) >= 3) {
+    fit <- summary(lm(z ~ Mutated + Cluster + Gene, data = long))$coefficients
+    add <- fit["MutatedTRUE", ]
+    res_tests[[length(res_tests) + 1]] <- data.table(Scenario = sc, Test = "Mutated gene expression (z) vs not, adjusted for cluster and gene (lm)",
+                                                     N = sum(long$Mutated), Estimate = add["Estimate"], P = add["Pr(>|t|)"])
+  }
+  # ---- 16-gene score vs leading-edge mutation ----
+  wt <- wilcox.test(sig[any_mut], sig[!any_mut], exact = FALSE)
+  res_tests[[length(res_tests) + 1]] <- data.table(Scenario = sc, Test = "16-gene score: tumors with >=1 mutation vs none (Wilcoxon)",
+                                                   N = length(tt), Estimate = median(sig[any_mut]) - median(sig[!any_mut]), P = wt$p.value)
+  fit2 <- summary(lm(sig ~ factor(tumor_cl) + any_mut))$coefficients
+  res_tests[[length(res_tests) + 1]] <- data.table(Scenario = sc, Test = "16-gene score ~ cluster + any mutation (lm, mutation term)",
+                                                   N = length(tt), Estimate = fit2[nrow(fit2), "Estimate"], P = fit2[nrow(fit2), "Pr(>|t|)"])
+  sp <- suppressWarnings(cor.test(sig, n_genes, method = "spearman", exact = FALSE))
+  res_tests[[length(res_tests) + 1]] <- data.table(Scenario = sc, Test = "16-gene score vs number of mutated leading-edge genes (Spearman rho)",
+                                                   N = length(tt), Estimate = unname(sp$estimate), P = sp$p.value)
+  res_tests[[length(res_tests) + 1]] <- data.table(Scenario = sc, Test = "Tumors with >=1 mutation: cluster 3 vs clusters 1+2 (Fisher)",
+                                                   N = length(tt), Estimate = obs, P = fp)
+  tumor_tabs[[sc]] <- data.table(Scenario = sc, Tumor = tt, Cluster = tumor_cl, n_mutated_genes = n_genes,
+                                 score_16gene = sig, total_burden = burden)
+}
+
+pct_dt <- rbindlist(res_pct)[, Percent := round(100 * Mutated / N, 1)]
+perm_dt <- rbindlist(res_perm); tests_dt <- rbindlist(res_tests); pairs_dt <- rbindlist(res_pairs, fill = TRUE)
+fwrite(pct_dt, file.path(out_dir, "percent_tumors_mutated_by_cluster.tsv"), sep = "\t")
+fwrite(perm_dt, file.path(out_dir, "matched_random_geneset_test.tsv"), sep = "\t")
+tests_dt[, P := signif(P, 3)]
+fwrite(tests_dt, file.path(out_dir, "mutation_vs_expression_tests.tsv"), sep = "\t")
+fwrite(pairs_dt, file.path(out_dir, "mutated_gene_tumor_expression.tsv"), sep = "\t")
+fwrite(rbindlist(tumor_tabs), file.path(out_dir, "per_tumor_summary.tsv"), sep = "\t")
+
+cat("\nTumors with >= 1 leading-edge mutation, by cluster:\n"); print(pct_dt)
+cat("\nMatched random gene sets and mutation burden:\n"); print(perm_dt)
+cat("\nTests:\n"); print(tests_dt)
+cat("\nExpression of each mutated gene in its mutated tumor (z across tumors, percentile rank):\n")
+print(pairs_dt[Scenario == names(scenarios)[1], .(Tumor, Gene, Class, VAF = round(100 * VAF, 1), Cluster, z = round(z, 2), pct_rank = round(pct_rank, 2))][order(Gene, Tumor)])
+```
+
+```{r fig1_percent_mutated}
+pct_plot <- pct_dt[Scenario %in% FIG1_SCENARIOS]
+pct_plot[, Scenario := factor(Scenario, FIG1_SCENARIOS)]
+fisher_lab <- perm_dt[Scenario %in% FIG1_SCENARIOS,
+                      .(Scenario = factor(Scenario, FIG1_SCENARIOS),
+                        label = paste0("Cluster 3 vs 1+2: Fisher ", p_txt(Fisher_p_C3_vs_1_2)))]
+p1 <- ggplot(pct_plot, aes(Cluster, Percent, fill = Cluster)) +
+  geom_col(width = 0.65, alpha = 0.85) +
+  geom_text(aes(label = paste0(Mutated, "/", N)), vjust = -0.4, size = 2.6) +
+  geom_text(data = fisher_lab, aes(x = 0.5, y = Inf, label = label), inherit.aes = FALSE, hjust = 0, vjust = 1.4, size = 2.4) +
+  scale_fill_manual(values = cluster_cols, guide = "none") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.2))) +
+  facet_wrap(~Scenario) +
+  labs(x = NULL, y = "Tumors with >= 1 leading-edge mutation (%)",
+       caption = "WES, non-silent calls in the 16 leading-edge genes. Numbers above bars: mutated tumors / tumors in the cluster.") +
+  theme_nat()
+save_plot(file.path(out_dir, "Fig1_percent_mutated_by_cluster"), width = 5.2, height = 3.2, draw_fn = function() print(p1))
+```
+
+```{r fig2_matched_null}
+null_dt <- rbindlist(null_list)
+null_dt[, Scenario := factor(Scenario, names(scenarios))]
+obs_dt <- perm_dt[, .(Scenario = factor(Scenario, names(scenarios)), Observed = Observed_diff,
+                      label = paste0("Empirical ", p_txt(Empirical_p_one_sided)))]
+p2 <- ggplot(null_dt, aes(100 * Null)) +
+  geom_histogram(bins = 30, fill = "grey75", colour = "white", linewidth = 0.2) +
+  geom_vline(data = obs_dt, aes(xintercept = 100 * Observed), colour = "#D62728", linewidth = 0.6) +
+  geom_text(data = obs_dt, aes(x = 100 * Observed, y = Inf, label = label), inherit.aes = FALSE,
+            hjust = 1.05, vjust = 1.6, size = 2.4, colour = "#D62728") +
+  facet_wrap(~Scenario) +
+  labs(x = "Cluster 3 minus clusters 1+2: % tumors with >= 1 mutation", y = "Random gene sets",
+       caption = paste0("Grey: ", N_PERM, " random gene sets with the same per-gene mutation frequencies. Red line: observed leading-edge value.")) +
+  theme_nat()
+save_plot(file.path(out_dir, "Fig2_matched_random_gene_sets"), width = 7.2, height = 3.2, draw_fn = function() print(p2))
+```
+
+```{r fig3_expression_of_mutated_genes}
+sc1 <- names(scenarios)[1]
+pr <- copy(pairs_dt[Scenario == sc1])
+if (nrow(pr) > 0) {
+  mg <- pr[, .N, by = Gene][order(-N, Gene), Gene]
+  bg <- as.data.table(as.table(z[mg, , drop = FALSE])); setnames(bg, c("Gene", "Tumor", "z"))
+  bg[, `:=`(Gene = factor(Gene, mg), Cluster = tumor_cl[match(Tumor, tt)])]
+
+  # Place mutated points and labels so they never overlap, within each gene:
+  # - a point whose z is within 0.12 of the previous one is moved sideways, so both points are visible
+  # - labels are kept at least 0.30 z-units apart (pushed upward when needed); a thin line joins label and point
+  place <- function(d) {
+    d <- d[order(z)]
+    zz <- d$z; n <- length(zz)
+    dx <- numeric(n); ly <- zz
+    for (i in seq_len(n)[-1]) {
+      if (zz[i] - zz[i - 1] < 0.12 && dx[i - 1] == 0) dx[i] <- 0.10
+      ly[i] <- max(ly[i], ly[i - 1] + 0.30)
+    }
+    d[, `:=`(dx = dx, ly = ly)]
+    d
+  }
+  pr <- pr[, place(.SD), by = Gene]
+  pr[, `:=`(x_pt = match(Gene, mg) + dx)]
+  pr[, x_lab := x_pt + 0.16]
+
+  p3 <- ggplot(bg, aes(Gene, z)) +
+    geom_boxplot(outlier.shape = NA, width = 0.5, colour = "grey50", fill = "grey95", linewidth = 0.3) +
+    geom_point(aes(colour = Cluster), size = 0.9, alpha = 0.7, position = position_jitter(width = 0.15, height = 0, seed = 42)) +
+    scale_colour_manual(values = cluster_cols, guide = "none") +
+    geom_segment(data = pr, aes(x = x_pt, xend = x_lab - 0.02, y = z, yend = ly), inherit.aes = FALSE,
+                 colour = "grey40", linewidth = 0.25) +
+    geom_point(data = pr, aes(x = x_pt, y = z, fill = Cluster), inherit.aes = FALSE, shape = 21, size = 2.8,
+               colour = "black", stroke = 0.4) +
+    geom_text(data = pr, aes(x = x_lab, y = ly, label = Tumor), inherit.aes = FALSE, hjust = 0, size = 2.1) +
+    scale_fill_manual(values = cluster_cols, name = "Mutated tumor (cluster)") +
+    labs(x = NULL, y = "Gene expression (z-score across tumors)",
+         title = paste0("Expression of each mutated leading-edge gene (", sc1, ")"),
+         caption = "Small points: all tumors with RNA-seq, coloured by cluster. Large outlined points: tumors carrying a mutation in that gene.") +
+    theme_nat() + theme(plot.title = element_text(face = "bold", size = 9))
+  save_plot(file.path(out_dir, "Fig3_expression_of_mutated_genes"), width = 7.2, height = 3.8, draw_fn = function() print(p3))
+}
+```
+
+```{r fig4_score}
+st <- rbindlist(tumor_tabs)[Scenario == sc1]
+st[, `:=`(Mutation = factor(ifelse(n_mutated_genes > 0, ">= 1 leading-edge mutation", "No mutation"),
+                            c(">= 1 leading-edge mutation", "No mutation")))]
+lm_p <- tests_dt[Scenario == sc1 & grepl("score ~ cluster", Test), P]
+p4 <- ggplot(st, aes(Cluster, score_16gene)) +
+  geom_boxplot(aes(fill = Cluster), alpha = 0.35, outlier.shape = NA, width = 0.55, colour = "grey25", linewidth = 0.35) +
+  geom_point(aes(colour = Mutation, shape = Mutation, size = Mutation), position = position_jitter(width = 0.12, height = 0, seed = 42)) +
+  scale_fill_manual(values = cluster_cols, guide = "none") +
+  scale_colour_manual(values = c(">= 1 leading-edge mutation" = "#D62728", "No mutation" = "#52606D"), name = NULL) +
+  scale_shape_manual(values = c(">= 1 leading-edge mutation" = 17, "No mutation" = 16), name = NULL) +
+  scale_size_manual(values = c(">= 1 leading-edge mutation" = 2.6, "No mutation" = 1.8), name = NULL) +
+  labs(x = NULL, y = "16-gene leading-edge score (mean z)",
+       title = paste0("Expression score by cluster and mutation (", sc1, ")"),
+       caption = paste(strwrap(paste0("Mutation term in a model with cluster: ", p_txt(lm_p),
+                                      " (lm). Triangles: tumors with >= 1 WES mutation in the leading-edge genes."), 75), collapse = "\n")) +
+  theme_nat() + theme(plot.title = element_text(face = "bold", size = 9), legend.position = "bottom")
+save_plot(file.path(out_dir, "Fig4_score_by_cluster_and_mutation"), width = 4.2, height = 3.8, draw_fn = function() print(p4))
+cat("All outputs are in:", out_dir, "\n")
+```

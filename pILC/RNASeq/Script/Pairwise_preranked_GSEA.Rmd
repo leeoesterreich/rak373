@@ -1,0 +1,169 @@
+---
+title: "Pairwise_preranked_GSEA"
+output: html_document
+date: "2026-10-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+############################################################
+## PURPOSE  : Preranked GSEA between RNA clusters (3 pairwise comparisons)
+## INPUT    : pILC_DESeq2_all_pairwise_results_named_genes.tsv (stat column)
+##            c5.all.v2025.1.Hs.symbols.gmt (GO) + msigdbr (Hallmark, Reactome)
+## OUTPUT   : named_genes_only/pairwise_GSEA/
+## NOTES    : Positive NES = enriched in the first cluster named.
+##            Named genes only (bare ENSG IDs cannot match MSigDB).
+##            Clusters were derived from the same expression data.
+############################################################
+```
+
+
+
+```{r}
+set.seed(42)
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(fgsea)
+  library(ggplot2)
+  library(msigdbr)
+})
+
+# ----------------------------
+# Paths (fixed names, no dates)
+# ----------------------------
+named_dir   <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/DESeq2/DESeq2_3clusters/pILC_DESeq2_3clusters/named_genes_only"
+res_file    <- file.path(named_dir, "pILC_DESeq2_all_pairwise_results_named_genes.tsv")
+c5_gmt_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/GSEA/Dataset/c5.all.v2025.1.Hs.symbols.gmt"
+out_dir     <- file.path(named_dir, "pairwise_GSEA")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+for (f in c(res_file, c5_gmt_file)) if (!file.exists(f)) stop("Missing: ", f)
+
+min_size <- 10
+max_size <- 500
+
+# ----------------------------
+# Ranking data
+# ----------------------------
+x <- fread(res_file)
+x <- x[!is.na(stat) & !is.na(gene_symbol) & gene_symbol != ""]
+x[, gene_symbol := toupper(gene_symbol)]
+cat("Comparisons:", paste(unique(x$Comparison), collapse = ", "), "\n")
+
+# ----------------------------
+# Gene sets from databases
+# ----------------------------
+get_msig <- function(collection, subcollection = NULL) {
+  r <- tryCatch(msigdbr(species = "Homo sapiens", collection = collection, subcollection = subcollection),
+                error = function(e) NULL)
+  if (is.null(r)) r <- tryCatch(msigdbr(species = "Homo sapiens", category = collection, subcategory = subcollection),
+                                error = function(e) NULL)
+  if (is.null(r) || nrow(r) == 0) { message("Not available: ", collection, " ", subcollection); return(list()) }
+  r <- as.data.table(r)
+  lapply(split(r$gene_symbol, r$gs_name), function(g) unique(toupper(g)))
+}
+
+gmt <- strsplit(readLines(c5_gmt_file), "\t")
+go  <- setNames(lapply(gmt, function(v) toupper(v[-(1:2)])), vapply(gmt, `[`, character(1), 1))
+
+collections <- list(
+  Hallmark = get_msig("H"),
+  Reactome = get_msig("C2", "CP:REACTOME"),
+  GO_BP    = go[grepl("^GOBP_", names(go))],
+  GO_CC    = go[grepl("^GOCC_", names(go))],
+  GO_MF    = go[grepl("^GOMF_", names(go))]
+)
+collections <- collections[lengths(collections) > 0]
+if (!("Hallmark" %in% names(collections))) stop("Hallmark sets could not be loaded.")
+cat("Collections:", paste(names(collections), lengths(collections), collapse = " | "), "\n")
+
+# ----------------------------
+# fgsea for every comparison and collection
+# ----------------------------
+results <- list()
+for (cmp in unique(x$Comparison)) {
+  d <- x[Comparison == cmp][order(-baseMean)][!duplicated(gene_symbol)]   # keep the most expressed per symbol
+  ranks <- sort(setNames(d$stat, d$gene_symbol), decreasing = TRUE)
+  first  <- sub("_vs_.*", "", cmp)
+  second <- sub(".*_vs_", "", cmp)
+  cat(cmp, ": ", length(ranks), " ranked genes\n", sep = "")
+
+  for (col in names(collections)) {
+    set.seed(42)
+    fg <- as.data.table(fgseaMultilevel(pathways = collections[[col]], stats = ranks,
+                                        minSize = min_size, maxSize = max_size,
+                                        eps = 0, nproc = 1))
+    fg[, padj := p.adjust(pval, method = "BH")]       # within comparison and collection
+    fg[, `:=`(Comparison = cmp, Collection = col,
+              Enriched_in = fifelse(NES > 0, first, second))]
+    setorder(fg, padj, pval)
+    results[[paste(cmp, col)]] <- fg
+  }
+}
+all_fg <- rbindlist(results)
+
+export <- copy(all_fg)
+export[, leadingEdge := vapply(leadingEdge, paste, character(1), collapse = ";")]
+setcolorder(export, c("Collection", "Comparison", "pathway", "Enriched_in", "NES", "pval", "padj"))
+fwrite(export, file.path(out_dir, "pairwise_GSEA_all_collections.tsv"), sep = "\t", na = "")
+
+cat("\nPathways with FDR < 0.05:\n")
+print(all_fg[, .(Tested = .N, FDR_lt_0.05 = sum(padj < 0.05, na.rm = TRUE)), by = .(Collection, Comparison)])
+
+# ----------------------------
+# Hallmark dot plot
+# ----------------------------
+h <- all_fg[Collection == "Hallmark"]
+keep <- unique(c(h[padj < 0.05, pathway],
+                 h[order(padj)][, head(pathway, 8), by = Comparison]$V1))
+subtitle_txt <- "Top 8 Hallmark sets per comparison (black outline = FDR < 0.05)"
+if (length(keep) == 0) {
+  keep <- unique(h[order(padj)][, head(pathway, 8), by = Comparison]$V1)
+  subtitle_txt <- "No set reached FDR < 0.05; top 8 per comparison shown"
+}
+h <- h[pathway %in% keep]
+h[, Label := tools::toTitleCase(tolower(gsub("_", " ", sub("^HALLMARK_", "", pathway))))]
+lvl <- h[, .(m = mean(NES)), by = Label][order(-m)]$Label
+h[, Label := factor(Label, levels = rev(lvl))]
+h[, Comparison_label := gsub("_vs_", " vs ", gsub("Cluster", "Cluster ", Comparison))]
+h[, minus_log10_FDR := -log10(pmax(padj, 1e-10))]
+h[, Sig := fifelse(padj < 0.05, "FDR < 0.05", "n.s.")]
+
+p <- ggplot(h, aes(Comparison_label, Label, fill = NES, size = minus_log10_FDR)) +
+  geom_point(shape = 21, aes(color = Sig), stroke = 0.8) +
+  scale_color_manual(values = c("FDR < 0.05" = "black", "n.s." = "grey70"), name = NULL) +
+  scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B", midpoint = 0,
+                       name = "NES\n(+ = first cluster)") +
+  scale_size_continuous(name = "-log10 FDR", range = c(2, 9)) +
+  labs(title = "Hallmark pathway enrichment between RNA clusters",
+       subtitle = paste0(subtitle_txt, "; positive NES = higher in the first cluster named"),
+       x = NULL, y = NULL) +
+  theme_bw(base_size = 11) +
+  theme(plot.title.position = "plot", plot.title = element_text(face = "bold"),
+        panel.grid.minor = element_blank())
+
+h_in <- max(5, 0.3 * nlevels(h$Label) + 3)
+ggsave(file.path(out_dir, "pairwise_GSEA_hallmark_dotplot.pdf"), p, width = 9, height = h_in)
+ggsave(file.path(out_dir, "pairwise_GSEA_hallmark_dotplot.png"), p, width = 9, height = h_in, dpi = 300)
+
+# ----------------------------
+# README and provenance (fixed names)
+# ----------------------------
+writeLines(
+  c("Pairwise preranked GSEA between RNA clusters",
+    "Seed: 42",
+    "Ranking: DESeq2 Wald statistic (positive = higher in the first cluster named); named genes only",
+    "Gene sets: MSigDB Hallmark and Reactome (msigdbr), GO BP (local C5 GMT)",
+    paste0("Set size: ", min_size, "-", max_size, "; fgseaMultilevel; BH FDR within each comparison and collection"),
+    "Clusters were derived from the same expression data; results are not independent validation.",
+    "",
+    paste0("Input md5: ", unname(tools::md5sum(res_file))),
+    paste0("C5 GMT md5: ", unname(tools::md5sum(c5_gmt_file))),
+    paste0("fgsea ", as.character(packageVersion("fgsea")),
+           " | msigdbr ", as.character(packageVersion("msigdbr")))),
+  file.path(out_dir, "README_pairwise_GSEA.txt"))
+writeLines(capture.output(sessionInfo()), file.path(out_dir, "sessionInfo_pairwise_GSEA.txt"))
+
+cat("Done. Output:", out_dir, "\n")
+```
