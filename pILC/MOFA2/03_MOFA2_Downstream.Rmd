@@ -102,10 +102,19 @@ clean_text <- function(x) {
 parse_numeric_clinical <- function(x) {
   x <- clean_text(x)
 
-  # Convert values like "<5" to 2.5 for plotting/association analyses.
-  x <- gsub("^<\\s*5$", "2.5", x)
+  # Identify values beginning with "<"
+  is_less_than <- !is.na(x) & grepl("^<\\s*[0-9.]+$", x)
 
-  suppressWarnings(as.numeric(x))
+  # Remove "<" and convert to numeric
+  numeric_values <- suppressWarnings(
+    as.numeric(gsub("^<\\s*", "", x))
+  )
+
+  # Replace values reported as "<N" with N/2
+  numeric_values[is_less_than] <-
+    numeric_values[is_less_than] / 2
+
+  numeric_values
 }
 
 standardize_pos_neg <- function(x) {

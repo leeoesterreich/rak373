@@ -1,0 +1,541 @@
+---
+title: "prepare_SLIDE_input"
+output: html_document
+date: "2026-09-27"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r}
+# ============================================================
+# 01_prepare_SLIDE_pleomorphic_input
+# pILC SLIDE input: pleomorphic component cellularity (%)
+# ============================================================
+
+set.seed(42)
+
+# ---------------------------
+# Paths
+# ---------------------------
+MOFA_DIR <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/MOFA2/Updated"
+SLIDE_DIR <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/SLIDE"
+
+PREPARED_VIEWS_FILE <- file.path(
+  MOFA_DIR,
+  "MOFA2_RDS",
+  "MOFA2_prepared_input_view_matrices.rds"
+)
+
+CLINICAL_FILE <- file.path(
+  MOFA_DIR,
+  "ClinicalCorrelation_clean_for_MOFA2.csv"
+)
+
+INPUT_DIR <- file.path(SLIDE_DIR, "Input_pleomorphic")
+RESULTS_DIR <- file.path(SLIDE_DIR, "Results_pleomorphic")
+LOG_DIR <- file.path(SLIDE_DIR, "Logs_pleomorphic")
+
+dir.create(INPUT_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(RESULTS_DIR, recursive = TRUE, showWarnings = FALSE)
+dir.create(LOG_DIR, recursive = TRUE, showWarnings = FALSE)
+
+OUTCOME_COL <- "Pleomorphic_invasive_component_cellularity"
+
+PRIMARY_VIEWS <- c(
+  "RNA_VST_top5000var",
+  "WES_mutation_recurrent",
+  "IMPACT_mutation_OncoKB"
+)
+
+MAX_TOTAL_FEATURES <- 5000L
+MIN_MUTATION_PREVALENCE <- 2L
+
+# ---------------------------
+# Functions
+# ---------------------------
+clean_sample_id <- function(x) {
+  x <- as.character(x)
+  x <- basename(x)
+  x <- trimws(x)
+  x <- toupper(x)
+  x <- gsub("\\.", "-", x)
+
+  x <- sub("_T$", "", x)
+  x <- sub("-T$", "", x)
+  x <- sub("T$", "", x)
+
+  x <- sub("_N$", "", x)
+  x <- sub("-N$", "", x)
+  x <- sub("NL$", "", x)
+
+  x <- sub("^(TP[0-9]+)-0+([0-9]+)$", "\\1-\\2", x)
+  x
+}
+
+collapse_duplicate_cols_numeric <- function(mat) {
+  mat <- as.matrix(mat)
+  storage.mode(mat) <- "numeric"
+
+  if (!anyDuplicated(colnames(mat))) {
+    return(mat)
+  }
+
+  unique_samples <- unique(colnames(mat))
+
+  out <- do.call(
+    cbind,
+    lapply(unique_samples, function(sample_id) {
+      idx <- which(colnames(mat) == sample_id)
+
+      # Same duplicate-column handling used in MOFA2 preparation:
+      # average values for columns that resolve to the same sample ID.
+      rowMeans(mat[, idx, drop = FALSE], na.rm = TRUE)
+    })
+  )
+
+  rownames(out) <- rownames(mat)
+  colnames(out) <- unique_samples
+  out
+}
+
+prepare_view <- function(mat, view_name) {
+  mat <- as.matrix(mat)
+  storage.mode(mat) <- "numeric"
+
+  if (is.null(rownames(mat)) || is.null(colnames(mat))) {
+    stop(view_name, " requires feature row names and sample column names.")
+  }
+
+  colnames(mat) <- clean_sample_id(colnames(mat))
+  mat <- collapse_duplicate_cols_numeric(mat)
+
+  if (any(!is.finite(mat))) {
+    stop(view_name, " contains missing/non-finite values.")
+  }
+
+  mat
+}
+
+# ---------------------------
+# Load the prepared MOFA2 matrices
+# ---------------------------
+if (!file.exists(PREPARED_VIEWS_FILE)) {
+  stop("Cannot find:\n", PREPARED_VIEWS_FILE)
+}
+
+if (!file.exists(CLINICAL_FILE)) {
+  stop("Cannot find:\n", CLINICAL_FILE)
+}
+
+view_mats <- readRDS(PREPARED_VIEWS_FILE)
+
+missing_views <- setdiff(PRIMARY_VIEWS, names(view_mats))
+
+if (length(missing_views) > 0) {
+  stop(
+    "These views are missing from the MOFA RDS:\n",
+    paste(missing_views, collapse = ", ")
+  )
+}
+
+view_mats <- view_mats[PRIMARY_VIEWS]
+
+for (v in names(view_mats)) {
+  view_mats[[v]] <- prepare_view(view_mats[[v]], v)
+
+  message(
+    v, ": ",
+    nrow(view_mats[[v]]), " features x ",
+    ncol(view_mats[[v]]), " samples"
+  )
+}
+
+# ---------------------------
+# Load continuous pleomorphic outcome
+# TP08-1319 is now numeric 10 in the clinical CSV.
+# ---------------------------
+clinical <- read.csv(
+  CLINICAL_FILE,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+if (!all(c("Sample", OUTCOME_COL) %in% colnames(clinical))) {
+  stop(
+    "Clinical CSV requires these columns:\n",
+    "Sample\n",
+    OUTCOME_COL
+  )
+}
+
+clinical$Sample <- clean_sample_id(clinical$Sample)
+
+clinical$pleomorphic_component_pct <- suppressWarnings(
+  as.numeric(clinical[[OUTCOME_COL]])
+)
+
+clinical <- clinical[
+  !is.na(clinical$Sample) &
+    clinical$Sample != "" &
+    is.finite(clinical$pleomorphic_component_pct),
+  ,
+  drop = FALSE
+]
+
+if (anyDuplicated(clinical$Sample) > 0) {
+  stop("Duplicate clinical Sample IDs remain after cleaning.")
+}
+
+message(
+  "\nClinical samples with valid pleomorphic outcome: ",
+  nrow(clinical)
+)
+
+# ---------------------------
+# Audit samples across all three views
+# ---------------------------
+clinical_samples <- sort(clinical$Sample)
+
+sample_audit <- data.frame(
+  Sample = clinical_samples,
+  pleomorphic_component_pct = clinical$pleomorphic_component_pct[
+    match(clinical_samples, clinical$Sample)
+  ],
+  has_RNA = clinical_samples %in%
+    colnames(view_mats$RNA_VST_top5000var),
+  has_WES_mutation = clinical_samples %in%
+    colnames(view_mats$WES_mutation_recurrent),
+  has_IMPACT_mutation = clinical_samples %in%
+    colnames(view_mats$IMPACT_mutation_OncoKB),
+  stringsAsFactors = FALSE
+)
+
+sample_audit$included_in_SLIDE <-
+  sample_audit$has_RNA &
+  sample_audit$has_WES_mutation &
+  sample_audit$has_IMPACT_mutation
+
+write.table(
+  sample_audit,
+  file = file.path(INPUT_DIR, "SLIDE_sample_availability_audit.tsv"),
+  sep = "\t",
+  row.names = FALSE,
+  quote = FALSE
+)
+
+availability_summary <- data.frame(
+  clinical_pleomorphic_samples = nrow(sample_audit),
+  RNA_available = sum(sample_audit$has_RNA),
+  WES_mutation_available = sum(sample_audit$has_WES_mutation),
+  IMPACT_mutation_available = sum(sample_audit$has_IMPACT_mutation),
+  complete_multiomics = sum(sample_audit$included_in_SLIDE)
+)
+
+print(availability_summary)
+
+# ---------------------------
+# Select complete multi-omics cohort
+# ---------------------------
+common_view_samples <- Reduce(
+  intersect,
+  lapply(view_mats, colnames)
+)
+
+model_samples <- sort(
+  intersect(common_view_samples, clinical$Sample)
+)
+
+if (length(model_samples) <= 15) {
+  stop(
+    "Only ", length(model_samples),
+    " complete samples are available. SLIDE requires more than 15."
+  )
+}
+
+message("\nFinal SLIDE cohort: ", length(model_samples), " samples")
+
+write.table(
+  data.frame(sample = model_samples),
+  file = file.path(INPUT_DIR, "model_samples.tsv"),
+  sep = "\t",
+  row.names = FALSE,
+  quote = FALSE
+)
+
+# ---------------------------
+# Construct X: samples x features
+# ---------------------------
+x_views <- list()
+feature_manifest_list <- list()
+
+for (v in names(view_mats)) {
+  mat <- view_mats[[v]][, model_samples, drop = FALSE]
+
+  if (v == "RNA_VST_top5000var") {
+    feature_variance <- apply(mat, 1, var, na.rm = TRUE)
+
+    mat <- mat[
+      order(feature_variance, decreasing = TRUE),
+      ,
+      drop = FALSE
+    ]
+  } else {
+    mutation_prevalence <- rowSums(mat != 0, na.rm = TRUE)
+
+    mat <- mat[
+      mutation_prevalence >= MIN_MUTATION_PREVALENCE,
+      ,
+      drop = FALSE
+    ]
+  }
+
+  original_features <- rownames(mat)
+
+  # View prefix makes every SLIDE feature ID unique.
+  slide_features <- paste0(
+    v,
+    "__",
+    make.unique(original_features)
+  )
+
+  rownames(mat) <- slide_features
+  x_views[[v]] <- t(mat)
+
+  feature_manifest_list[[v]] <- data.frame(
+    SLIDE_feature = slide_features,
+    original_feature = original_features,
+    source_view = v,
+    feature_type = ifelse(
+      v == "RNA_VST_top5000var",
+      "RNA_expression",
+      "mutation"
+    ),
+    stringsAsFactors = FALSE
+  )
+}
+
+# Retain all eligible mutation features.
+# Fill remaining places with highest-variance RNA features.
+non_rna_views <- setdiff(
+  names(x_views),
+  "RNA_VST_top5000var"
+)
+
+n_non_rna_features <- sum(
+  vapply(x_views[non_rna_views], ncol, integer(1))
+)
+
+n_rna_allowed <- MAX_TOTAL_FEATURES - n_non_rna_features
+
+if (n_rna_allowed < 500L) {
+  stop(
+    "Too many eligible mutation features (",
+    n_non_rna_features,
+    ") to create a stable 5,000-feature matrix."
+  )
+}
+
+n_rna_keep <- min(
+  ncol(x_views$RNA_VST_top5000var),
+  n_rna_allowed
+)
+
+x_views$RNA_VST_top5000var <-
+  x_views$RNA_VST_top5000var[
+    ,
+    seq_len(n_rna_keep),
+    drop = FALSE
+  ]
+
+feature_manifest_list$RNA_VST_top5000var <-
+  feature_manifest_list$RNA_VST_top5000var[
+    seq_len(n_rna_keep),
+    ,
+    drop = FALSE
+  ]
+
+x <- do.call(cbind, x_views)
+storage.mode(x) <- "numeric"
+
+feature_sd <- apply(x, 2, sd, na.rm = TRUE)
+keep_features <- is.finite(feature_sd) & feature_sd > 0
+
+if (any(!keep_features)) {
+  message(
+    "Removing ", sum(!keep_features),
+    " zero-variance feature(s)."
+  )
+
+  x <- x[, keep_features, drop = FALSE]
+}
+
+if (any(!is.finite(x))) {
+  stop("Final X matrix contains missing/non-finite values.")
+}
+
+if (anyDuplicated(colnames(x)) > 0) {
+  stop("Final X matrix contains duplicate feature names.")
+}
+
+# ---------------------------
+# Construct Y: samples x 1 outcome
+# ---------------------------
+y_values <- clinical$pleomorphic_component_pct[
+  match(rownames(x), clinical$Sample)
+]
+
+if (anyNA(y_values) || any(!is.finite(y_values))) {
+  stop("Missing outcome values remain after matching.")
+}
+
+y <- matrix(
+  as.numeric(y_values),
+  ncol = 1,
+  dimnames = list(
+    rownames(x),
+    "pleomorphic_component_pct"
+  )
+)
+
+if (!identical(rownames(x), rownames(y))) {
+  stop("X and Y sample ordering differs.")
+}
+
+# ---------------------------
+# Write SLIDE inputs
+# ---------------------------
+x_file <- file.path(INPUT_DIR, "x.csv")
+y_file <- file.path(INPUT_DIR, "y.csv")
+yaml_file <- file.path(INPUT_DIR, "slide_pleomorphic.yaml")
+
+write.csv(
+  x,
+  file = x_file,
+  row.names = TRUE,
+  quote = FALSE
+)
+
+write.csv(
+  y,
+  file = y_file,
+  row.names = TRUE,
+  quote = FALSE
+)
+
+feature_manifest <- do.call(rbind, feature_manifest_list)
+
+feature_manifest <- feature_manifest[
+  match(colnames(x), feature_manifest$SLIDE_feature),
+  ,
+  drop = FALSE
+]
+
+write.table(
+  feature_manifest,
+  file = file.path(INPUT_DIR, "feature_manifest.tsv"),
+  sep = "\t",
+  row.names = FALSE,
+  quote = FALSE
+)
+
+input_summary <- data.frame(
+  metric = c(
+    "outcome",
+    "n_samples",
+    "n_features",
+    "RNA_features",
+    "WES_mutation_features",
+    "IMPACT_mutation_features",
+    "outcome_min",
+    "outcome_median",
+    "outcome_max"
+  ),
+  value = c(
+    "pleomorphic_component_pct",
+    nrow(x),
+    ncol(x),
+    sum(feature_manifest$source_view == "RNA_VST_top5000var"),
+    sum(feature_manifest$source_view == "WES_mutation_recurrent"),
+    sum(feature_manifest$source_view == "IMPACT_mutation_OncoKB"),
+    min(y),
+    median(y),
+    max(y)
+  ),
+  stringsAsFactors = FALSE
+)
+
+write.table(
+  input_summary,
+  file = file.path(INPUT_DIR, "input_summary.tsv"),
+  sep = "\t",
+  row.names = FALSE,
+  quote = FALSE
+)
+
+# ---------------------------
+# SLIDE YAML settings
+# ---------------------------
+params <- list(
+  x_path = x_file,
+  y_path = y_file,
+  out_path = RESULTS_DIR,
+  delta = c(0.01, 0.05, 0.1),
+  lambda = c(0.5, 1.0),
+  spec = 0.1,
+  y_factor = FALSE,
+  y_levels = NULL,
+  eval_type = "corr",
+  SLIDE_iter = 1000,
+  SLIDE_top_feats = 15,
+  sampleCV_iter = 500,
+  sampleCV_K = 4,
+  do_interacts = FALSE,
+  thresh_fdr = 0.2,
+  fdr = 0.1
+)
+
+yaml::write_yaml(params, yaml_file)
+
+saveRDS(
+  list(
+    x = x,
+    y = y,
+    params = params,
+    model_samples = model_samples,
+    sample_audit = sample_audit,
+    feature_manifest = feature_manifest
+  ),
+  file.path(INPUT_DIR, "slide_input_objects.rds")
+)
+
+# ---------------------------
+# Validate using SLIDE
+# ---------------------------
+x_check <- as.matrix(
+  read.csv(x_file, row.names = 1, check.names = FALSE)
+)
+
+y_check <- as.matrix(
+  read.csv(y_file, row.names = 1, check.names = FALSE)
+)
+
+if (!identical(rownames(x_check), rownames(y_check))) {
+  stop("Written X and Y files have different sample order.")
+}
+
+SLIDE::checkDataParams(params)
+
+capture.output(
+  sessionInfo(),
+  file = file.path(
+    LOG_DIR,
+    "01_prepare_SLIDE_pleomorphic_sessionInfo.txt"
+  )
+)
+
+message("\nSLIDE input preparation completed successfully.")
+message("X dimensions: ", nrow(x), " samples x ", ncol(x), " features")
+message("Y dimensions: ", nrow(y), " samples x 1 continuous outcome")
+message("Input directory: ", INPUT_DIR)
+```
