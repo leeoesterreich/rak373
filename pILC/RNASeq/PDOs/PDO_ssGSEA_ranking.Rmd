@@ -1,0 +1,187 @@
+---
+title: "PDO_ssGSEA_ranking"
+output: html_document
+date: "2026-10-12"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r}
+###############################################################################
+# Rank Hallmark pathways by their MEAN ssGSEA score across the 4 PDOs
+#   BO-046, BO-114, BO-189, BO-268
+#
+# WHY
+#   The heatmap row order comes from hierarchical clustering. It is close to a
+#   ranking but it is not one. This script ranks the pathways by the actual
+#   mean score, so "Top 5" and "Bottom 5" on a slide are real rankings.
+#
+# INPUT   PDO_ssGSEA_Hallmark_scores.csv  (pathways x PDOs, from
+#         PDO_ssGSEA_Hallmark.R)
+#
+# WORKFLOW
+#   1. Read scores (pathways x 4 PDOs)
+#   2. Per pathway: mean, min, max, range (max - min), rank by mean,
+#      rank inside each PDO, number of PDOs in which it is in the top 10
+#   3. Tables: full ranking, top 5 / bottom 5, 10 pathways that differ most
+#      between PDOs
+#   4. Figures (dots = individual PDOs, black diamond = mean, grey line =
+#      min to max): all 50 sorted; top 5 + bottom 5; most variable 10
+#
+# NOTES
+#   - ssGSEA scores are relative to these 4 PDOs (normalize = TRUE rescales by
+#     the range in this run). They cannot be compared directly with tumor
+#     scores from another run.
+#   - No statistical test is possible with 4 samples: the ranking is
+#     descriptive.
+#   - A top-ranked pathway is not necessarily specific to these PDOs: pathways
+#     made of broadly expressed genes (e.g. MYC targets V1, oxidative
+#     phosphorylation) score high in most proliferating samples.
+#   - No dates in output file names.
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+})
+
+SEED <- 42
+set.seed(SEED)
+
+# ------------------------------ 1. SETTINGS ----------------------------------
+PDO_DIR     <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/PDO"
+SCORES_FILE <- file.path(PDO_DIR, "PDO_ssGSEA_Hallmark_scores.csv")
+OUT_DIR     <- PDO_DIR
+dir.create(file.path(OUT_DIR, "plots"), recursive = TRUE, showWarnings = FALSE)
+
+N_EXTREME <- 5    # how many top and bottom pathways to show
+N_VARIABLE <- 10  # how many most variable pathways to show
+TOP_K     <- 10   # "in the top K of a PDO" (for the shared-top check)
+
+# Shown under every figure: no statistics are possible with one sample per PDO
+CAPTION <- "Descriptive ranking only: one sample per PDO (n = 4, no replicates), no statistical test."
+
+# ------------------------------ 2. READ SCORES -------------------------------
+sc <- read.csv(SCORES_FILE, row.names = 1, check.names = FALSE)
+rownames(sc) <- sub("^HALLMARK_", "", rownames(sc))
+sc <- as.matrix(sc)
+stopifnot(is.numeric(sc), !anyNA(sc))
+pdos <- colnames(sc)
+message("Pathways: ", nrow(sc), "; PDOs: ", paste(pdos, collapse = ", "))
+
+pdo_cols <- setNames(c("#E41A1C", "#377EB8", "#4DAF4A", "#984EA3")[seq_along(pdos)], pdos)
+
+# ------------------------------ 3. RANKING TABLE -----------------------------
+rank_in_pdo <- apply(-sc, 2, rank, ties.method = "min")   # 1 = highest in that PDO
+
+ranking <- data.frame(
+  pathway    = rownames(sc),
+  sc,
+  mean_score = rowMeans(sc),
+  min_score  = apply(sc, 1, min),
+  max_score  = apply(sc, 1, max),
+  check.names = FALSE, row.names = NULL) %>%
+  mutate(range_between_PDOs = max_score - min_score)
+
+ranking$n_PDOs_in_top10 <- rowSums(rank_in_pdo <= TOP_K)
+colnames(rank_in_pdo) <- paste0("rank_in_", colnames(rank_in_pdo))
+ranking <- cbind(ranking, rank_in_pdo)
+
+ranking <- ranking %>%
+  arrange(desc(mean_score)) %>%
+  mutate(rank_high_to_low = row_number(),
+         rank_low_to_high = n() - rank_high_to_low + 1) %>%
+  relocate(rank_high_to_low, rank_low_to_high, .after = pathway)
+write.csv(ranking, file.path(OUT_DIR, "PDO_ssGSEA_Hallmark_ranking.csv"), row.names = FALSE)
+
+top_n    <- ranking %>% slice_head(n = N_EXTREME) %>% mutate(group = paste0("Top ", N_EXTREME))
+bottom_n <- ranking %>% slice_tail(n = N_EXTREME) %>% arrange(mean_score) %>%
+  mutate(group = paste0("Bottom ", N_EXTREME))     # listed from the lowest score
+write.csv(bind_rows(top_n, bottom_n),
+          file.path(OUT_DIR, "PDO_ssGSEA_Hallmark_top5_bottom5.csv"), row.names = FALSE)
+
+variable <- ranking %>% arrange(desc(range_between_PDOs)) %>% slice_head(n = N_VARIABLE)
+write.csv(variable, file.path(OUT_DIR, "PDO_ssGSEA_most_variable_pathways.csv"),
+          row.names = FALSE)
+
+print(as_tibble(bind_rows(top_n, bottom_n) %>%
+                  select(group, pathway, mean_score, min_score, max_score, n_PDOs_in_top10)),
+      n = Inf)
+
+# ------------------------------ 4. FIGURES -----------------------------------
+pretty <- function(x) gsub("_", " ", x)
+
+long <- as.data.frame(sc) %>%
+  rownames_to_column("pathway") %>%
+  pivot_longer(-pathway, names_to = "sample", values_to = "score")
+summ <- ranking %>% select(pathway, mean_score, min_score, max_score)
+
+# paths: pathways ordered from the top of the plot to the bottom
+# grp:   optional named vector pathway -> facet label (row panels)
+plot_dots <- function(paths, grp = NULL, title, subtitle) {
+  lv <- rev(paths)                                   # first level plots at the bottom
+  d  <- long %>% filter(pathway %in% paths) %>% mutate(pathway = factor(pathway, levels = lv))
+  s  <- summ %>% filter(pathway %in% paths) %>% mutate(pathway = factor(pathway, levels = lv))
+  if (!is.null(grp)) {
+    glev <- unique(grp[paths])
+    d$group <- factor(grp[as.character(d$pathway)], levels = glev)
+    s$group <- factor(grp[as.character(s$pathway)], levels = glev)
+  }
+  p <- ggplot() +
+    geom_vline(xintercept = 0, linetype = "dashed", colour = "grey60") +
+    geom_segment(data = s, aes(x = min_score, xend = max_score, y = pathway, yend = pathway),
+                 colour = "grey65", linewidth = 0.8) +
+    geom_point(data = d, aes(score, pathway, colour = sample), size = 3, alpha = 0.9) +
+    geom_point(data = s, aes(mean_score, pathway), shape = 18, size = 4.5, colour = "black") +
+    scale_colour_manual(values = pdo_cols, name = "PDO") +
+    scale_y_discrete(labels = pretty) +
+    labs(x = "ssGSEA score", y = NULL, title = title, subtitle = subtitle,
+         caption = CAPTION) +
+    theme_bw(base_size = 12) +
+    theme(panel.grid.minor = element_blank(),
+          plot.title = element_text(face = "bold"))
+  if (!is.null(grp)) {
+    p <- p + facet_grid(group ~ ., scales = "free_y", space = "free_y") +
+      theme(strip.text = element_text(face = "bold", size = 12))
+  }
+  p
+}
+
+sub_txt <- "Dots: individual PDOs. Black diamond: mean of the 4 PDOs.\nGrey line: min to max."
+
+# 4a. all pathways, sorted by mean
+p_all <- plot_dots(ranking$pathway, NULL,
+                   "Hallmark ssGSEA scores in PDOs, ranked by mean", sub_txt)
+ggsave(file.path(OUT_DIR, "plots", "PDO_ssGSEA_ranked_all_pathways.png"),
+       p_all, width = 9, height = 11.5, dpi = 300)
+ggsave(file.path(OUT_DIR, "plots", "PDO_ssGSEA_ranked_all_pathways.pdf"),
+       p_all, width = 9, height = 11.5)
+
+# 4b. top and bottom pathways (for the slide)
+ext_paths <- c(top_n$pathway, rev(bottom_n$pathway))      # highest ... lowest overall
+ext_grp   <- setNames(c(rep(top_n$group[1], nrow(top_n)),
+                        rep(bottom_n$group[1], nrow(bottom_n))), ext_paths)
+p_ext <- plot_dots(ext_paths, ext_grp,
+                   paste0("Top ", N_EXTREME, " and bottom ", N_EXTREME,
+                          " Hallmark pathways\nby mean ssGSEA score"), sub_txt)
+ggsave(file.path(OUT_DIR, "plots", "PDO_ssGSEA_top5_bottom5.png"),
+       p_ext, width = 8.5, height = 6, dpi = 300)
+ggsave(file.path(OUT_DIR, "plots", "PDO_ssGSEA_top5_bottom5.pdf"),
+       p_ext, width = 8.5, height = 6)
+
+# 4c. pathways that differ most between PDOs (largest max - min)
+p_var <- plot_dots(variable$pathway, NULL,
+                   paste0(N_VARIABLE, " pathways that differ most between PDOs"),
+                   sub_txt)
+ggsave(file.path(OUT_DIR, "plots", "PDO_ssGSEA_most_variable_pathways.png"),
+       p_var, width = 8.5, height = 5.5, dpi = 300)
+ggsave(file.path(OUT_DIR, "plots", "PDO_ssGSEA_most_variable_pathways.pdf"),
+       p_var, width = 8.5, height = 5.5)
+
+message("Done. Outputs in: ", OUT_DIR)
+sessionInfo()
+```
+
