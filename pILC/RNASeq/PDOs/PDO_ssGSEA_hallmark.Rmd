@@ -1,0 +1,226 @@
+---
+title: "PDO_ssGSEA_hallmark"
+output: html_document
+date: "2026-10-11"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r}
+###############################################################################
+# ssGSEA (Hallmark) for 4 patient-derived organoids (PDOs):
+#   BO-046, BO-114, BO-189, BO-268
+#
+# INPUT   PDO_raw_counts.csv   (made by Extract_PDO_raw_counts.R)
+#         gene (Ensembl ID, with version) + 4 columns of raw integer counts
+#
+# WORKFLOW
+#   1. Read raw counts
+#   2. Gene cleaning: Ensembl -> symbol, protein-coding only, one row per symbol
+#      (same logic as the pILC DESeq2/ssGSEA script)
+#   3. Count filter: >= MIN_COUNT counts in >= MIN_SAMPLES samples
+#   4. VST on the 4 samples (blind = TRUE, no grouping used)
+#   5. Variance filter: remove the bottom VAR_FILTER_PCT of genes by VST variance
+#      (set VAR_FILTER_PCT <- 0 to switch it off)
+#   6. ssGSEA with Hallmark gene sets (normalize = TRUE, as in the pILC script)
+#   7. Sensitivity check: ssGSEA again WITHOUT the variance filter, and the
+#      correlation between the two sets of scores
+#   8. Tables and figures
+#
+# IMPORTANT NOTES
+#   - ssGSEA is rank-based inside each sample. Removing genes changes the ranks,
+#     so step 7 shows whether the variance filter changes the result.
+#   - normalize = TRUE rescales scores by their range ACROSS THE 4 SAMPLES.
+#     The scores are therefore relative within these PDOs and must NOT be
+#     compared directly with scores from the pILC tumor run.
+#   - With n = 4 no statistical test is possible. Results are descriptive.
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(org.Hs.eg.db)
+  library(AnnotationDbi)
+  library(GSVA)
+  library(ComplexHeatmap)
+  library(circlize)
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+  library(tibble)
+})
+
+SEED <- 42
+set.seed(SEED)
+
+# ------------------------------ 1. SETTINGS ----------------------------------
+PDO_DIR      <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/PDO"
+COUNTS_FILE  <- file.path(PDO_DIR, "PDO_raw_counts.csv")
+HALLMARK_GMT <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/GSEA/Dataset/h.all.v2025.1.Hs.symbols.gmt"
+
+OUT_DIR <- PDO_DIR
+dir.create(file.path(OUT_DIR, "plots"), recursive = TRUE, showWarnings = FALSE)
+
+MIN_COUNT     <- 10    # a gene must have at least this many counts ...
+MIN_SAMPLES   <- 1     # ... in at least this many of the 4 samples
+VAR_FILTER_PCT <- 0.10 # remove the bottom 10% of genes by VST variance (0 = off)
+TOP_N         <- 10    # top pathways reported per sample
+
+# ---------------------------- 2. READ RAW COUNTS -----------------------------
+raw <- read.csv(COUNTS_FILE, check.names = FALSE, stringsAsFactors = FALSE)
+samples <- setdiff(colnames(raw), "gene")
+counts  <- as.matrix(raw[, samples])
+rownames(counts) <- raw$gene
+mode(counts) <- "integer"
+stopifnot(!anyNA(counts), all(counts >= 0))
+message("Raw count matrix: ", nrow(counts), " genes x ", ncol(counts), " samples")
+
+# ------------------------ 3. GENE CLEANING (SYMBOLS) -------------------------
+ids  <- sub("\\..*$", "", rownames(counts))        # remove Ensembl version suffix
+anno <- AnnotationDbi::select(org.Hs.eg.db, keys = unique(ids),
+                              keytype = "ENSEMBL",
+                              columns = c("SYMBOL", "GENETYPE"))
+anno   <- anno[!duplicated(anno$ENSEMBL), ]
+symbol <- anno$SYMBOL[match(ids, anno$ENSEMBL)]
+gtype  <- anno$GENETYPE[match(ids, anno$ENSEMBL)]
+
+# Keep protein-coding genes that have a gene symbol
+keep   <- !is.na(symbol) & symbol != "" & gtype %in% "protein-coding"
+counts <- counts[keep, ]
+symbol <- symbol[keep]
+
+# Duplicated symbols: keep the row with the highest mean count
+ord    <- order(rowMeans(counts), decreasing = TRUE)
+counts <- counts[ord, ]
+symbol <- symbol[ord]
+counts <- counts[!duplicated(symbol), ]
+rownames(counts) <- symbol[!duplicated(symbol)]
+n_coding <- nrow(counts)
+message("Protein-coding genes with symbol: ", n_coding)
+
+# ----------------------------- 4. COUNT FILTER -------------------------------
+counts <- counts[rowSums(counts >= MIN_COUNT) >= MIN_SAMPLES, ]
+n_count_filt <- nrow(counts)
+message("After count filter (>= ", MIN_COUNT, " counts in >= ", MIN_SAMPLES,
+        " samples): ", n_count_filt)
+
+# ------------------------------- 5. VST --------------------------------------
+# design = ~ 1 and blind = TRUE: the transformation does not use any grouping
+dds <- DESeqDataSetFromMatrix(countData = counts,
+                              colData   = data.frame(sample = colnames(counts),
+                                                     row.names = colnames(counts)),
+                              design    = ~ 1)
+vst_mat <- assay(vst(dds, blind = TRUE))
+
+# ------------------------- 6. VARIANCE FILTER --------------------------------
+gene_var <- apply(vst_mat, 1, var)
+if (VAR_FILTER_PCT > 0) {
+  cutoff   <- quantile(gene_var, probs = VAR_FILTER_PCT)
+  vst_filt <- vst_mat[gene_var > cutoff, ]
+} else {
+  vst_filt <- vst_mat
+}
+n_var_filt <- nrow(vst_filt)
+message("After variance filter (bottom ", VAR_FILTER_PCT * 100, "% removed): ", n_var_filt)
+
+filter_summary <- data.frame(
+  step  = c("Protein-coding with symbol", "After count filter", "After variance filter"),
+  genes = c(n_coding, n_count_filt, n_var_filt))
+write.csv(filter_summary, file.path(OUT_DIR, "PDO_gene_filtering_summary.csv"),
+          row.names = FALSE)
+write.csv(vst_filt, file.path(OUT_DIR, "PDO_vst_filtered.csv"))
+
+# ----------------------------- 7. ssGSEA -------------------------------------
+# Hallmark GMT: name <tab> description <tab> genes...
+gmt_lines <- strsplit(readLines(HALLMARK_GMT), "\t")
+hallmark  <- setNames(lapply(gmt_lines, function(x) x[-(1:2)]),
+                      sapply(gmt_lines, `[`, 1))
+
+run_ssgsea <- function(mat) {
+  sc <- gsva(ssgseaParam(exprData = mat, geneSets = hallmark, normalize = TRUE))
+  rownames(sc) <- sub("^HALLMARK_", "", rownames(sc))
+  sc
+}
+
+ss_scores <- run_ssgsea(vst_filt)
+write.csv(ss_scores, file.path(OUT_DIR, "PDO_ssGSEA_Hallmark_scores.csv"))
+
+# Gene-set coverage: how many genes of each Hallmark set are in the matrix
+coverage <- data.frame(
+  pathway   = sub("^HALLMARK_", "", names(hallmark)),
+  set_size  = lengths(hallmark),
+  n_found   = sapply(hallmark, function(g) sum(g %in% rownames(vst_filt))),
+  row.names = NULL) %>%
+  mutate(fraction_found = round(n_found / set_size, 3))
+write.csv(coverage, file.path(OUT_DIR, "PDO_ssGSEA_Hallmark_gene_coverage.csv"),
+          row.names = FALSE)
+if (any(coverage$fraction_found < 0.8))
+  message("Warning: pathways with < 80% of genes found: ",
+          paste(coverage$pathway[coverage$fraction_found < 0.8], collapse = ", "))
+
+# ------------------- 8. SENSITIVITY: WITH vs WITHOUT VARIANCE FILTER ---------
+if (VAR_FILTER_PCT > 0) {
+  ss_nofilt <- run_ssgsea(vst_mat)
+  write.csv(ss_nofilt, file.path(OUT_DIR, "PDO_ssGSEA_Hallmark_scores_no_variance_filter.csv"))
+  sens <- data.frame(
+    sample = colnames(ss_scores),
+    spearman_filtered_vs_unfiltered = sapply(colnames(ss_scores), function(s)
+      cor(ss_scores[, s], ss_nofilt[rownames(ss_scores), s], method = "spearman")),
+    row.names = NULL)
+  write.csv(sens, file.path(OUT_DIR, "PDO_ssGSEA_variance_filter_sensitivity.csv"),
+            row.names = FALSE)
+  print(sens)   # values close to 1 = the variance filter changes nothing important
+}
+
+# --------------------------- 9. TOP PATHWAYS ---------------------------------
+score_long <- as.data.frame(t(ss_scores)) %>%
+  rownames_to_column("sample") %>%
+  pivot_longer(-sample, names_to = "pathway", values_to = "score")
+
+top_paths <- score_long %>%
+  group_by(sample) %>%
+  arrange(desc(score), .by_group = TRUE) %>%
+  mutate(rank = row_number()) %>%
+  filter(rank <= TOP_N) %>%
+  ungroup()
+write.csv(top_paths, file.path(OUT_DIR, "PDO_ssGSEA_Hallmark_top_pathways_per_sample.csv"),
+          row.names = FALSE)
+
+# ------------------------------ 10. FIGURES ----------------------------------
+# 10a. Heatmap of raw ssGSEA scores (not z-scores: with n = 4 a z-score would
+#      exaggerate small differences)
+rng <- range(ss_scores)
+ht <- Heatmap(ss_scores, name = "ssGSEA\nscore",
+              col = colorRamp2(c(rng[1], mean(rng), rng[2]),
+                               c("#2166AC", "white", "#B2182B")),
+              cluster_columns = TRUE, cluster_rows = TRUE,
+              show_column_names = TRUE,
+              row_names_gp = gpar(fontsize = 8),
+              column_names_gp = gpar(fontsize = 10),
+              column_title = "Hallmark ssGSEA scores, PDOs")
+png(file.path(OUT_DIR, "plots", "PDO_ssGSEA_Hallmark_heatmap.png"),
+    width = 2200, height = 2600, res = 300)
+draw(ht); dev.off()
+pdf(file.path(OUT_DIR, "plots", "PDO_ssGSEA_Hallmark_heatmap.pdf"), width = 7.5, height = 8.5)
+draw(ht); dev.off()
+
+# 10b. Ranked top pathways, one plot per sample
+for (s in colnames(ss_scores)) {
+  d <- top_paths %>% filter(sample == s) %>%
+    mutate(pathway = factor(pathway, levels = rev(pathway)))
+  p <- ggplot(d, aes(score, pathway)) +
+    geom_col(fill = "#B2182B", alpha = 0.8) +
+    labs(title = paste0(s, ": top ", TOP_N, " Hallmark pathways"),
+         x = "ssGSEA enrichment score", y = NULL) +
+    theme_classic(base_size = 14) +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5))
+  ggsave(file.path(OUT_DIR, "plots", paste0("PDO_ssGSEA_top_pathways_", s, ".png")),
+         p, width = 7.5, height = 5, dpi = 300)
+  ggsave(file.path(OUT_DIR, "plots", paste0("PDO_ssGSEA_top_pathways_", s, ".pdf")),
+         p, width = 7.5, height = 5)
+}
+
+message("Done. Outputs in: ", OUT_DIR)
+sessionInfo()
+```
+
