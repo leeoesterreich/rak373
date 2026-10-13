@@ -1,0 +1,919 @@
+---
+title: "METABRIC_ILC_Grade1_2_vs_Grade3"
+output: html_document
+date: "2026-10-01"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# ==============================================================================
+# METABRIC Agilent microarray analysis — ILC ONLY
+#
+# Cohort     : Invasive lobular carcinoma (ONCOTREE_CODE == "ILC")
+# Comparison : Grade 1 + Grade 2 vs Grade 3
+# Contrast   : Grade3 - Grade1_2
+# DEG        : BH FDR < 0.05 AND |logFC| >= 1
+# Direction  : positive logFC / t / NES = higher in Grade 3
+#              negative logFC / t / NES = higher in Grade 1/2
+#
+# Analyses
+#   1. limma differential expression
+#   2. PCA, volcano plot, heatmap
+#   3. GSEA (all genes ranked by limma t) for
+#        Hallmark, Reactome, GO_BP, GO_MF, GO_CC
+#        - Main plot  : FDR < 0.05 + redundancy filter (Jaccard < 0.5 kept)
+#        - Backup plot: FDR < 0.05 only
+#   4. ORA (strict DEGs, up and down tested separately), same collections
+#        - Main plot  : FDR < 0.05 + redundancy filter
+#        - Backup plot: FDR < 0.05 only
+# ==============================================================================
+
+set.seed(42)
+
+# ==============================================================================
+# 0. Packages
+# ==============================================================================
+
+suppressPackageStartupMessages({
+  library(limma)
+  library(dplyr)
+  library(ggplot2)
+  library(ggrepel)
+  library(pheatmap)
+  library(stringr)
+  library(clusterProfiler)
+  library(msigdbr)
+  library(patchwork)
+  library(grid)
+})
+
+
+# ==============================================================================
+# 1. Parameters
+# ==============================================================================
+
+FDR_CUTOFF               <- 0.05
+LOGFC_CUTOFF             <- 1
+
+TOP_LABELS_PER_DIRECTION <- 10    # volcano labels per direction
+HEATMAP_TOP_N_PER_DIR    <- 25    # heatmap genes per direction
+PCA_TOP_VARIABLE_GENES   <- 2000
+
+GSEA_MIN_GS_SIZE         <- 10
+GSEA_MAX_GS_SIZE         <- 500
+
+PLOT_TOP_N_MAIN          <- 10    # terms per direction, main plots
+JACCARD_CUTOFF           <- 0.5   # terms with Jaccard >= cutoff are "redundant"
+LABEL_WRAP_WIDTH         <- 45    # characters per line in pathway labels
+
+# Colours (same logic in every figure)
+COL_G3  <- "#C0392B"   # higher in Grade 3
+COL_G12 <- "#2874A6"   # higher in Grade 1/2
+COL_NS  <- "grey78"
+
+# Curated genes: labelled on the volcano ONLY if they pass the strict cutoff
+genes_of_interest <- c("CDH1", "PIK3CA", "ESR1", "GATA3", "FOXA1",
+                       "TBX3", "TP53", "ERBB2", "CCND1", "MYC")
+
+
+# ==============================================================================
+# 2. Input / output
+# ==============================================================================
+
+base_dir      <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/MetaBric"
+clinical_file <- file.path(base_dir, "data_clinical_sample.txt")
+expr_file     <- file.path(base_dir, "data_mrna_agilent_microarray.txt")
+
+outdir   <- file.path(base_dir, "ILC_Grade1_2_vs_Grade3")
+gsea_dir <- file.path(outdir, "GSEA")
+ora_dir  <- file.path(outdir, "ORA")
+
+for (d in c(outdir, gsea_dir, ora_dir)) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+
+# Save a ggplot as PDF + PNG
+save_fig <- function(p, path_no_ext, width, height, dpi = 600) {
+  ggsave(paste0(path_no_ext, ".pdf"), p, width = width, height = height)
+  ggsave(paste0(path_no_ext, ".png"), p, width = width, height = height, dpi = dpi)
+}
+
+# Shared theme
+theme_pub <- function(base_size = 12) {
+  theme_classic(base_size = base_size) +
+    theme(
+      plot.title    = element_text(face = "bold", size = base_size + 2),
+      plot.subtitle = element_text(size = base_size - 3, color = "grey30"),
+      axis.text     = element_text(color = "black"),
+      legend.key.height = unit(0.5, "cm")
+    )
+}
+
+
+# ==============================================================================
+# 3. Read clinical data and define groups
+# ==============================================================================
+
+clinical <- read.delim(
+  clinical_file, header = TRUE, sep = "\t", comment.char = "#",
+  stringsAsFactors = FALSE, check.names = FALSE
+)
+
+stopifnot(all(c("SAMPLE_ID", "GRADE", "ONCOTREE_CODE") %in% colnames(clinical)))
+
+# Retain ONLY histologically annotated invasive lobular carcinomas.
+# Excludes mixed ductal/lobular tumors (MDLC) and every other histology.
+clinical <- clinical %>%
+  filter(trimws(as.character(ONCOTREE_CODE)) == "ILC")
+
+cat("\nTotal ILC samples in clinical file:", nrow(clinical), "\n")
+stopifnot(nrow(clinical) > 0, !anyDuplicated(clinical$SAMPLE_ID))
+
+clinical$GRADE_numeric <- suppressWarnings(as.numeric(clinical$GRADE))
+
+clinical$Grade_group <- case_when(
+  clinical$GRADE_numeric %in% c(1, 2) ~ "Grade1_2",
+  clinical$GRADE_numeric == 3         ~ "Grade3",
+  TRUE                                ~ NA_character_
+)
+
+cat("\nILC-only grade distribution (including missing grades)\n")
+print(table(clinical$GRADE_numeric, useNA = "ifany"))
+
+clinical_use <- clinical %>% filter(!is.na(Grade_group))
+clinical_use$Grade_group <- factor(clinical_use$Grade_group,
+                                   levels = c("Grade1_2", "Grade3"))
+
+
+# ==============================================================================
+# 4. Read expression and match samples
+# ==============================================================================
+
+expr_raw <- read.delim(
+  expr_file, header = TRUE, sep = "\t",
+  stringsAsFactors = FALSE, check.names = FALSE
+)
+
+stopifnot(all(c("Hugo_Symbol", "Entrez_Gene_Id") %in% colnames(expr_raw)))
+
+sample_columns <- setdiff(colnames(expr_raw), c("Hugo_Symbol", "Entrez_Gene_Id"))
+common_samples <- sample_columns[sample_columns %in% clinical_use$SAMPLE_ID]
+
+metadata <- clinical_use[match(common_samples, clinical_use$SAMPLE_ID), ]
+stopifnot(identical(metadata$SAMPLE_ID, common_samples))
+
+cat("\nFinal sample counts\n")
+print(table(metadata$Grade_group))
+print(table(metadata$GRADE_numeric))
+stopifnot(nrow(metadata) > 0,
+          all(metadata$ONCOTREE_CODE == "ILC"),
+          all(metadata$GRADE_numeric %in% c(1, 2, 3)),
+          all(c("Grade1_2", "Grade3") %in% as.character(metadata$Grade_group)))
+
+# Matching audit (paired with the samples-used table)
+audit_summary <- data.frame(
+  Metric = c("Total_clinical", "Clinical_Grade1", "Clinical_Grade2",
+             "Clinical_Grade3", "Expression_samples", "Matched_Grade1",
+             "Matched_Grade2", "Matched_Grade3", "Final_Grade1_2",
+             "Final_Grade3", "Final_total"),
+  N = c(nrow(clinical),
+        sum(clinical$GRADE_numeric == 1, na.rm = TRUE),
+        sum(clinical$GRADE_numeric == 2, na.rm = TRUE),
+        sum(clinical$GRADE_numeric == 3, na.rm = TRUE),
+        length(sample_columns),
+        sum(metadata$GRADE_numeric == 1),
+        sum(metadata$GRADE_numeric == 2),
+        sum(metadata$GRADE_numeric == 3),
+        sum(metadata$Grade_group == "Grade1_2"),
+        sum(metadata$Grade_group == "Grade3"),
+        nrow(metadata))
+)
+
+write.csv(audit_summary, file.path(outdir, "01_sample_matching_audit.csv"),
+          row.names = FALSE)
+write.csv(metadata, file.path(outdir, "02_samples_used.csv"), row.names = FALSE)
+
+n_g12 <- sum(metadata$Grade_group == "Grade1_2")
+n_g3  <- sum(metadata$Grade_group == "Grade3")
+
+
+# ==============================================================================
+# 5. Expression matrix, gene QC and filtering
+# ==============================================================================
+
+expr <- as.matrix(expr_raw[, common_samples, drop = FALSE])
+storage.mode(expr) <- "numeric"
+stopifnot(identical(colnames(expr), metadata$SAMPLE_ID))
+
+gene_symbols <- expr_raw$Hugo_Symbol
+valid_gene   <- !is.na(gene_symbols) & gene_symbols != ""
+
+expr         <- expr[valid_gene, , drop = FALSE]
+gene_symbols <- gene_symbols[valid_gene]
+rownames(expr) <- gene_symbols
+
+cat("\nDuplicated gene symbols:", sum(duplicated(gene_symbols)), "\n")
+
+# Average duplicate gene symbols
+if (anyDuplicated(gene_symbols) > 0) {
+  expr <- avereps(expr, ID = rownames(expr))
+}
+
+# Keep genes measured in >= 80% of samples
+expr <- expr[rowMeans(!is.na(expr)) >= 0.80, , drop = FALSE]
+
+# Remove zero-variance genes
+gene_variance <- apply(expr, 1, var, na.rm = TRUE)
+expr <- expr[!is.na(gene_variance) & gene_variance > 0, , drop = FALSE]
+
+cat("Genes entering limma:", nrow(expr), "\n")
+
+
+# ==============================================================================
+# 6. limma differential expression
+# ==============================================================================
+
+group  <- metadata$Grade_group
+design <- model.matrix(~ 0 + group)
+colnames(design) <- levels(group)
+rownames(design) <- metadata$SAMPLE_ID
+
+fit <- lmFit(expr, design)
+
+contrast_matrix <- makeContrasts(
+  Grade3_vs_Grade1_2 = Grade3 - Grade1_2,
+  levels = design
+)
+
+fit2 <- contrasts.fit(fit, contrast_matrix)
+fit2 <- eBayes(fit2, trend = TRUE)
+
+DE <- topTable(fit2, coef = "Grade3_vs_Grade1_2", number = Inf,
+               adjust.method = "BH", sort.by = "P")
+
+DE$Gene <- rownames(DE)
+DE <- DE[, c("Gene", setdiff(colnames(DE), "Gene"))]
+
+# Strict DEG definition
+DE <- DE %>%
+  mutate(
+    Significance = case_when(
+      adj.P.Val < FDR_CUTOFF & logFC >=  LOGFC_CUTOFF ~ "Higher in Grade 3",
+      adj.P.Val < FDR_CUTOFF & logFC <= -LOGFC_CUTOFF ~ "Higher in Grade 1/2",
+      TRUE                                            ~ "Not significant"
+    ),
+    Significance = factor(Significance,
+                          levels = c("Higher in Grade 3",
+                                     "Higher in Grade 1/2",
+                                     "Not significant"))
+  )
+
+DE_sig        <- DE %>% filter(Significance != "Not significant")
+Grade3_high   <- DE %>% filter(Significance == "Higher in Grade 3")
+Grade1_2_high <- DE %>% filter(Significance == "Higher in Grade 1/2")
+
+cat("\nSTRICT DEG COUNTS (BH FDR < 0.05 AND |logFC| >= 1)\n")
+print(table(DE$Significance))
+
+write.csv(DE,            file.path(outdir, "04_limma_all_genes.csv"),        row.names = FALSE)
+write.csv(DE_sig,        file.path(outdir, "05_DEG_FDR0.05_logFC1.csv"),     row.names = FALSE)
+write.csv(Grade3_high,   file.path(outdir, "06_Grade3_high_DEG.csv"),        row.names = FALSE)
+write.csv(Grade1_2_high, file.path(outdir, "07_Grade1_2_high_DEG.csv"),      row.names = FALSE)
+
+
+# ==============================================================================
+# 7. PCA
+# ==============================================================================
+
+expr_pca <- expr[rowSums(is.na(expr)) == 0, , drop = FALSE]
+pca_var  <- apply(expr_pca, 1, var)
+
+top_pca_genes <- names(sort(pca_var, decreasing = TRUE))[
+  seq_len(min(PCA_TOP_VARIABLE_GENES, length(pca_var)))
+]
+
+pca <- prcomp(t(expr_pca[top_pca_genes, , drop = FALSE]),
+              center = TRUE, scale. = FALSE)
+
+pca_percent <- 100 * pca$sdev^2 / sum(pca$sdev^2)
+
+pca_df <- data.frame(
+  SAMPLE_ID   = rownames(pca$x),
+  PC1         = pca$x[, 1],
+  PC2         = pca$x[, 2],
+  Grade_group = metadata$Grade_group[match(rownames(pca$x), metadata$SAMPLE_ID)]
+)
+
+write.csv(pca_df, file.path(outdir, "03_PCA_coordinates.csv"), row.names = FALSE)
+
+grade_cols   <- c(Grade1_2 = COL_G12, Grade3 = COL_G3)
+grade_labels <- c(Grade1_2 = paste0("Grade 1/2 (n = ", n_g12, ")"),
+                  Grade3   = paste0("Grade 3 (n = ", n_g3, ")"))
+
+p_pca <- ggplot(pca_df, aes(PC1, PC2, color = Grade_group)) +
+  geom_point(size = 1.8, alpha = 0.6) +
+  stat_ellipse(level = 0.95, linewidth = 0.7) +
+  scale_color_manual(values = grade_cols, labels = grade_labels, name = NULL) +
+  labs(
+    title    = "METABRIC ILC: principal component analysis",
+    subtitle = paste0("Top ", length(top_pca_genes),
+                      " most variable genes; ellipses = 95% confidence"),
+    x = paste0("PC1 (", round(pca_percent[1], 1), "%)"),
+    y = paste0("PC2 (", round(pca_percent[2], 1), "%)")
+  ) +
+  theme_pub() +
+  theme(legend.position = "top")
+
+save_fig(p_pca, file.path(outdir, "03_PCA_Grade1_2_vs_Grade3"), 6.5, 6)
+
+
+# ==============================================================================
+# 8. Volcano plot
+# ==============================================================================
+
+# Labels: curated genes (only if strict DEG) + top genes per direction (by |t|)
+genes_of_interest_sig <- DE_sig %>%
+  filter(Gene %in% genes_of_interest) %>% pull(Gene)
+
+top_g3 <- Grade3_high %>%
+  arrange(desc(abs(t))) %>% slice_head(n = TOP_LABELS_PER_DIRECTION) %>% pull(Gene)
+
+top_g12 <- Grade1_2_high %>%
+  arrange(desc(abs(t))) %>% slice_head(n = TOP_LABELS_PER_DIRECTION) %>% pull(Gene)
+
+genes_to_label <- unique(c(genes_of_interest_sig, top_g3, top_g12))
+
+DE_plot <- DE %>%
+  mutate(
+    minusLog10FDR = -log10(pmax(adj.P.Val, .Machine$double.xmin)),
+    Label = ifelse(Gene %in% genes_to_label, Gene, NA_character_)
+  ) %>%
+  arrange(desc(Significance == "Not significant"))   # draw grey points first
+
+sig_counts <- table(DE$Significance)
+volcano_labels <- c(
+  "Higher in Grade 3"   = paste0("Higher in Grade 3 (n = ",   sig_counts[["Higher in Grade 3"]],   ")"),
+  "Higher in Grade 1/2" = paste0("Higher in Grade 1/2 (n = ", sig_counts[["Higher in Grade 1/2"]], ")"),
+  "Not significant"     = "Not significant"
+)
+
+p_volcano <- ggplot(DE_plot, aes(logFC, minusLog10FDR, color = Significance)) +
+  geom_point(size = 1.4, alpha = 0.65) +
+  geom_vline(xintercept = c(-LOGFC_CUTOFF, LOGFC_CUTOFF),
+             linetype = "dashed", linewidth = 0.4) +
+  geom_hline(yintercept = -log10(FDR_CUTOFF),
+             linetype = "dashed", linewidth = 0.4) +
+  geom_text_repel(
+    aes(label = Label), size = 3.2, max.overlaps = Inf,
+    box.padding = 0.4, point.padding = 0.3, min.segment.length = 0,
+    segment.size = 0.3, show.legend = FALSE, color = "black"
+  ) +
+  scale_color_manual(
+    values = c("Higher in Grade 3" = COL_G3,
+               "Higher in Grade 1/2" = COL_G12,
+               "Not significant" = COL_NS),
+    labels = volcano_labels, name = NULL
+  ) +
+  labs(
+    title    = "METABRIC ILC: Grade 3 vs Grade 1/2",
+    subtitle = "BH FDR < 0.05 and |logFC| \u2265 1",
+    x = expression(log[2]~"fold change (Grade 3 \u2212 Grade 1/2)"),
+    y = expression(-log[10]~"(FDR)")
+  ) +
+  theme_pub(14) +
+  theme(legend.position = "top")
+
+save_fig(p_volcano, file.path(outdir, "08_Volcano_Grade3_vs_Grade1_2"), 8, 7)
+
+
+# ==============================================================================
+# 9. Heatmap (top DEGs per direction, row z-scores)
+# ==============================================================================
+
+up_genes   <- Grade3_high %>%
+  arrange(desc(abs(t))) %>% slice_head(n = HEATMAP_TOP_N_PER_DIR) %>% pull(Gene)
+down_genes <- Grade1_2_high %>%
+  arrange(desc(abs(t))) %>% slice_head(n = HEATMAP_TOP_N_PER_DIR) %>% pull(Gene)
+
+heat_genes <- c(up_genes, down_genes)
+
+if (length(heat_genes) >= 2) {
+
+  heat_expr <- expr[heat_genes, , drop = FALSE]
+  heat_expr <- heat_expr[rowSums(is.na(heat_expr)) == 0, , drop = FALSE]
+
+  heat_z <- t(scale(t(heat_expr)))
+  heat_z <- pmax(pmin(heat_z, 2.5), -2.5)      # clip for a stable colour range
+
+  annotation_col <- data.frame(Grade = metadata$Grade_group,
+                               row.names = metadata$SAMPLE_ID)
+
+  annotation_row <- data.frame(
+    Direction = ifelse(rownames(heat_z) %in% up_genes,
+                       "Higher in Grade 3", "Higher in Grade 1/2"),
+    row.names = rownames(heat_z)
+  )
+
+  annotation_colors <- list(
+    Grade     = c(Grade1_2 = COL_G12, Grade3 = COL_G3),
+    Direction = c("Higher in Grade 3" = COL_G3, "Higher in Grade 1/2" = COL_G12)
+  )
+
+  ph <- pheatmap(
+    heat_z,
+    annotation_col    = annotation_col,
+    annotation_row    = annotation_row,
+    annotation_colors = annotation_colors,
+    color  = colorRampPalette(c(COL_G12, "white", COL_G3))(100),
+    breaks = seq(-2.5, 2.5, length.out = 101),
+    show_colnames = FALSE,
+    show_rownames = TRUE,
+    cluster_rows = TRUE,
+    cluster_cols = TRUE,
+    clustering_method = "ward.D2",
+    fontsize_row = 7,
+    border_color = NA,
+    main = paste0("Top ", HEATMAP_TOP_N_PER_DIR,
+                  " ILC DEGs per direction: Grade 3 vs Grade 1/2 (row z-score)"),
+    silent = TRUE
+  )
+
+  pdf(file.path(outdir, "09_Heatmap_top_DEGs.pdf"), width = 10, height = 10)
+  grid.newpage(); grid.draw(ph$gtable)
+  dev.off()
+
+  png(file.path(outdir, "09_Heatmap_top_DEGs.png"),
+      width = 10, height = 10, units = "in", res = 300)
+  grid.newpage(); grid.draw(ph$gtable)
+  dev.off()
+
+  write.csv(
+    data.frame(Gene = rownames(heat_z), annotation_row),
+    file.path(outdir, "09_Heatmap_genes.csv"), row.names = FALSE
+  )
+
+} else {
+  message("Fewer than 2 strict DEGs: heatmap skipped.")
+}
+
+
+# ==============================================================================
+# 10. Gene-set collections (MSigDB)
+# ==============================================================================
+
+msig <- msigdbr(species = "Homo sapiens")
+
+# Column names differ between msigdbr versions
+coll_col <- if ("gs_collection" %in% colnames(msig)) "gs_collection" else "gs_cat"
+sub_col  <- if ("gs_subcollection" %in% colnames(msig)) "gs_subcollection" else "gs_subcat"
+
+get_t2g <- function(collection, subcollection = NULL) {
+  d <- msig[msig[[coll_col]] == collection, ]
+  if (!is.null(subcollection)) {
+    d <- d[!is.na(d[[sub_col]]) & d[[sub_col]] == subcollection, ]
+  }
+  d %>% dplyr::select(gs_name, gene_symbol) %>% distinct()
+}
+
+# backup_n = terms per direction in the backup plot (Inf = all significant)
+collections <- list(
+  Hallmark = list(t2g = get_t2g("H"),
+                  prefix = "HALLMARK", label = "Hallmark",
+                  backup_n = Inf, side_by_side = TRUE),
+  Reactome = list(t2g = get_t2g("C2", "CP:REACTOME"),
+                  prefix = "REACTOME", label = "Reactome",
+                  backup_n = 20, side_by_side = FALSE),
+  GO_BP    = list(t2g = get_t2g("C5", "GO:BP"),
+                  prefix = "GOBP", label = "GO Biological Process",
+                  backup_n = 20, side_by_side = FALSE),
+  GO_MF    = list(t2g = get_t2g("C5", "GO:MF"),
+                  prefix = "GOMF", label = "GO Molecular Function",
+                  backup_n = 20, side_by_side = FALSE),
+  GO_CC    = list(t2g = get_t2g("C5", "GO:CC"),
+                  prefix = "GOCC", label = "GO Cellular Component",
+                  backup_n = 20, side_by_side = FALSE)
+)
+
+for (nm in names(collections)) {
+  n_sets <- length(unique(collections[[nm]]$t2g$gs_name))
+  cat(nm, ": ", n_sets, " gene sets\n", sep = "")
+  stopifnot(n_sets > 0)
+}
+
+
+# ==============================================================================
+# 11. Plot helpers (label cleaning, redundancy filter)
+# ==============================================================================
+
+# Make pathway names readable
+clean_term <- function(x, prefix) {
+  x <- sub(paste0("^", prefix, "_"), "", x)
+  x <- tolower(gsub("_", " ", x))
+  x <- paste0(toupper(substring(x, 1, 1)), substring(x, 2))
+
+  # Words that must keep their special capitalisation (extend as needed)
+  acronyms <- c(
+    "DNA", "RNA", "mRNA", "tRNA", "rRNA", "ncRNA", "miRNA", "ATP", "GTP",
+    "GTPase", "NADH", "TGF", "TNF", "TNFa", "NFkB", "IL2", "IL6", "STAT3",
+    "STAT5", "JAK", "KRAS", "MYC", "E2F", "G2M", "mTORC1", "mTOR", "p53",
+    "UV", "PI3K", "AKT", "MAPK", "WNT", "NOTCH", "ER", "MHC", "ECM", "TCA",
+    "TLR", "NMD", "HIV", "Fc"
+  )
+  for (a in acronyms) {
+    x <- gsub(paste0("\\b", a, "\\b"), a, x, ignore.case = TRUE, perl = TRUE)
+  }
+  x
+}
+
+# Remove redundant terms by leading-edge / hit-gene Jaccard overlap.
+# df must be sorted best first and contain a 'core_enrichment' column ("/" separated).
+reduce_redundancy <- function(df, cutoff, max_keep = Inf) {
+
+  if (nrow(df) <= 1) return(df)
+
+  gene_lists <- strsplit(df$core_enrichment, "/")
+  keep       <- rep(FALSE, nrow(df))
+  kept_idx   <- integer(0)
+
+  for (i in seq_len(nrow(df))) {
+
+    redundant <- FALSE
+    for (j in kept_idx) {
+      jac <- length(intersect(gene_lists[[i]], gene_lists[[j]])) /
+        length(union(gene_lists[[i]], gene_lists[[j]]))
+      if (jac >= cutoff) { redundant <- TRUE; break }
+    }
+
+    if (!redundant) {
+      keep[i]  <- TRUE
+      kept_idx <- c(kept_idx, i)
+      if (length(kept_idx) >= max_keep) break   # enough terms collected
+    }
+  }
+
+  df[keep, , drop = FALSE]
+}
+
+dir_levels <- c("Higher in Grade 3", "Higher in Grade 1/2")
+
+# Height scales with the number of terms so labels never collide
+fig_height <- function(n_terms) max(4, 0.42 * n_terms + 1.8)
+
+
+# ==============================================================================
+# 12. GSEA
+# ==============================================================================
+
+# Ranked list: ALL tested genes, limma moderated t-statistic
+gene_rank <- DE$t
+names(gene_rank) <- DE$Gene
+gene_rank <- sort(gene_rank[!is.na(gene_rank) & !is.na(names(gene_rank))],
+                  decreasing = TRUE)
+
+write.table(
+  data.frame(Gene = names(gene_rank), limma_t = gene_rank),
+  file.path(gsea_dir, "GSEA_ranked_all_genes_limma_t.tsv"),
+  sep = "\t", quote = FALSE, row.names = FALSE
+)
+
+run_gsea <- function(gene_rank, t2g, name) {
+
+  cat("\nRunning GSEA:", name, "\n")
+  set.seed(42)
+
+  gsea <- GSEA(
+    geneList      = gene_rank,
+    TERM2GENE     = t2g,
+    minGSSize     = GSEA_MIN_GS_SIZE,
+    maxGSSize     = GSEA_MAX_GS_SIZE,
+    pvalueCutoff  = 1,
+    pAdjustMethod = "BH",
+    eps           = 0,
+    seed          = TRUE,
+    verbose       = FALSE
+  )
+
+  gsea_df <- as.data.frame(gsea)
+  gsea_df$Direction <- ifelse(gsea_df$NES > 0, "Higher in Grade 3", "Higher in Grade 1/2")
+
+  write.csv(gsea_df, file.path(gsea_dir, paste0(name, "_GSEA_all_pathways.csv")),
+            row.names = FALSE)
+  write.csv(gsea_df %>% filter(p.adjust < FDR_CUTOFF),
+            file.path(gsea_dir, paste0(name, "_GSEA_FDR0.05.csv")),
+            row.names = FALSE)
+
+  cat("Significant pathways:", sum(gsea_df$p.adjust < FDR_CUTOFF, na.rm = TRUE), "\n")
+  cat("Pathways with NA p.adjust:", sum(is.na(gsea_df$p.adjust)), "\n")
+  gsea
+}
+
+# Build one GSEA lollipop plot (no saving)
+build_gsea_plot <- function(gsea_obj, label, prefix, top_n, remove_redundant) {
+
+  res <- as.data.frame(gsea_obj) %>%
+    filter(p.adjust < FDR_CUTOFF) %>%
+    arrange(p.adjust, desc(abs(NES)))
+
+  if (nrow(res) == 0) return(NULL)
+
+  select_terms <- function(d) {
+    if (nrow(d) == 0) return(d)
+    if (remove_redundant) d <- reduce_redundancy(d, JACCARD_CUTOFF, max_keep = top_n)
+    slice_head(d, n = min(top_n, nrow(d)))
+  }
+
+  plot_df <- bind_rows(select_terms(filter(res, NES > 0)),
+                       select_terms(filter(res, NES < 0))) %>%
+    mutate(
+      Direction     = factor(ifelse(NES > 0, dir_levels[1], dir_levels[2]),
+                             levels = dir_levels),
+      Term          = str_wrap(clean_term(ID, prefix), width = LABEL_WRAP_WIDTH),
+      minusLog10FDR = -log10(pmax(p.adjust, 1e-300))
+    )
+
+  plot_df$Term <- factor(plot_df$Term, levels = unique(plot_df$Term[order(plot_df$NES)]))
+
+  top_text <- ifelse(is.infinite(top_n), "all significant terms",
+                     paste0("top ", top_n, " per direction"))
+
+  subtitle_text <- if (remove_redundant) {
+    paste0("Ranked by limma t; FDR < ", FDR_CUTOFF,
+           "; non-redundant (leading-edge Jaccard < ", JACCARD_CUTOFF, "); ", top_text)
+  } else {
+    paste0("Ranked by limma t; FDR < ", FDR_CUTOFF, "; no redundancy filter; ", top_text)
+  }
+
+  p <- ggplot(plot_df, aes(NES, Term, color = Direction)) +
+    geom_vline(xintercept = 0, color = "grey30", linewidth = 0.4) +
+    geom_segment(aes(x = 0, xend = NES, yend = Term), linewidth = 0.9) +
+    geom_point(aes(size = minusLog10FDR)) +
+    scale_color_manual(values = c("Higher in Grade 3" = COL_G3,
+                                  "Higher in Grade 1/2" = COL_G12), name = NULL) +
+    scale_size_continuous(range = c(3, 8), name = expression(-log[10]~"(FDR)")) +
+    scale_x_continuous(expand = expansion(mult = 0.08)) +
+    labs(title = paste0(label, " ILC GSEA: Grade 3 vs Grade 1/2"),
+         subtitle = subtitle_text,
+         x = "Normalized enrichment score (NES)", y = NULL) +
+    theme_pub() +
+    theme(axis.text.y = element_text(size = 10, lineheight = 0.9),
+          panel.grid.major.x = element_line(color = "grey90", linewidth = 0.3))
+
+  list(plot = p, data = plot_df)
+}
+
+# Main + backup (+ optional side-by-side); returns one summary row
+plot_gsea_main_and_backup <- function(gsea_obj, name, cfg) {
+
+  res_sig <- as.data.frame(gsea_obj) %>% filter(p.adjust < FDR_CUTOFF)
+
+  summary_row <- data.frame(
+    Collection = name,
+    Significant_total = nrow(res_sig),
+    Significant_Grade3 = sum(res_sig$NES > 0),
+    Significant_Grade1_2 = sum(res_sig$NES < 0),
+    Main_plot_terms = 0L, Backup_plot_terms = 0L
+  )
+
+  main   <- build_gsea_plot(gsea_obj, cfg$label, cfg$prefix,
+                            top_n = PLOT_TOP_N_MAIN, remove_redundant = TRUE)
+  backup <- build_gsea_plot(gsea_obj, cfg$label, cfg$prefix,
+                            top_n = cfg$backup_n, remove_redundant = FALSE)
+
+  if (is.null(main) || is.null(backup)) {
+    message("No significant GSEA pathways for ", name)
+    return(summary_row)
+  }
+
+  cols <- c("ID", "Term", "NES", "p.adjust", "setSize", "Direction")
+
+  write.csv(main$data[, cols],
+            file.path(gsea_dir, paste0(name, "_GSEA_main_plot_data.csv")), row.names = FALSE)
+  write.csv(backup$data[, cols],
+            file.path(gsea_dir, paste0(name, "_GSEA_backup_plot_data.csv")), row.names = FALSE)
+
+  save_fig(main$plot,
+           file.path(gsea_dir, paste0(name, "_GSEA_main_FDR0.05_nonredundant")),
+           10, fig_height(nrow(main$data)))
+
+  save_fig(backup$plot,
+           file.path(gsea_dir, paste0(name, "_GSEA_backup_FDR0.05_all")),
+           10, fig_height(nrow(backup$data)))
+
+  if (isTRUE(cfg$side_by_side)) {
+    combined <- (backup$plot | main$plot) +
+      plot_layout(guides = "collect") & theme(legend.position = "right")
+    save_fig(combined,
+             file.path(gsea_dir, paste0(name, "_GSEA_backup_vs_main_side_by_side")),
+             20, fig_height(max(nrow(main$data), nrow(backup$data))))
+  }
+
+  summary_row$Main_plot_terms   <- nrow(main$data)
+  summary_row$Backup_plot_terms <- nrow(backup$data)
+  summary_row
+}
+
+gsea_results <- list()
+gsea_summary <- list()
+
+for (nm in names(collections)) {
+  gsea_results[[nm]] <- run_gsea(gene_rank, collections[[nm]]$t2g, nm)
+  gsea_summary[[nm]] <- plot_gsea_main_and_backup(gsea_results[[nm]], nm, collections[[nm]])
+}
+
+gsea_summary <- bind_rows(gsea_summary)
+write.csv(gsea_summary, file.path(gsea_dir, "GSEA_summary_counts.csv"), row.names = FALSE)
+print(gsea_summary)
+
+
+# ==============================================================================
+# 13. ORA (strict DEGs; up and down tested separately)
+#     Universe = all genes tested by limma
+# ==============================================================================
+
+gene_universe <- unique(DE$Gene[!is.na(DE$Gene) & DE$Gene != ""])
+grade3_genes  <- unique(Grade3_high$Gene)
+grade12_genes <- unique(Grade1_2_high$Gene)
+
+cat("\nORA input: Grade 3-up genes =", length(grade3_genes),
+    "; Grade 1/2-up genes =", length(grade12_genes), "\n")
+
+# Convert "k/n" strings to numbers
+ratio_to_num <- function(s) {
+  vapply(strsplit(s, "/"),
+         function(z) as.numeric(z[1]) / as.numeric(z[2]), numeric(1))
+}
+
+run_ora_one <- function(genes, t2g, direction) {
+
+  if (length(genes) < 2) return(NULL)
+
+  x <- enricher(
+    gene = genes, universe = gene_universe, TERM2GENE = t2g,
+    pAdjustMethod = "BH", pvalueCutoff = 1, qvalueCutoff = 1,
+    minGSSize = GSEA_MIN_GS_SIZE, maxGSSize = GSEA_MAX_GS_SIZE
+  )
+
+  if (is.null(x)) return(NULL)
+
+  df <- as.data.frame(x)
+  if (nrow(df) == 0) return(NULL)
+
+  df$Direction      <- direction
+  df$FoldEnrichment <- ratio_to_num(df$GeneRatio) / ratio_to_num(df$BgRatio)
+  df
+}
+
+build_ora_plot <- function(ora_df, label, prefix, top_n, remove_redundant) {
+
+  res <- ora_df %>%
+    filter(p.adjust < FDR_CUTOFF) %>%
+    arrange(p.adjust, desc(FoldEnrichment)) %>%
+    mutate(core_enrichment = geneID)          # reuse the redundancy function
+
+  if (nrow(res) == 0) return(NULL)
+
+  select_terms <- function(d) {
+    if (nrow(d) == 0) return(d)
+    if (remove_redundant) d <- reduce_redundancy(d, JACCARD_CUTOFF, max_keep = top_n)
+    slice_head(d, n = min(top_n, nrow(d)))
+  }
+
+  plot_df <- bind_rows(select_terms(filter(res, Direction == dir_levels[1])),
+                       select_terms(filter(res, Direction == dir_levels[2]))) %>%
+    mutate(
+      Direction     = factor(Direction, levels = dir_levels),
+      Term          = str_wrap(clean_term(ID, prefix), width = LABEL_WRAP_WIDTH),
+      minusLog10FDR = -log10(pmax(p.adjust, 1e-300))
+    )
+
+  plot_df$Term <- factor(
+    plot_df$Term,
+    levels = unique(plot_df$Term[order(plot_df$Direction, plot_df$FoldEnrichment)])
+  )
+
+  top_text <- ifelse(is.infinite(top_n), "all significant terms",
+                     paste0("top ", top_n, " per direction"))
+
+  subtitle_text <- if (remove_redundant) {
+    paste0("Strict DEGs (FDR < ", FDR_CUTOFF, ", |logFC| \u2265 ", LOGFC_CUTOFF,
+           "); ORA FDR < ", FDR_CUTOFF,
+           "; non-redundant (Jaccard < ", JACCARD_CUTOFF, "); ", top_text)
+  } else {
+    paste0("Strict DEGs (FDR < ", FDR_CUTOFF, ", |logFC| \u2265 ", LOGFC_CUTOFF,
+           "); ORA FDR < ", FDR_CUTOFF, "; no redundancy filter; ", top_text)
+  }
+
+  p <- ggplot(plot_df, aes(FoldEnrichment, Term)) +
+    geom_point(aes(size = Count, fill = minusLog10FDR),
+               shape = 21, color = "black", stroke = 0.3) +
+    facet_grid(Direction ~ ., scales = "free_y", space = "free_y") +
+    scale_fill_gradient(low = "#FEE0D2", high = "#A50F15",
+                        name = expression(-log[10]~"(FDR)")) +
+    scale_size_continuous(range = c(3, 9), name = "Gene count") +
+    scale_x_continuous(expand = expansion(mult = c(0.05, 0.12))) +
+    labs(title = paste0(label, " ILC ORA: Grade 3 vs Grade 1/2"),
+         subtitle = subtitle_text,
+         x = "Fold enrichment", y = NULL) +
+    theme_pub() +
+    theme(axis.text.y = element_text(size = 10, lineheight = 0.9),
+          strip.background = element_rect(fill = "grey92", color = NA),
+          strip.text = element_text(face = "bold"),
+          panel.grid.major.x = element_line(color = "grey90", linewidth = 0.3))
+
+  list(plot = p, data = plot_df)
+}
+
+run_ora_collection <- function(name, cfg) {
+
+  cat("\nRunning ORA:", name, "\n")
+
+  ora_df <- bind_rows(
+    run_ora_one(grade3_genes,  cfg$t2g, dir_levels[1]),
+    run_ora_one(grade12_genes, cfg$t2g, dir_levels[2])
+  )
+
+  summary_row <- data.frame(
+    Collection = name,
+    Significant_total = 0L, Significant_Grade3 = 0L, Significant_Grade1_2 = 0L,
+    Main_plot_terms = 0L, Backup_plot_terms = 0L
+  )
+
+  if (is.null(ora_df) || nrow(ora_df) == 0) {
+    message("No ORA results for ", name)
+    return(summary_row)
+  }
+
+  write.csv(ora_df, file.path(ora_dir, paste0("ORA_", name, "_all.csv")), row.names = FALSE)
+
+  ora_sig <- ora_df %>% filter(p.adjust < FDR_CUTOFF)
+  write.csv(ora_sig, file.path(ora_dir, paste0("ORA_", name, "_FDR0.05.csv")), row.names = FALSE)
+
+  summary_row$Significant_total    <- nrow(ora_sig)
+  summary_row$Significant_Grade3   <- sum(ora_sig$Direction == dir_levels[1])
+  summary_row$Significant_Grade1_2 <- sum(ora_sig$Direction == dir_levels[2])
+
+  main   <- build_ora_plot(ora_df, cfg$label, cfg$prefix, PLOT_TOP_N_MAIN, TRUE)
+  backup <- build_ora_plot(ora_df, cfg$label, cfg$prefix, cfg$backup_n,    FALSE)
+
+  if (is.null(main) || is.null(backup)) {
+    message("No significant ORA terms for ", name)
+    return(summary_row)
+  }
+
+  cols <- c("ID", "Term", "Direction", "Count", "GeneRatio", "BgRatio",
+            "FoldEnrichment", "p.adjust", "geneID")
+
+  write.csv(main$data[, cols],
+            file.path(ora_dir, paste0("ORA_", name, "_main_plot_data.csv")), row.names = FALSE)
+  write.csv(backup$data[, cols],
+            file.path(ora_dir, paste0("ORA_", name, "_backup_plot_data.csv")), row.names = FALSE)
+
+  save_fig(main$plot,
+           file.path(ora_dir, paste0("ORA_", name, "_main_FDR0.05_nonredundant")),
+           10, fig_height(nrow(main$data)) + 0.6)
+
+  save_fig(backup$plot,
+           file.path(ora_dir, paste0("ORA_", name, "_backup_FDR0.05_all")),
+           10, fig_height(nrow(backup$data)) + 0.6)
+
+  summary_row$Main_plot_terms   <- nrow(main$data)
+  summary_row$Backup_plot_terms <- nrow(backup$data)
+  summary_row
+}
+
+ora_summary <- bind_rows(lapply(names(collections),
+                                function(nm) run_ora_collection(nm, collections[[nm]])))
+
+write.csv(ora_summary, file.path(ora_dir, "ORA_summary_counts.csv"), row.names = FALSE)
+print(ora_summary)
+
+
+# ==============================================================================
+# 14. Final analysis summary and session information
+# ==============================================================================
+
+summary_table <- data.frame(
+  Metric = c("Grade1_2_samples", "Grade3_samples", "Total_samples",
+             "Genes_tested", "Strict_DEGs", "Grade3_high_DEGs", "Grade1_2_high_DEGs"),
+  N = c(n_g12, n_g3, nrow(metadata), nrow(DE),
+        nrow(DE_sig), nrow(Grade3_high), nrow(Grade1_2_high))
+)
+
+write.csv(summary_table, file.path(outdir, "10_analysis_summary.csv"), row.names = FALSE)
+
+writeLines(capture.output(sessionInfo()), file.path(outdir, "sessionInfo.txt"))
+
+cat("\n============================================================\n")
+cat("ILC-ONLY ANALYSIS COMPLETE\n")
+cat("============================================================\n")
+print(summary_table)
+cat("\nDEG cutoff : BH FDR < 0.05 AND |logFC| >= 1\n")
+cat("Contrast   : Grade3 - Grade1_2\n")
+cat("GSEA       : all genes ranked by limma t; BH FDR < 0.05\n")
+cat("Positive NES / logFC = Grade 3; negative = Grade 1/2\n")
+cat("Output     :", outdir, "\n")
+
+```
