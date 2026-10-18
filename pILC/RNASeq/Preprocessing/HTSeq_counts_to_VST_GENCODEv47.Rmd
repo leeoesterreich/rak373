@@ -1,0 +1,252 @@
+---
+title: "pILC_01_HTSeq_counts_to_VST_GENCODEv47"
+output: html_document
+date: "2026-10-02"
+---
+PURPOSE
+##   Build gene-level raw count and VST matrices from HTSeq
+##   count files, with gene labels taken from the GTF that was
+##   used for counting.
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+############################################################
+## Create VST RNA-seq matrix from HTSeq count files
+## Gene labels come from the GTF used for counting
+## (GENCODE v47 basic, GRCh38) - no biomaRt, no version stripping
+############################################################
+
+set.seed(42)
+
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(data.table)
+})
+
+############################################################
+## 1. Paths
+############################################################
+
+count_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/4_Count_file_HTSeq_stranded/"
+
+genome_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/Reference_genome/Human/Human_ref_hg38_p7"
+gtf_file   <- file.path(genome_dir, "gencode.v47.basic.annotation.gtf")
+
+out_dir <- file.path(count_dir, "VST_data_GENCODEv47")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+if (!file.exists(gtf_file)) stop("GTF not found: ", gtf_file)
+
+############################################################
+## 2. Read gene annotation from the GTF (gene lines only)
+############################################################
+
+# Remove comment lines (#) with grep, then read the table
+gtf <- fread(
+  cmd = paste("grep -v '^#'", shQuote(gtf_file)),
+  sep = "\t", header = FALSE, quote = "",
+  select = c(3, 9), col.names = c("feature", "attributes")
+)
+gtf <- gtf[feature == "gene"]
+
+# Pull values out of the attribute column, e.g. gene_id "ENSG...";
+get_attr <- function(x, key) {
+  pattern <- paste0('.*', key, ' "([^"]+)".*')
+  ifelse(grepl(paste0(key, ' "'), x), sub(pattern, "\\1", x), NA_character_)
+}
+
+gene_annot <- data.table(
+  ensembl_id   = get_attr(gtf$attributes, "gene_id"),
+  gene_symbol  = get_attr(gtf$attributes, "gene_name"),
+  gene_biotype = get_attr(gtf$attributes, "gene_type")  # GENCODE uses gene_type
+)
+gene_annot <- unique(gene_annot, by = "ensembl_id")
+
+cat("Genes in GTF:", nrow(gene_annot), "\n\n")
+
+############################################################
+## 3. Read HTSeq files (strict checks, no silent NA -> 0)
+############################################################
+
+count_files <- list.files(count_dir, pattern = "\\.txt$", full.names = TRUE)
+if (length(count_files) != 31) {
+  stop("Expected 31 HTSeq files, found ", length(count_files))
+}
+
+# make.names() turns TP17-M11 into TP17.M11, matching the cluster map in the DESeq2 script
+sample_names <- make.names(tools::file_path_sans_ext(basename(count_files)))
+
+read_htseq <- function(file) {
+  fread(file, header = FALSE, sep = "\t", col.names = c("ensembl_id", "count"))
+}
+count_list <- lapply(count_files, read_htseq)
+names(count_list) <- sample_names
+
+# Every file must contain the same genes in the same order
+ref_ids <- count_list[[1]]$ensembl_id
+same_ids <- vapply(count_list, function(x) identical(x$ensembl_id, ref_ids), logical(1))
+if (!all(same_ids)) {
+  stop("Gene IDs differ between files: ", paste(names(same_ids)[!same_ids], collapse = ", "))
+}
+
+counts_mat <- do.call(cbind, lapply(count_list, function(x) x$count))
+rownames(counts_mat) <- ref_ids
+colnames(counts_mat) <- sample_names
+
+# Remove HTSeq summary rows (__no_feature, __ambiguous, ...)
+counts_mat <- counts_mat[!grepl("^__", rownames(counts_mat)), , drop = FALSE]
+
+if (anyNA(counts_mat)) stop("Missing count values detected.")
+cat("Count matrix: ", nrow(counts_mat), "genes x", ncol(counts_mat), "samples\n\n")
+
+############################################################
+## 4. Build unique gene labels from the GTF
+############################################################
+
+idx <- match(rownames(counts_mat), gene_annot$ensembl_id)
+cat("Count IDs not found in GTF:", sum(is.na(idx)), "\n")
+
+symbol <- gene_annot$gene_symbol[idx]
+symbol <- ifelse(is.na(symbol) | symbol == "", rownames(counts_mat), symbol)
+
+# Where a symbol is shared by several ENSG IDs, use SYMBOL|ENSG; otherwise keep SYMBOL
+dup_symbol <- duplicated(symbol) | duplicated(symbol, fromLast = TRUE)
+gene_label <- ifelse(dup_symbol, paste(symbol, rownames(counts_mat), sep = "|"), symbol)
+stopifnot(!anyDuplicated(gene_label))
+
+annot_out <- data.table(
+  Gene         = gene_label,
+  ensembl_id   = rownames(counts_mat),
+  gene_symbol  = symbol,
+  gene_biotype = gene_annot$gene_biotype[idx]
+)
+fwrite(annot_out, file.path(out_dir, "gene_annotation_from_GTF.tsv"), sep = "\t")
+
+rownames(counts_mat) <- gene_label
+
+cat("Genes still labelled by ENSG ID only:", sum(grepl("^ENSG", gene_label) & !grepl("\\|", gene_label)), "\n\n")
+
+############################################################
+## 5. Save raw counts (this is the input for the DESeq2 script)
+############################################################
+
+raw_out <- data.table(Gene = rownames(counts_mat), counts_mat)
+fwrite(raw_out, file.path(out_dir, "htseq_raw_counts_with_gene_names.csv"))
+saveRDS(counts_mat, file.path(out_dir, "htseq_raw_counts_with_gene_names.rds"))
+
+############################################################
+## 6. Low-expression filter before VST
+##    Keep genes with count >= 5 in at least 10% of samples
+############################################################
+
+min_count   <- 5
+min_samples <- ceiling(ncol(counts_mat) * 0.10)
+
+keep_genes      <- rowSums(counts_mat >= min_count) >= min_samples
+counts_filtered <- counts_mat[keep_genes, , drop = FALSE]
+
+cat("Genes after low-expression filter:", nrow(counts_filtered), "\n\n")
+
+fwrite(
+  data.table(Gene = rownames(counts_filtered), counts_filtered),
+  file.path(out_dir, "htseq_expression_filtered_counts_gene_names.csv")
+)
+saveRDS(counts_filtered, file.path(out_dir, "htseq_expression_filtered_counts_gene_names.rds"))
+
+############################################################
+## 7. VST (blind = TRUE, design ~ 1: unsupervised use)
+############################################################
+
+storage.mode(counts_filtered) <- "integer"
+
+coldata <- data.frame(sample = colnames(counts_filtered),
+                      row.names = colnames(counts_filtered))
+
+dds <- DESeqDataSetFromMatrix(
+  countData = counts_filtered,
+  colData   = coldata,
+  design    = ~ 1
+)
+
+vst_obj <- tryCatch(
+  vst(dds, blind = TRUE),
+  error = function(e) {
+    message("vst() failed: ", conditionMessage(e),
+            "\nUsing varianceStabilizingTransformation() instead.")
+    varianceStabilizingTransformation(dds, blind = TRUE)
+  }
+)
+vst_mat <- assay(vst_obj)
+
+fwrite(
+  data.table(Gene = rownames(vst_mat), vst_mat),
+  file.path(out_dir, "htseq_VST_gene_names_all_expression_filtered_genes.csv")
+)
+saveRDS(vst_obj, file.path(out_dir, "DESeq2_VST_object.rds"))
+saveRDS(vst_mat, file.path(out_dir, "htseq_VST_matrix_all_expression_filtered_genes.rds"))
+
+############################################################
+## 8. Top 5000 variable genes after VST (for MOFA2 / clustering)
+############################################################
+
+top_n_genes   <- 5000
+vst_gene_vars <- apply(vst_mat, 1, var, na.rm = TRUE)
+top_genes     <- names(sort(vst_gene_vars, decreasing = TRUE))[1:min(top_n_genes, length(vst_gene_vars))]
+vst_mat_topvar <- vst_mat[top_genes, , drop = FALSE]
+
+fwrite(
+  data.table(Gene = rownames(vst_mat_topvar), vst_mat_topvar),
+  file.path(out_dir, "htseq_VST_gene_names_top5000_variable_genes.csv")
+)
+saveRDS(vst_mat_topvar, file.path(out_dir, "htseq_VST_matrix_top5000_variable_genes.rds"))
+
+gene_variance_df <- data.table(Gene = names(vst_gene_vars),
+                               VST_variance = as.numeric(vst_gene_vars))
+setorder(gene_variance_df, -VST_variance)
+fwrite(gene_variance_df, file.path(out_dir, "htseq_VST_gene_variance_table.csv"))
+
+fwrite(data.table(Sample = colnames(vst_mat)),
+       file.path(out_dir, "VST_sample_names.csv"))
+
+############################################################
+## 9. Final summary
+############################################################
+
+cat("\n============================================================\n")
+cat("DONE: VST RNA-seq matrix generated\n")
+cat("============================================================\n")
+cat("Output folder:", out_dir, "\n\n")
+cat("Raw counts (input for DESeq2):", file.path(out_dir, "htseq_raw_counts_with_gene_names.csv"), "\n")
+cat("Recommended matrix for MOFA2 :", file.path(out_dir, "htseq_VST_matrix_top5000_variable_genes.rds"), "\n\n")
+cat("Genes after removing HTSeq summary rows:", nrow(counts_mat), "\n")
+cat("Genes after low-expression filter      :", nrow(counts_filtered), "\n")
+cat("Genes in top-variable VST matrix       :", nrow(vst_mat_topvar), "\n")
+cat("Number of samples                      :", ncol(vst_mat), "\n")
+```
+
+```{r}
+# ---- 10. GCT file for GenePattern NMFConsensus (all expression-filtered genes) ----
+# GCT format: line 1 = "#1.2"; line 2 = n_genes <tab> n_samples;
+# then a header row (Name, Description, samples) and the data rows.
+gct_file <- file.path(out_dir, "vst_transformed_data.gct")
+
+desc <- annot_out$ensembl_id[match(rownames(vst_mat), annot_out$Gene)]  # Description = Ensembl ID
+
+con <- file(gct_file, "w")
+writeLines("#1.2", con)
+writeLines(paste(nrow(vst_mat), ncol(vst_mat), sep = "\t"), con)
+close(con)
+
+gct_body <- data.table(Name = rownames(vst_mat), Description = desc, vst_mat)
+fwrite(gct_body, gct_file, sep = "\t", append = TRUE, col.names = TRUE)
+
+# ---- 11. Quick check: assigned reads per sample (expect about 15-31 million) ----
+lib_check <- data.table(Sample = colnames(counts_mat),
+                        assigned_reads = colSums(counts_mat))
+print(lib_check)
+fwrite(lib_check, file.path(out_dir, "tumor_assigned_reads_per_sample.csv"))
+stopifnot(!anyNA(vst_mat), all(is.finite(vst_mat)), min(vst_mat) >= 0)
+```
+
