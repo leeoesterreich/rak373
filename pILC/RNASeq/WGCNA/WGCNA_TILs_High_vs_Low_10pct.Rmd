@@ -1,0 +1,913 @@
+---
+title: "WGCNA with TILs High (>=10%) vs Low (<10%) as the external trait"
+params:
+  power_override: null   # leave null to use the prespecified rule; set e.g. 7 for a sensitivity run
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# 1. Aim
+
+Run WGCNA on the strand-corrected top-5000 VST matrix and relate the modules to TILs
+High vs Low instead of the three NMF clusters used before.
+
+* Low TILs  = TILs < 10 (this includes the text value "<5")
+* High TILs = TILs >= 10
+* The trait is coded High = 1, Low = 0. Positive module correlation = higher in High TILs.
+* The cutoff of 10 is fixed in advance (group sizes at 10%: 16 Low and 14 High among the
+  30 samples that have a TILs value). Other cutoffs would only be sensitivity analyses.
+* One sample (TP17-M11) has a blank TILs value. It stays in the network but is left out
+  of the TILs correlations and tests.
+
+# 2. Settings
+
+```{r settings}
+SEED <- 42
+set.seed(SEED)
+
+TIL_CUTOFF <- 10                        # High >= cutoff, Low < cutoff
+
+# ---- paths (edit here only) ----
+root <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq"
+clinical_path <- file.path(root, "Clinical_correlation",
+                           "pILC_ClinicoPathological_details.csv")
+expr_path <- file.path(root, "4_Count_file_HTSeq_stranded", "VST_data_GENCODEv47",
+                       "htseq_VST_gene_names_top5000_variable_genes.csv")
+oncovar_file <- "/ix1/alee/LO_LAB/Personal/Rahul/BioNano/Reference/TCGA.BRCA.all.genes.OncoVar.tsv"
+
+# wgcna_base: power-independent diagnostics. wgcna_dir (power_<N>) is set once the power is chosen.
+wgcna_base <- file.path(root, "WGCNA", "TILs", "High_vs_Low_10pct")
+dir.create(wgcna_base, recursive = TRUE, showWarnings = FALSE)
+
+POWERS           <- c(1:10, 12, 14, 16, 18, 20)  # candidate soft-threshold powers
+R2_CUTOFF        <- 0.80                          # scale-free fit threshold
+NETWORK_TYPE     <- "unsigned"                    # same as the cluster run
+DEEP_SPLIT       <- 2                             # dynamic tree cut sensitivity
+MIN_MODULE_SIZE  <- 30                            # smallest allowed module
+MERGE_CUT_HEIGHT <- 0.25                          # merge modules with eigengene r > 0.75
+HUB_FDR_CUTOFF   <- 0.05                          # BH-FDR (High vs Low test) for hub genes
+HUB_KME_CUTOFF   <- 0.70                          # module membership for hub genes
+TOP_N            <- 50                            # genes per module in top-hub tables
+
+GROUP_COLORS <- c(Low = "#9ecae1", High = "#08519c")
+
+stopifnot(file.exists(clinical_path), file.exists(expr_path))
+
+suppressPackageStartupMessages({
+  library(WGCNA)
+  library(dplyr)
+  library(tibble)
+  library(data.table)
+  library(ComplexHeatmap)
+})
+options(stringsAsFactors = FALSE)
+try(WGCNA::allowWGCNAThreads(), silent = TRUE)
+```
+
+# 3. Helper functions
+
+```{r helpers}
+# Make IDs comparable: trim spaces, dots -> hyphens, drop a trailing _S<number>
+norm_id <- function(x) sub("_S[0-9]+$", "", gsub("\\.", "-", trimws(x)))
+
+# Save the same plot as PNG and PDF, then show it in the report.
+# out_dir defaults to the power-specific folder (wgcna_dir, defined once the power is chosen);
+# power-independent figures pass out_dir = wgcna_base explicitly.
+save_fig <- function(name, plot_fun, width_in, height_in, res = 200, out_dir = wgcna_dir) {
+  png(file.path(out_dir, paste0(name, ".png")),
+      width = width_in * res, height = height_in * res, res = res)
+  tryCatch(plot_fun(), finally = dev.off())
+  pdf(file.path(out_dir, paste0(name, ".pdf")),
+      width = width_in, height = height_in)
+  tryCatch(plot_fun(), finally = dev.off())
+  plot_fun()
+}
+
+# Parse the TILs column. Returns the raw text, a numeric value for plotting and
+# rank tests, and the Low/High group.
+#   "<5"  -> Low. Numeric value 2.5 (midpoint) is used for plotting only;
+#            rank-based tests are not affected by the exact value as long as it is < 5.
+#   "10"  -> numeric 10, High (>= cutoff)
+#   anything unreadable (or "<x" with x > cutoff, which is ambiguous) -> NA
+parse_tils <- function(x, cutoff) {
+  raw    <- trimws(as.character(x))
+  is_lt  <- grepl("^<", raw)
+  num    <- suppressWarnings(as.numeric(gsub("[^0-9.]", "", raw)))
+  num[is.na(raw) | raw == ""] <- NA
+
+  plot_value <- ifelse(is_lt, num / 2, num)
+  group <- ifelse(is_lt & !is.na(num) & num <= cutoff, "Low",
+           ifelse(!is_lt & !is.na(num) & num >= cutoff, "High",
+           ifelse(!is_lt & !is.na(num) & num <  cutoff, "Low", NA)))
+  group[grepl("^>", raw)] <- NA     # a ">x" value is not expected; treat as unreadable
+  data.frame(TILs_raw = raw, TILs_value = plot_value, TILs_less_than = is_lt,
+             TILs_group = group, stringsAsFactors = FALSE)
+}
+
+# Row-z-scored heatmap of the given genes, samples ordered by TILs group (Low, then High).
+make_tils_heatmap <- function(genes, expr, traits, column_title, row_title = NULL) {
+  ord <- rownames(traits)[order(traits$TILs_group)]
+  m <- t(as.matrix(expr[ord, genes, drop = FALSE]))       # genes x samples
+  v <- apply(m, 1, var, na.rm = TRUE)
+  m <- m[!is.na(v) & v > 0, , drop = FALSE]               # drop zero-variance genes
+  if (nrow(m) < 2) return(NULL)                           # need >= 2 genes
+  z <- t(scale(t(m)))
+  ann <- HeatmapAnnotation(
+    TILs = as.character(traits[ord, "TILs_group"]),
+    col = list(TILs = GROUP_COLORS),
+    na_col = "grey80"
+  )
+  Heatmap(z, name = "Z-score", top_annotation = ann,
+          cluster_rows = TRUE, cluster_columns = FALSE,
+          show_column_names = FALSE,
+          row_names_gp = grid::gpar(fontsize = 6),
+          column_title = column_title, row_title = row_title)
+}
+```
+
+# 4. WGCNA with TILs High vs Low as the external trait
+
+WGCNA groups genes that rise and fall together across samples into modules. Here the
+modules are related to one external trait: TILs High (1) vs Low (0), with the cutoff set
+in the settings (10%). The workflow is the same as the earlier WGCNA with the three NMF
+clusters; only the external trait is different (two TILs groups instead of three clusters).
+
+Important: the network and the modules are built from the expression data alone and do
+not use any trait. With the same VST matrix and the same settings, the modules are
+therefore expected to be the same as in the cluster WGCNA. A check against the saved
+cluster result is printed below. What changes is the trait part: which modules relate to
+TILs, and which genes are hub genes.
+
+Notes for future reference:
+
+* Modules are defined before, and independently of, any external trait. If the check in
+  the section "Check: are the modules the same as in the cluster WGCNA?" prints TRUE,
+  the modules used here ARE the cluster WGCNA modules (same colours, same genes). Only
+  the trait step (which modules relate to TILs, which genes are hub genes) is new.
+* Every module-trait correlation uses all samples that have the trait. What matters for
+  power is the size of the smaller group. A one-vs-rest cluster trait splits the samples
+  about 10 vs 21. The TILs trait splits the 30 samples with a TILs value into 16 Low and
+  14 High at the 10% cutoff, so its smaller group is larger than a cluster.
+
+* Trait coding: High = 1, Low = 0. A positive correlation means the module is higher in
+  High-TILs tumours, a negative one means it is higher in Low-TILs tumours. A separate
+  "Low" trait would be the exact mirror image (same |r|, opposite sign), so it is not added.
+* As a supporting view, the continuous TILs value (Spearman) is reported per module too.
+* Power rule (prespecified): the lowest tested power with signed scale-free R-squared >= 0.80,
+  while checking that mean connectivity has not collapsed.
+* Outputs that do not depend on the power go to `wgcna_base`; everything else goes to
+  its own `power_<N>` folder.
+
+# 5. Load VST-transformed expression data
+
+The VST matrix is already variance-stabilised and restricted to the 5000 most variable
+genes, which keeps the network computation light and is the usual WGCNA practice.
+
+```{r load-vst}
+expr_data <- read.csv(expr_path, header = TRUE, check.names = FALSE)
+
+stopifnot("Expected a 'Gene' column" = "Gene" %in% colnames(expr_data))
+stopifnot("Duplicate gene symbols in the VST file" = !anyDuplicated(expr_data$Gene))
+
+cat("Genes x columns in file:", nrow(expr_data), "x", ncol(expr_data), "\n")
+expr_data[1:3, 1:5]
+```
+
+# 6. Convert to WGCNA format (rows = samples, columns = genes)
+
+```{r prepare-dat-expr}
+expr_matrix <- expr_data |>
+  column_to_rownames(var = "Gene") |>
+  as.matrix()
+
+storage.mode(expr_matrix) <- "numeric"
+stopifnot("Non-numeric or missing values in the VST matrix" = !anyNA(expr_matrix))
+
+dat_expr <- as.data.frame(t(expr_matrix), check.names = FALSE)
+rownames(dat_expr) <- norm_id(rownames(dat_expr))
+stopifnot(!anyDuplicated(rownames(dat_expr)))
+
+cat("WGCNA expression matrix:", nrow(dat_expr), "samples x", ncol(dat_expr), "genes\n")
+```
+
+# 7. Identify problematic genes and samples
+
+`goodSamplesGenes()` flags genes/samples with too many missing values or zero variance.
+
+```{r good-samples-genes}
+gsg <- goodSamplesGenes(dat_expr, verbose = 3)
+gsg$allOK
+
+if (!gsg$allOK) {
+  if (sum(!gsg$goodGenes) > 0) {
+    cat("Removing genes:\n"); print(colnames(dat_expr)[!gsg$goodGenes])
+  }
+  if (sum(!gsg$goodSamples) > 0) {
+    cat("Removing samples:\n"); print(rownames(dat_expr)[!gsg$goodSamples])
+  }
+  dat_expr <- dat_expr[gsg$goodSamples, gsg$goodGenes, drop = FALSE]
+}
+
+cat("Final matrix:", nrow(dat_expr), "samples x", ncol(dat_expr), "genes\n")
+```
+
+# 8. Sample clustering to look for outliers
+
+```{r sample-clustering}
+sampleTree <- hclust(dist(dat_expr), method = "average")
+
+plot_sample_tree <- function() {
+  op <- par(cex = 0.6, mar = c(0, 4, 2, 0))
+  on.exit(par(op))
+  plot(sampleTree, main = "Sample clustering to detect outliers",
+       sub = "", xlab = "", cex.lab = 1.5, cex.axis = 1.5, cex.main = 2)
+}
+
+save_fig("sample_clustering_outliers", plot_sample_tree, width_in = 8, height_in = 5.5,
+         out_dir = wgcna_base)
+
+# No sample is removed automatically based on the dendrogram alone.
+# If a true outlier is found, document the cutoff and the exclusion explicitly.
+```
+
+# 9. Soft-threshold power analysis
+
+WGCNA raises correlations to a power so that strong correlations are kept and weak ones
+are suppressed, giving a network that is approximately scale-free (a few highly
+connected genes, many weakly connected ones).
+
+```{r pick-soft-threshold}
+spt <- pickSoftThreshold(
+  dat_expr,
+  powerVector = POWERS,
+  networkType = NETWORK_TYPE,
+  verbose = 5
+)
+
+sft_table <- spt$fitIndices
+stopifnot(all(c("Power", "SFT.R.sq", "mean.k.") %in% colnames(sft_table)))
+
+sft_table
+
+write.csv(sft_table, file.path(wgcna_base, "SoftThreshold_Diagnostics.csv"), row.names = FALSE)
+```
+
+# 10. Plot scale-free topology fit
+
+The dashed line marks the R-squared cutoff.
+
+```{r scale-independence}
+plot_scale_independence <- function() {
+  op <- par(mar = c(5, 5, 2, 2))
+  on.exit(par(op))
+  plot(sft_table$Power, sft_table$SFT.R.sq, type = "n",
+       xlab = "Soft threshold (power)",
+       ylab = expression("Scale-free topology model fit (signed " * R^2 * ")"),
+       main = "Scale independence")
+  text(sft_table$Power, sft_table$SFT.R.sq, labels = sft_table$Power, col = "red")
+  abline(h = R2_CUTOFF, col = "red", lty = 2)
+}
+
+save_fig("scale_independence", plot_scale_independence, width_in = 6.5, height_in = 5.5,
+         out_dir = wgcna_base)
+```
+
+# 11. Plot mean connectivity
+
+A good power gives acceptable scale-free fit without destroying connectivity.
+
+```{r mean-connectivity}
+plot_mean_connectivity <- function() {
+  op <- par(mar = c(5, 5, 2, 2))
+  on.exit(par(op))
+  plot(sft_table$Power, sft_table[["mean.k."]], type = "n",
+       xlab = "Soft threshold (power)", ylab = "Mean connectivity",
+       main = "Mean connectivity")
+  text(sft_table$Power, sft_table[["mean.k."]], labels = sft_table$Power, col = "red")
+}
+
+save_fig("mean_connectivity", plot_mean_connectivity, width_in = 6.5, height_in = 5.5,
+         out_dir = wgcna_base)
+```
+
+# 12. Select the soft-threshold power with the prespecified rule
+
+By default the power is taken from the data: the lowest tested power with R-squared >= 0.80.
+Nothing is hard-coded. Please inspect the mean-connectivity plot at the selected power.
+
+For a sensitivity analysis, `power_override` (see the header) can force another tested
+power. The run summary then records that the power was set manually and also records
+the power that the rule would have chosen, so the two cases cannot be confused.
+
+```{r select-soft-power}
+power_summary <- data.frame(
+  Power = sft_table$Power,
+  SFT_R2 = sft_table$SFT.R.sq,
+  MeanConnectivity = sft_table[["mean.k."]]
+)
+
+power_candidates <- power_summary |>
+  filter(is.finite(SFT_R2), SFT_R2 >= R2_CUTOFF) |>
+  arrange(Power)
+
+write.csv(power_candidates,
+          file.path(wgcna_base, "SoftThreshold_Candidate_Powers_R2ge0.80.csv"),
+          row.names = FALSE)
+
+cat("Powers meeting SFT R-squared >=", R2_CUTOFF, ":\n")
+print(power_candidates)
+
+# Power chosen by the prespecified rule (NA if no tested power qualifies).
+rule_power <- if (nrow(power_candidates) > 0) min(power_candidates$Power) else NA_real_
+
+if (!is.null(params$power_override)) {
+  # Sensitivity analysis: the power is forced, and this is recorded in the run summary.
+  stopifnot("power_override must be one of the tested POWERS" = params$power_override %in% POWERS)
+  softPower <- params$power_override
+  power_source <- "Manual override (sensitivity analysis)"
+  warning("Using manual power ", softPower, "; the prespecified rule gives ", rule_power, ".")
+} else {
+  if (is.na(rule_power)) {
+    stop(
+      "No tested power reached SFT R-squared >= ", R2_CUTOFF, ". ",
+      "Inspect scale_independence.png and the WGCNA FAQ guidance on powers for small ",
+      "sample sizes before choosing a power by hand; do not force a historical value."
+    )
+  }
+  softPower <- rule_power   # objective rule: lowest qualifying power
+  power_source <- "Prespecified rule (lowest power with SFT R-squared >= 0.80)"
+}
+
+# Everything that depends on the power goes into its own subfolder.
+wgcna_dir <- file.path(wgcna_base, paste0("power_", softPower))
+dir.create(wgcna_dir, recursive = TRUE, showWarnings = FALSE)
+cat("Outputs that depend on the power are written to:", wgcna_dir, "\n")
+
+selected_power_summary <- power_summary |> filter(Power == softPower)
+cat("\nSelected soft-threshold power =", softPower, "\n")
+print(selected_power_summary)
+
+write.csv(selected_power_summary,
+          file.path(wgcna_dir, "Selected_SoftThreshold_Power.csv"),
+          row.names = FALSE)
+```
+
+# 13. Adjacency matrix and Topological Overlap Matrix (TOM)
+
+The adjacency is the gene-gene correlation raised to the selected power. The TOM
+measures shared neighbours, which makes modules more robust to noise.
+
+```{r adjacency-tom}
+adjacency_matrix <- adjacency(dat_expr, power = softPower, type = NETWORK_TYPE)
+TOM <- TOMsimilarity(adjacency_matrix, TOMType = NETWORK_TYPE)
+TOM.dissimilarity <- 1 - TOM
+
+rm(adjacency_matrix, TOM)   # free memory
+invisible(gc())
+```
+
+# 14. Gene clustering and dynamic module detection
+
+```{r module-construction}
+geneTree <- hclust(as.dist(TOM.dissimilarity), method = "average")
+
+Modules <- cutreeDynamic(
+  dendro = geneTree,
+  distM = TOM.dissimilarity,
+  deepSplit = DEEP_SPLIT,
+  pamRespectsDendro = FALSE,
+  minClusterSize = MIN_MODULE_SIZE
+)
+
+table(Modules)                      # label 0 = genes not assigned to any module
+ModuleColors <- labels2colors(Modules)   # label 0 becomes "grey"
+table(ModuleColors)
+```
+
+# 15. Module eigengenes
+
+An eigengene is the first principal component of a module: one expression profile that
+summarises the whole module across samples.
+
+```{r module-eigengenes}
+MElist <- moduleEigengenes(dat_expr, colors = ModuleColors)
+MEs_initial <- MElist$eigengenes
+rownames(MEs_initial) <- rownames(dat_expr)   # rows follow dat_expr by construction
+
+write.csv(MEs_initial,
+          file.path(wgcna_dir, "ModuleEigengenes_BeforeMerging.csv"),
+          row.names = TRUE)
+```
+
+# 16. Merge highly similar modules
+
+Modules whose eigengenes correlate above 0.75 (dissimilarity < 0.25) are merged.
+
+```{r module-merging}
+ME.dissimilarity <- 1 - cor(MElist$eigengenes, use = "complete")
+METree <- hclust(as.dist(ME.dissimilarity), method = "average")
+
+plot_me_tree <- function() {
+  op <- par(mar = c(0, 4, 2, 0), cex = 0.6)
+  on.exit(par(op))
+  plot(METree, main = "Clustering of module eigengenes", xlab = "", sub = "")
+  abline(h = MERGE_CUT_HEIGHT, col = "red")
+}
+save_fig("module_eigengene_clustering", plot_me_tree, width_in = 8, height_in = 5.5)
+
+merge <- mergeCloseModules(dat_expr, ModuleColors, cutHeight = MERGE_CUT_HEIGHT, verbose = 3)
+
+mergedColors <- merge$colors
+mergedMEs <- merge$newMEs
+rownames(mergedMEs) <- rownames(dat_expr)     # rows follow dat_expr by construction
+
+names(ModuleColors) <- colnames(dat_expr)
+names(mergedColors) <- colnames(dat_expr)
+stopifnot(identical(names(mergedColors), colnames(dat_expr)))
+
+plot_gene_dendro <- function() {
+  plotDendroAndColors(
+    dendro = geneTree,
+    colors = cbind(ModuleColors, mergedColors),
+    groupLabels = c("Original Module", "Merged Module"),
+    dendroLabels = FALSE, hang = 0.03, addGuide = TRUE, guideHang = 0.05,
+    main = "Gene dendrogram and module colors: original and merged"
+  )
+}
+save_fig("Module_Dendrogram_with_Colors", plot_gene_dendro, width_in = 10, height_in = 7)
+
+cat("Modules before merging:", length(unique(ModuleColors)), "\n")
+cat("Modules after merging :", length(unique(mergedColors)), "\n")
+print(sort(table(ModuleColors), decreasing = TRUE))
+print(sort(table(mergedColors), decreasing = TRUE))
+
+write.csv(
+  data.frame(Gene = colnames(dat_expr),
+             OriginalModule = unname(ModuleColors),
+             MergedModule = unname(mergedColors)),
+  file.path(wgcna_dir, "Gene_Module_Assignments.csv"),
+  row.names = FALSE
+)
+```
+
+# 17. Load and align the TILs traits
+
+TILs are read from the clinical table and matched to the expression samples. The network
+uses all samples in the expression matrix; a sample whose TILs value is blank would
+simply have a missing trait value and is left out of the TILs correlations only.
+
+```{r tils-traits}
+clin <- read.csv(clinical_path, check.names = FALSE, stringsAsFactors = FALSE)
+stopifnot("Sample" %in% colnames(clin), "TILs (%)" %in% colnames(clin))
+clin$id <- norm_id(clin$Sample)
+stopifnot(!anyDuplicated(clin$id))
+
+tils <- parse_tils(clin[["TILs (%)"]], TIL_CUTOFF)
+clin_tils <- data.frame(id = clin$id, TILs_input = clin[["TILs (%)"]], tils,
+                        stringsAsFactors = FALSE)
+
+# Every expression sample must be found in the clinical table (an ID mismatch would
+# otherwise look like missing TILs).
+not_in_clin <- setdiff(rownames(dat_expr), clin_tils$id)
+if (length(not_in_clin) > 0) {
+  print(not_in_clin)
+  stop("Expression samples not found in the clinical table (check the sample IDs).")
+}
+
+m_t <- match(rownames(dat_expr), clin_tils$id)
+datTraits <- data.frame(
+  TILs_group = factor(clin_tils$TILs_group[m_t], levels = c("Low", "High")),
+  TILs_value = clin_tils$TILs_value[m_t],
+  row.names  = rownames(dat_expr)
+)
+stopifnot(identical(rownames(dat_expr), rownames(datTraits)))
+
+no_tils <- rownames(datTraits)[is.na(datTraits$TILs_group)]
+cat("Samples without a usable TILs group:", length(no_tils),
+    if (length(no_tils) > 0) paste0("(", paste(no_tils, collapse = ", "), ")"), "\n")
+cat("TILs group sizes (Low = <", TIL_CUTOFF, ", High = >=", TIL_CUTOFF, "):\n", sep = "")
+print(table(datTraits$TILs_group, useNA = "ifany"))
+print(table(clin_tils$TILs_input[m_t], useNA = "ifany"))
+
+```
+
+# 18. Numeric TILs trait
+
+```{r numeric-tils-trait}
+datTraitsNum <- matrix(as.numeric(datTraits$TILs_group == "High"), ncol = 1,
+                       dimnames = list(rownames(datTraits), "TILs_High"))
+stopifnot(identical(rownames(dat_expr), rownames(datTraitsNum)))
+
+write.csv(data.frame(Sample = rownames(datTraits),
+                     TILs_input = clin_tils$TILs_input[m_t], datTraits,
+                     TILs_High = datTraitsNum[, "TILs_High"]),
+          file.path(wgcna_dir, "TILs_Trait_Matrix.csv"), row.names = FALSE)
+```
+
+# 19. Check: are the modules the same as in the cluster WGCNA?
+
+```{r check-vs-cluster-run}
+cluster_rds <- file.path(root, "WGCNA", "NMFcluster", "K3_50runs",
+                         paste0("power_", softPower), "WGCNA_Cluster_Core_Objects.rds")
+if (file.exists(cluster_rds)) {
+  old <- readRDS(cluster_rds)
+  same <- identical(names(old$mergedColors), names(mergedColors)) &&
+          identical(unname(old$mergedColors), unname(mergedColors))
+  cat("Module assignment identical to the cluster WGCNA run (power", softPower, "):", same, "\n")
+} else {
+  cat("Cluster WGCNA result for power", softPower, "not found; check skipped.\n")
+}
+```
+
+# 20. Module-TILs associations
+
+```{r module-tils-associations}
+MEs <- orderMEs(mergedMEs)
+stopifnot(identical(rownames(dat_expr), rownames(MEs)))
+write.csv(MEs, file.path(wgcna_dir, "ModuleEigengenes_Merged.csv"), row.names = TRUE)
+
+nGenes   <- ncol(dat_expr)
+nSamples <- nrow(dat_expr)
+ok       <- !is.na(datTraitsNum[, "TILs_High"])
+n_trait  <- sum(ok)
+cat("Samples in network:", nSamples, "| with a TILs group:", n_trait,
+    "| High:", sum(datTraitsNum[ok, "TILs_High"] == 1),
+    "| Low:", sum(datTraitsNum[ok, "TILs_High"] == 0), "\n")
+
+# Pearson correlation of each module eigengene with the 0/1 trait (High = 1)
+module.trait.correlation <- cor(MEs, datTraitsNum, use = "pairwise.complete.obs")
+module.trait.Pvalue <- corPvalueStudent(module.trait.correlation, n_trait)
+# BH-FDR across modules
+module.trait.FDR <- apply(module.trait.Pvalue, 2, p.adjust, method = "BH")
+dimnames(module.trait.FDR) <- dimnames(module.trait.Pvalue)
+
+# Supporting view: continuous TILs, Spearman (rank-based, so "<5" coded 2.5 does not matter)
+okv <- !is.na(datTraits$TILs_value)
+sp <- lapply(MEs, function(x) cor.test(x[okv], datTraits$TILs_value[okv],
+                                       method = "spearman", exact = FALSE))
+rho   <- unname(sapply(sp, function(z) unname(z$estimate)))
+rho_p <- unname(sapply(sp, function(z) z$p.value))
+
+assoc <- data.frame(
+  Module = sub("^ME", "", colnames(MEs)),
+  r_High_vs_Low   = unname(module.trait.correlation[, "TILs_High"]),
+  P_High_vs_Low   = unname(module.trait.Pvalue[, "TILs_High"]),
+  FDR_High_vs_Low = unname(module.trait.FDR[, "TILs_High"]),
+  rho_TILs_continuous = rho,
+  P_TILs_continuous   = rho_p,
+  FDR_TILs_continuous = p.adjust(rho_p, method = "BH"),
+  Module_size = as.integer(table(mergedColors)[sub("^ME", "", colnames(MEs))]),
+  stringsAsFactors = FALSE
+)
+write.csv(assoc, file.path(wgcna_dir, "All_Module_TILs_Associations.csv"), row.names = FALSE)
+print(assoc[order(assoc$P_High_vs_Low), ], digits = 3)
+```
+
+# 21. Module-TILs relationship heatmap
+
+Each cell shows the correlation, with the BH-adjusted p-value (FDR) in brackets below it.
+The FDR is calculated across modules, separately for each column.
+
+```{r module-trait-heatmap}
+heat_r <- cbind("TILs High vs Low" = assoc$r_High_vs_Low,
+                "TILs continuous (Spearman)" = assoc$rho_TILs_continuous)
+heat_p <- cbind(assoc$FDR_High_vs_Low, assoc$FDR_TILs_continuous)   # BH-FDR, not raw p
+rownames(heat_r) <- colnames(MEs)
+textMatrix <- matrix(paste0(signif(heat_r, 2), "\n(", signif(heat_p, 2), ")"),
+                     nrow = nrow(heat_r))
+
+plot_module_trait_heatmap <- function() {
+  op <- par(mfrow = c(1, 1), oma = c(0, 0, 0, 0), mar = c(8, 12, 4, 3))
+  on.exit(par(op))
+  labeledHeatmap(
+    Matrix = heat_r, xLabels = colnames(heat_r),
+    yLabels = rownames(heat_r), ySymbols = rownames(heat_r),
+    colorLabels = FALSE, colors = blueWhiteRed(50),
+    textMatrix = textMatrix, cex.text = 0.6, cex.lab.x = 0.85, cex.lab.y = 0.70,
+    zlim = c(-1, 1), main = "Module-TILs relationships (BH-FDR in brackets)"
+  )
+}
+save_fig("Module_Trait_Relationships_TILs", plot_module_trait_heatmap,
+           width_in = 7, height_in = max(7, 0.5 * nrow(heat_r) + 3))
+```
+
+# 22. Gene-level module membership (kME) and gene significance (GS)
+
+kME is the correlation of a gene with its module eigengene (how central the gene is).
+GS is the correlation of a gene with the TILs trait (High = 1, Low = 0).
+
+```{r gene-level-kme-gs}
+modNames <- substring(colnames(MEs), 3)   # drop the leading "ME"
+
+geneModuleMembership <- as.data.frame(cor(dat_expr, MEs, use = "p"))
+MMPvalue <- as.data.frame(corPvalueStudent(as.matrix(geneModuleMembership), nSamples))
+colnames(geneModuleMembership) <- paste0("kME_", modNames)
+colnames(MMPvalue) <- paste0("p.kME_", modNames)
+
+geneTraitSignificance <- as.data.frame(cor(dat_expr, datTraitsNum, use = "p"))
+GSPvalue <- as.data.frame(corPvalueStudent(as.matrix(geneTraitSignificance), n_trait))
+colnames(geneTraitSignificance) <- paste0("GS_", colnames(datTraitsNum))
+colnames(GSPvalue) <- paste0("p.GS_", colnames(datTraitsNum))
+
+geneInfo <- data.frame(
+  Gene = colnames(dat_expr),
+  Module = unname(mergedColors),
+  geneModuleMembership, MMPvalue, geneTraitSignificance, GSPvalue,
+  check.names = FALSE, row.names = NULL
+)
+# BH-FDR for gene significance across all genes
+geneInfo$FDR_GS_TILs_High <- p.adjust(geneInfo[["p.GS_TILs_High"]], method = "BH")
+
+write.csv(geneInfo, file.path(wgcna_dir, "WGCNA_GeneLevel_kME_GS.csv"), row.names = FALSE)
+head(geneInfo[, 1:6])
+```
+
+# 23. Top positive and top negative module for TILs
+
+* Positive module: highest positive correlation = higher in High-TILs tumours.
+* Negative module: strongest negative correlation = higher in Low-TILs tumours.
+
+No module names are supplied beforehand. The grey "module" (genes not assigned to any
+module) is excluded. Modules are chosen by the size of the correlation, so check the FDR
+column before interpreting a module: a top module with a large FDR is only the best of
+weak candidates.
+
+```{r identify-top-modules}
+long <- data.frame(Module = assoc$Module, Trait = "TILs_High",
+                   r = assoc$r_High_vs_Low, p = assoc$P_High_vs_Low,
+                   FDR = assoc$FDR_High_vs_Low, stringsAsFactors = FALSE)
+candidates <- long[long$Module != "grey", ]
+
+pick_module <- function(d, dir) {
+  d <- if (dir == "pos") d[d$r > 0, ] else d[d$r < 0, ]
+  if (nrow(d) == 0) return(NULL)
+  d <- d[order(-abs(d$r)), ][1, ]
+  d$direction <- dir
+  d$Associated_with <- ifelse(dir == "pos", "High TILs", "Low TILs")
+  d
+}
+top_pos <- pick_module(candidates, "pos")
+top_neg <- pick_module(candidates, "neg")
+selected_modules <- rbind(top_pos, top_neg)
+stopifnot("No non-grey module available" = !is.null(selected_modules) && nrow(selected_modules) > 0)
+rownames(selected_modules) <- NULL
+
+print(selected_modules, digits = 3)
+write.csv(selected_modules, file.path(wgcna_dir, "Selected_TILs_Associated_Modules.csv"),
+          row.names = FALSE)
+```
+
+# 24. Eigengene of the selected modules by TILs group
+
+```{r selected-eigengene-plot, fig.width=8, fig.height=4.5}
+plot_me_box <- function() {
+  op <- par(mfrow = c(1, nrow(selected_modules)), mar = c(4.5, 4.5, 3.5, 1))
+  on.exit(par(op))
+  set.seed(SEED)
+  g <- datTraits$TILs_group
+  for (i in seq_len(nrow(selected_modules))) {
+    mm <- selected_modules$Module[i]
+    y <- MEs[, paste0("ME", mm)]
+    boxplot(y[!is.na(g)] ~ g[!is.na(g)], outline = FALSE, las = 1, border = "grey40", col = NA,
+            xlab = "TILs group", ylab = "Module eigengene",
+            names = c(paste0("Low (<", TIL_CUTOFF, ")"), paste0("High (>=", TIL_CUTOFF, ")")),
+            main = paste0(mm, " (", selected_modules$Associated_with[i], ")"))
+    points(jitter(as.numeric(g), amount = 0.12), y, pch = 19, cex = 1.1,
+           col = GROUP_COLORS[as.character(g)])
+    mtext(sprintf("r = %.2f, FDR = %.3g", selected_modules$r[i], selected_modules$FDR[i]),
+          side = 3, line = 0.3, cex = 0.8)
+  }
+}
+save_fig("Selected_Module_Eigengene_by_TILs_Group", plot_me_box,
+           width_in = 4 * nrow(selected_modules) + 1, height_in = 4.5)
+```
+
+# 25. Export expression for each selected module
+
+```{r export-module-expression}
+module_export_summary <- list()
+for (i in seq_len(nrow(selected_modules))) {
+  module_name    <- selected_modules$Module[i]
+  direction_name <- selected_modules$direction[i]
+
+  module_genes <- colnames(dat_expr)[mergedColors == module_name]
+  expr_module <- dat_expr[, module_genes, drop = FALSE]
+
+  out_file <- paste0("TILs_High_", direction_name, "_", module_name,
+                     "_Module_Gene_Expression.csv")
+  write.csv(expr_module, file.path(wgcna_dir, out_file), row.names = TRUE)
+
+  module_export_summary[[i]] <- data.frame(
+    Trait = "TILs_High", Direction = direction_name, Module = module_name,
+    N_Genes = length(module_genes), N_Samples = nrow(expr_module), File = out_file)
+}
+module_export_summary <- do.call(rbind, module_export_summary)
+write.csv(module_export_summary,
+          file.path(wgcna_dir, "Selected_Module_Expression_Summary.csv"), row.names = FALSE)
+module_export_summary
+```
+
+# 26. Hub genes in each selected module
+
+A gene is a hub gene if it differs between High and Low TILs (Wilcoxon rank-sum test,
+BH-adjusted P < 0.05 within the module) and has module membership kME > 0.70. The effect
+size is the mean VST difference (High minus Low), which is on a log2-like scale. Module
+names come from the result above and are not hard-coded. With about 30 samples these
+results are descriptive.
+
+```{r identify-hub-genes}
+stopifnot(identical(rownames(datTraits), rownames(dat_expr)))
+grp   <- datTraits$TILs_group
+ok_g  <- !is.na(grp)
+all_hub_results <- list()
+
+for (i in seq_len(nrow(selected_modules))) {
+  module_name    <- selected_modules$Module[i]
+  direction_name <- selected_modules$direction[i]
+
+  module_genes <- colnames(dat_expr)[mergedColors == module_name]
+  if (length(module_genes) == 0) {
+    warning("No genes found for module ", module_name)
+    next
+  }
+
+  y_mat <- dat_expr[ok_g, module_genes, drop = FALSE]
+  g_ok  <- grp[ok_g]
+
+  p_val <- apply(y_mat, 2, function(y) {
+    tryCatch(wilcox.test(y[g_ok == "High"], y[g_ok == "Low"], exact = FALSE)$p.value,
+             error = function(e) NA_real_)
+  })
+  mean_diff <- apply(y_mat, 2, function(y) mean(y[g_ok == "High"]) - mean(y[g_ok == "Low"]))
+
+  kme_col <- paste0("kME_", module_name)
+  stopifnot("Expected kME column not found" = kme_col %in% colnames(geneInfo))
+
+  tab_m <- data.frame(gene = module_genes, p_value = as.numeric(p_val),
+                      mean_diff_High_minus_Low = as.numeric(mean_diff),
+                      stringsAsFactors = FALSE)
+  tab_m$adj_p <- p.adjust(tab_m$p_value, method = "BH")
+  tab_m$kME   <- geneInfo[[kme_col]][match(tab_m$gene, geneInfo$Gene)]
+
+  hub <- tab_m[!is.na(tab_m$p_value) & tab_m$adj_p < HUB_FDR_CUTOFF &
+               tab_m$kME > HUB_KME_CUTOFF, , drop = FALSE]
+  hub <- hub[order(-hub$kME, hub$p_value), , drop = FALSE]
+  hub$trait     <- rep("TILs_High", nrow(hub))
+  hub$direction <- rep(direction_name, nrow(hub))
+  hub$module    <- rep(module_name, nrow(hub))
+  hub <- hub[, c("trait", "direction", "module", "gene", "kME", "p_value", "adj_p",
+                 "mean_diff_High_minus_Low")]
+
+  write.csv(hub, file.path(wgcna_dir, paste0("HubGenes_TILs_High_", direction_name, "_",
+                                             module_name, ".csv")), row.names = FALSE)
+  cat("Module", module_name, "(", direction_name, "): genes =", length(module_genes),
+      "| hub genes =", nrow(hub), "\n")
+  all_hub_results[[paste(direction_name, module_name, sep = "_")]] <- hub
+}
+
+all_tils_hub_genes <- if (length(all_hub_results) > 0) do.call(rbind, all_hub_results) else data.frame()
+rownames(all_tils_hub_genes) <- NULL
+write.csv(all_tils_hub_genes, file.path(wgcna_dir, "All_TILs_HubGenes.csv"), row.names = FALSE)
+cat("Total retained hub-gene rows:", nrow(all_tils_hub_genes), "\n")
+head(all_tils_hub_genes)
+```
+
+# 27. Top 50 genes (by kME) for each selected module
+
+```{r top50-hub-genes}
+top50_list <- list()
+for (i in seq_len(nrow(selected_modules))) {
+  module_name    <- selected_modules$Module[i]
+  direction_name <- selected_modules$direction[i]
+
+  kme_col  <- paste0("kME_", module_name)
+  pkme_col <- paste0("p.kME_", module_name)
+
+  d <- geneInfo[geneInfo$Module == module_name, ]
+  d <- head(d[order(-d[[kme_col]]), ], TOP_N)
+  d <- d[, c("Gene", "Module", kme_col, pkme_col,
+             "GS_TILs_High", "p.GS_TILs_High", "FDR_GS_TILs_High")]
+  colnames(d)[3:4] <- c("kME", "p.kME")        # same names for every module
+  d$Trait <- "TILs_High"
+  d$Direction <- direction_name
+
+  write.csv(d, file.path(wgcna_dir, paste0("Top50_Hub_Genes_TILs_High_", direction_name,
+                                           "_", module_name, ".csv")), row.names = FALSE)
+  top50_list[[paste("TILs_High", direction_name, module_name, sep = "_")]] <- d
+}
+top50_all_df <- do.call(rbind, top50_list)
+write.csv(top50_all_df, file.path(wgcna_dir, "Top50_Hub_Genes_All_Selected_Modules.csv"),
+          row.names = FALSE)
+```
+
+# 28. Heatmaps of the top 50 genes
+
+```{r hub-gene-heatmaps}
+for (i in seq_len(nrow(selected_modules))) {
+  module_name    <- selected_modules$Module[i]
+  direction_name <- selected_modules$direction[i]
+
+  key   <- paste("TILs_High", direction_name, module_name, sep = "_")
+  genes <- intersect(top50_list[[key]]$Gene, colnames(dat_expr))
+
+  ht <- make_tils_heatmap(genes, dat_expr, datTraits,
+                          column_title = paste("TILs", selected_modules$Associated_with[i],
+                                               module_name))
+  if (is.null(ht)) next
+  save_fig(paste0("Top50_", key, "_Heatmap"), function() draw(ht),
+             width_in = 10, height_in = 8)
+}
+```
+
+# 29. Optional annotation of hub genes with the OncoVar/TCGA reference
+
+```{r cancer-annotation}
+annotated_core <- NULL
+
+if (nrow(all_tils_hub_genes) == 0) {
+  message("No hub genes passed the filters; cancer-gene annotation skipped.")
+} else if (!file.exists(oncovar_file)) {
+  message("OncoVar reference not found: ", oncovar_file,
+          ". Cancer-gene annotation and annotated heatmaps skipped.")
+} else {
+  oncovar <- fread(oncovar_file, data.table = FALSE)
+  stopifnot("OncoVar file has no Gene_symbol column" = "Gene_symbol" %in% colnames(oncovar))
+
+  annotated_core <- all_tils_hub_genes[all_tils_hub_genes$gene %in% oncovar$Gene_symbol, ]
+  rownames(annotated_core) <- NULL
+  write.csv(annotated_core, file.path(wgcna_dir, "Annotated_Cancer_HubGenes.csv"),
+            row.names = FALSE)
+  cat("Cancer-associated hub-gene rows:", nrow(annotated_core), "\n")
+}
+```
+
+# 30. Heatmaps for the annotated cancer-associated hub genes
+
+```{r annotated-hubgene-heatmaps}
+if (!is.null(annotated_core) && nrow(annotated_core) > 0) {
+  for (dir_name in unique(annotated_core$direction)) {
+    group_df <- annotated_core[annotated_core$direction == dir_name, ]
+    genes <- intersect(unique(group_df$gene), colnames(dat_expr))
+    assoc_with <- ifelse(dir_name == "pos", "High TILs", "Low TILs")
+    cat(dir_name, ":", length(genes), "annotated genes available\n")
+
+    ht <- make_tils_heatmap(genes, dat_expr, datTraits,
+                            column_title = paste0("Annotated hub genes: ", assoc_with),
+                            row_title = paste(length(genes), "genes"))
+    if (is.null(ht)) {
+      warning("Skipping heatmap for ", dir_name, ": fewer than 2 variable genes.")
+      next
+    }
+    save_fig(paste0("AnnotatedHubGenes_TILs_High_", dir_name, "_Heatmap"),
+               function() draw(ht), width_in = 11, height_in = 9)
+  }
+} else {
+  message("No annotated hub genes; annotated heatmaps skipped.")
+}
+```
+
+# 31. Save reproducibility information
+
+```{r reproducibility}
+run_summary <- data.frame(
+  Parameter = c("Seed", "Expression file", "Clinical table", "TILs cutoff",
+                "Samples in network", "Samples with TILs group", "Genes (after QC)",
+                "Network type", "Soft-threshold selection rule", "Selected soft power",
+                "Power source", "Power chosen by the rule",
+                "Dynamic tree deepSplit", "Minimum module size", "Module merge cut height",
+                "Hub-gene kME cutoff", "Hub-gene BH-FDR cutoff"),
+  Value = c(SEED, expr_path, clinical_path, TIL_CUTOFF,
+            nSamples, n_trait, nGenes,
+            NETWORK_TYPE, "Lowest power with SFT R-squared >= 0.80; inspect mean connectivity",
+            softPower, power_source, rule_power,
+            DEEP_SPLIT, MIN_MODULE_SIZE, MERGE_CUT_HEIGHT,
+            HUB_KME_CUTOFF, HUB_FDR_CUTOFF)
+)
+write.csv(run_summary, file.path(wgcna_dir, "WGCNA_TILs_Run_Summary.csv"), row.names = FALSE)
+
+writeLines(capture.output(sessionInfo()), file.path(wgcna_dir, "sessionInfo.txt"))
+
+saveRDS(
+  list(softPower = softPower, power_source = power_source, rule_power = rule_power,
+       spt = spt, sampleTree = sampleTree, geneTree = geneTree,
+       ModuleColors = ModuleColors, mergedColors = mergedColors, MEs = MEs,
+       datTraits = datTraits, datTraitsNum = datTraitsNum,
+       module.trait.correlation = module.trait.correlation,
+       module.trait.Pvalue = module.trait.Pvalue, module.trait.FDR = module.trait.FDR,
+       assoc = assoc, geneInfo = geneInfo, selected_modules = selected_modules,
+       all_tils_hub_genes = all_tils_hub_genes),
+  file.path(wgcna_dir, "WGCNA_TILs_Core_Objects.rds")
+)
+
+cat("WGCNA TILs workflow complete.\n",
+    "Selected soft power:", softPower, "\n",
+    "Results:", wgcna_dir, "\n")
+```
+
