@@ -1,0 +1,174 @@
+---
+title: "NMF_consensus_clustering"
+output: html_document
+date: "2026-10-14"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+###############################################################################
+# Consensus NMF clustering of the 31 pILC tumors in R
+# (a re-implementation of the Broad GenePattern "NMFConsensus" module)
+#
+# WHY THIS SCRIPT
+#   GenePattern NMFConsensus is not available, so the same method is run here.
+#   Method (same as Broad):
+#     1. For each k (2, 3, 4) run NMF 20 times, each time from a random start.
+#        X (genes x tumors) ~ W (genes x k) %*% H (k x tumors)
+#        Error function = divergence (Kullback-Leibler), multiplicative updates.
+#     2. In each run every tumor is assigned to the program with the highest H.
+#        Every 10 iterations the assignment is checked; the run stops when it
+#        has not changed for 40 checks in a row (stop.frequency / stop.convergence)
+#        or after 2000 iterations (max.num.iterations).
+#     3. Consensus matrix = fraction of the 20 runs in which two tumors are
+#        in the same cluster (0 = never, 1 = always).
+#     4. Hierarchical clustering (average linkage) of 1 - consensus gives the
+#        final clusters. The cophenetic correlation tells how stable each k is
+#        (closer to 1 = more stable).
+#
+# NOTE ON THE SEED
+#   R and GenePattern use different random number generators, so the random
+#   starts cannot be identical to the old GenePattern run (seed 123456789).
+#   This script uses seed 42.
+#
+# INPUT
+#   vst_transformed_data.gct (new VST matrix from the corrected counts)
+#
+# OUTPUT (folder OUT_DIR, no dates in file names)
+#   Cophenetic_correlation.csv        stability for k = 2, 3, 4
+#   Consensus_matrix_k{k}.csv         tumor x tumor consensus
+#   Cluster_membership_k{k}.csv       cluster of each tumor
+#   Consensus_heatmap_k{k}.png / .pdf
+#   NMF_best_run_k3_W.csv / _H.csv    W and H of the best run (lowest error), k = 3
+#   Run_settings_and_session_info.txt
+###############################################################################
+
+# ------------------------------ 1. SETTINGS ----------------------------------
+ROOT     <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq"
+GCT_FILE <- file.path(ROOT, "4_Count_file_HTSeq_stranded", "VST_data_GENCODEv47",
+                      "vst_transformed_data.gct")
+OUT_DIR  <- file.path(ROOT, "NMF", "R_NMFConsensus")
+dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+
+K_RANGE   <- 2:4        # k.initial = 2, k.final = 4
+N_CLUST   <- 50         # num.clusterings
+MAX_ITER  <- 2000       # max.num.iterations
+STOP_FREQ <- 10         # stop.frequency
+STOP_CONV <- 40         # stop.convergence
+SEED      <- 42         # main seed
+EPS       <- 1e-9       # avoids division by zero / log(0)
+
+# ------------------------------ 2. FUNCTIONS ---------------------------------
+# 2a. One NMF run with the KL-divergence multiplicative updates (Lee & Seung)
+nmf_kl <- function(X, k) {
+  n <- nrow(X); m <- ncol(X)
+  W <- matrix(runif(n * k), n, k) + EPS          # random start
+  H <- matrix(runif(k * m), k, m) + EPS
+  prev <- NULL; stable <- 0L; it <- 0L
+  repeat {
+    it <- it + 1L
+    # update H, then W (each step lowers the divergence)
+    WH <- W %*% H + EPS
+    H  <- H * sweep(crossprod(W, X / WH), 1, colSums(W), "/")
+    WH <- W %*% H + EPS
+    W  <- W * sweep(tcrossprod(X / WH, H), 2, rowSums(H), "/")
+    W[W < EPS] <- EPS; H[H < EPS] <- EPS
+    if (it %% STOP_FREQ == 0L) {                 # convergence check
+      cl <- max.col(t(H), ties.method = "first") # tumor -> program with highest H
+      if (!is.null(prev) && identical(cl, prev)) stable <- stable + 1L else stable <- 0L
+      prev <- cl
+      if (stable >= STOP_CONV) break
+    }
+    if (it >= MAX_ITER) break
+  }
+  WH <- W %*% H + EPS
+  list(W = W, H = H, cluster = max.col(t(H), ties.method = "first"),
+       divergence = sum(X * log(X / WH) - X + WH), iterations = it)
+}
+
+# 2b. Consensus over N_CLUST runs for one k
+consensus_k <- function(X, k, seed) {
+  set.seed(seed)
+  m <- ncol(X)
+  C <- matrix(0, m, m)
+  best <- NULL
+  for (r in seq_len(N_CLUST)) {
+    fit <- nmf_kl(X, k)
+    C <- C + outer(fit$cluster, fit$cluster, "==")   # 1 if same cluster
+    if (is.null(best) || fit$divergence < best$divergence) best <- fit
+    cat(sprintf("  k=%d run %2d/%d  iterations=%4d  divergence=%.1f\n",
+                k, r, N_CLUST, fit$iterations, fit$divergence))
+  }
+  C <- C / N_CLUST
+  dimnames(C) <- list(colnames(X), colnames(X))
+  # final clusters: average-linkage tree on 1 - consensus
+  d  <- as.dist(1 - C)
+  hc <- hclust(d, method = "average")
+  coph <- cor(as.vector(d), as.vector(cophenetic(hc)))
+  cl <- cutree(hc, k)
+  # "ordered" labels: 1, 2, 3 ... in the order the clusters appear in the tree
+  cl_ord <- match(cl, unique(cl[hc$order]))
+  names(cl_ord) <- colnames(X)
+  list(C = C, hc = hc, coph = coph, membership = cl_ord, best = best)
+}
+
+# 2c. Consensus heatmap (tumors ordered by the tree, side bar = cluster)
+plot_consensus <- function(res, k, file_stub) {
+  pal  <- colorRampPalette(c("white", "#B2182B"))(100)
+  side <- c("#4E79A7", "#F28E2B", "#59A14F", "#B07AA1")[res$membership]
+  draw <- function() {
+    heatmap(res$C, Rowv = as.dendrogram(res$hc), Colv = as.dendrogram(res$hc),
+            symm = TRUE, col = pal, scale = "none", ColSideColors = side,
+            labRow = NA, main = sprintf("Consensus matrix, k = %d (cophenetic = %.3f)",
+                                        k, res$coph))
+  }
+  png(paste0(file_stub, ".png"), width = 1800, height = 1800, res = 250); draw(); dev.off()
+  pdf(paste0(file_stub, ".pdf"), width = 7, height = 7); draw(); dev.off()
+}
+
+# ------------------------------ 3. READ THE VST MATRIX -----------------------
+g <- read.delim(GCT_FILE, skip = 2, check.names = FALSE, stringsAsFactors = FALSE)
+stopifnot(!anyDuplicated(g$Name))
+X <- as.matrix(g[, -(1:2)]); rownames(X) <- g$Name
+storage.mode(X) <- "double"
+cat("Matrix:", nrow(X), "genes x", ncol(X), "tumors\n")
+stopifnot(ncol(X) == 31, !anyNA(X), min(X) >= 0)    # NMF needs non-negative values
+X <- pmax(X, EPS)
+
+# ------------------------------ 4. CONSENSUS NMF FOR k = 2, 3, 4 -------------
+results <- list(); coph_tab <- data.frame()
+for (k in K_RANGE) {
+  cat("\n=== k =", k, "===\n")
+  res <- consensus_k(X, k, SEED)
+  results[[as.character(k)]] <- res
+  coph_tab <- rbind(coph_tab, data.frame(k = k, cophenetic_correlation = round(res$coph, 4)))
+
+  write.csv(res$C, file.path(OUT_DIR, sprintf("Consensus_matrix_k%d.csv", k)))
+  write.csv(data.frame(sample = names(res$membership), cluster = res$membership),
+            file.path(OUT_DIR, sprintf("Cluster_membership_k%d.csv", k)), row.names = FALSE)
+  plot_consensus(res, k, file.path(OUT_DIR, sprintf("Consensus_heatmap_k%d", k)))
+}
+write.csv(coph_tab, file.path(OUT_DIR, "Cophenetic_correlation.csv"), row.names = FALSE)
+print(coph_tab)
+
+# ------------------------------ 5. k = 3: W AND H OF THE BEST RUN ------------
+best3 <- results[["3"]]$best
+Wb <- best3$W; rownames(Wb) <- rownames(X); colnames(Wb) <- paste0("P", 1:3)
+Hb <- best3$H; colnames(Hb) <- colnames(X); rownames(Hb) <- paste0("P", 1:3)
+write.csv(Wb, file.path(OUT_DIR, "NMF_best_run_k3_W.csv"))
+write.csv(Hb, file.path(OUT_DIR, "NMF_best_run_k3_H.csv"))
+
+# ------------------------------ 6. SAVE SETTINGS -----------------------------
+sink(file.path(OUT_DIR, "Run_settings_and_session_info.txt"))
+cat("genes:", nrow(X), " tumors:", ncol(X), "\n")
+cat("k:", K_RANGE, " clusterings:", N_CLUST, " max iterations:", MAX_ITER,
+    " stop frequency:", STOP_FREQ, " stop convergence:", STOP_CONV, "\n")
+cat("seed:", SEED, "\n\n")
+print(sessionInfo())
+sink()
+cat("\nDone. Results in:", OUT_DIR, "\n")
+```
+
