@@ -1,0 +1,282 @@
+---
+title: "01_Prepare_MOFA2_input_GENCODEv47"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+USER_LIB <- "/ihome/alee/rak373/R/x86_64-pc-linux-gnu-library/4.6"
+.libPaths(c(USER_LIB, .libPaths()))
+
+suppressPackageStartupMessages({
+  library(data.table)
+})
+
+set.seed(42)
+```
+
+```{r paths}
+# ---- Output ----
+OUT_DIR   <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/MOFA2"
+RDS_DIR   <- file.path(OUT_DIR, "MOFA2_RDS")
+TABLE_DIR <- file.path(OUT_DIR, "MOFA2_Tables")
+for (d in c(OUT_DIR, RDS_DIR, TABLE_DIR)) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+
+# ---- Inputs ----
+# Updated RNA matrix (stranded HTSeq, GENCODE v47, already VST + top 5000 variable genes)
+RNA_VST_FILE <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/4_Count_file_HTSeq_stranded/VST_data_GENCODEv47/htseq_VST_matrix_top5000_variable_genes.rds"
+
+# Same inputs as the earlier analysis
+WES_MAF_FILE <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Compare_TumorOnly_vs_WithPON/maftools/Tier_1_common/Combined_MAF/Tier_1_common_all_samples.combined.maf"
+WES_CNV_FILE <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/CNV_PCGR/Plot/Figures/WES_PCGR_CNV_onecall_per_gene_sample.tsv"
+IMPACT_FILE  <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/MSK_IMPACT/pILC_IMPACT_filtered.tsv"
+ONCOKB_GENE_FILE <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/MOFA2/Updated/cancerGeneList.tsv"
+
+# ---- Settings ----
+TOP_N_RNA_GENES     <- 5000
+MIN_MUTATED_SAMPLES <- 2     # recurrence filter for WES mutations only
+
+# Output of this script (read by 02_Train_MOFA2_model_GENCODEv47.Rmd)
+VIEW_MATRIX_RDS <- file.path(RDS_DIR, "MOFA2_prepared_input_view_matrices_GENCODEv47.rds")
+```
+
+```{r helpers}
+pick_col <- function(dt, candidates, label = "column", required = TRUE) {
+  hits <- candidates[candidates %in% colnames(dt)]
+  if (length(hits) == 0) {
+    if (required) stop("Could not find ", label, ". Checked: ", paste(candidates, collapse = ", "))
+    return(NA_character_)
+  }
+  hits[1]
+}
+
+clean_gene <- function(x) toupper(trimws(as.character(x)))
+
+clean_sample_id <- function(x) {
+  x <- toupper(trimws(basename(as.character(x))))
+  x <- sub("_S[0-9]+$", "", x)      # TP03.117_S25 -> TP03.117 (sequencing sample suffix)
+  x <- gsub("\\.", "-", x)          # TP03.117 -> TP03-117
+  x <- sub("_T$", "", x); x <- sub("-T$", "", x); x <- sub("T$", "", x)
+  x <- sub("_N$", "", x); x <- sub("-N$", "", x); x <- sub("NL$", "", x)
+  sub("^(TP[0-9]+)-0+([0-9]+)$", "\\1-\\2", x)  # TP09-09 -> TP09-9
+}
+
+collapse_duplicate_rows_numeric <- function(mat) {
+  if (!anyDuplicated(rownames(mat))) return(mat)
+  ids <- unique(rownames(mat))
+  out <- do.call(rbind, lapply(ids, function(id) {
+    colMeans(mat[rownames(mat) == id, , drop = FALSE], na.rm = TRUE)
+  }))
+  rownames(out) <- ids; colnames(out) <- colnames(mat)
+  out
+}
+
+collapse_duplicate_cols_numeric <- function(mat) {
+  if (!anyDuplicated(colnames(mat))) return(mat)
+  ids <- unique(colnames(mat))
+  out <- do.call(cbind, lapply(ids, function(id) {
+    rowMeans(mat[, colnames(mat) == id, drop = FALSE], na.rm = TRUE)
+  }))
+  rownames(out) <- rownames(mat); colnames(out) <- ids
+  out
+}
+
+drop_zero_variance_features <- function(mat) {
+  keep <- apply(mat, 1, function(z) length(unique(z[is.finite(z)])) > 1)
+  mat[keep, , drop = FALSE]
+}
+
+make_binary_gene_sample_matrix <- function(events_dt, all_samples, min_mutated_samples = 2) {
+  events_dt <- unique(events_dt[, .(feature, sample)])
+  recurrent <- events_dt[, .(n = uniqueN(sample)), by = feature][n >= min_mutated_samples, feature]
+  if (length(recurrent) == 0) return(matrix(nrow = 0, ncol = length(all_samples)))
+  mat <- matrix(0, nrow = length(recurrent), ncol = length(all_samples),
+                dimnames = list(sort(recurrent), sort(all_samples)))
+  fill <- events_dt[feature %in% recurrent]
+  mat[cbind(fill$feature, fill$sample)] <- 1
+  drop_zero_variance_features(mat)
+}
+
+KEEP_CLASSES <- c("Frame_Shift_Del", "Frame_Shift_Ins", "In_Frame_Del", "In_Frame_Ins",
+                  "Missense_Mutation", "Nonsense_Mutation", "Nonstop_Mutation",
+                  "Splice_Site", "Translation_Start_Site")
+```
+
+```{r oncokb}
+oncokb_dt <- fread(ONCOKB_GENE_FILE)
+gene_col <- pick_col(oncokb_dt, c("Hugo Symbol", "Hugo_Symbol", "Hugo.Symbol", "Gene", "gene"), "OncoKB gene column")
+type_col <- pick_col(oncokb_dt, c("Gene Type", "Gene_Type", "Gene.Type", "gene_type"), "OncoKB gene type column")
+
+oncokb_dt[, Gene_clean := clean_gene(get(gene_col))]
+oncokb_dt[, Gene_Type_clean := toupper(trimws(as.character(get(type_col))))]
+oncokb_driver_genes <- oncokb_dt[grepl("ONCOGENE|TSG", Gene_Type_clean), unique(Gene_clean)]
+length(oncokb_driver_genes)
+```
+
+```{r rna-view}
+# RNA view: already VST-normalized, top 5000 variable genes
+rna_obj <- readRDS(RNA_VST_FILE)
+
+if (is.data.frame(rna_obj)) {
+  rna_dt <- as.data.table(rna_obj)
+  gcol <- pick_col(rna_dt, c("Gene", "gene", "gene_name", "Hugo_Symbol", "hgnc_symbol", "symbol", "ensembl_gene_id"),
+                   "RNA feature column", required = FALSE)
+  if (!is.na(gcol)) {
+    feats <- rna_dt[[gcol]]
+    rna_dt[, (gcol) := NULL]
+    rna_mat <- as.matrix(rna_dt)
+    rownames(rna_mat) <- feats
+  } else {
+    rna_mat <- as.matrix(rna_obj)
+  }
+} else {
+  rna_mat <- as.matrix(rna_obj)
+}
+
+stopifnot(!is.null(rownames(rna_mat)), !is.null(colnames(rna_mat)))
+storage.mode(rna_mat) <- "numeric"
+
+rna_raw_samples <- colnames(rna_mat)
+rownames(rna_mat) <- trimws(as.character(rownames(rna_mat)))
+colnames(rna_mat) <- clean_sample_id(colnames(rna_mat))
+
+# Check: gene ID type (GSEA later needs gene symbols)
+message("Fraction of Ensembl-style row names: ",
+        round(mean(grepl("^ENSG", rownames(rna_mat))), 3))
+message("First features: ", paste(head(rownames(rna_mat), 5), collapse = ", "))
+
+rna_mat <- collapse_duplicate_rows_numeric(rna_mat)
+rna_mat <- collapse_duplicate_cols_numeric(rna_mat)
+rna_mat <- rna_mat[apply(rna_mat, 1, function(z) any(is.finite(z))), , drop = FALSE]
+
+# Only re-select if the file has more than 5000 genes
+if (nrow(rna_mat) > TOP_N_RNA_GENES) {
+  rna_var <- apply(rna_mat, 1, var, na.rm = TRUE)
+  rna_mat <- rna_mat[names(sort(rna_var, decreasing = TRUE))[seq_len(TOP_N_RNA_GENES)], , drop = FALSE]
+}
+rna_mat <- drop_zero_variance_features(rna_mat)
+
+dim(rna_mat)
+
+# Raw -> cleaned sample ID mapping, to inspect ID problems
+fwrite(data.table(raw_id = rna_raw_samples, clean_id = clean_sample_id(rna_raw_samples)),
+       file.path(TABLE_DIR, "RNA_sample_ID_mapping_GENCODEv47.tsv"), sep = "\t")
+```
+
+```{r wes-mutation-view}
+wes_maf <- fread(WES_MAF_FILE)
+miss <- setdiff(c("Hugo_Symbol", "Tumor_Sample_Barcode", "Variant_Classification"), colnames(wes_maf))
+if (length(miss) > 0) stop("Missing columns in WES MAF: ", paste(miss, collapse = ", "))
+
+wes_maf[, `:=`(sample = clean_sample_id(Tumor_Sample_Barcode),
+               feature = clean_gene(Hugo_Symbol),
+               variant_class = trimws(as.character(Variant_Classification)))]
+
+if ("FILTER" %in% colnames(wes_maf)) {
+  wes_maf <- wes_maf[is.na(FILTER) | FILTER == "" | toupper(trimws(as.character(FILTER))) == "PASS"]
+}
+wes_maf <- wes_maf[variant_class %in% KEEP_CLASSES]
+
+wes_all_samples <- sort(unique(wes_maf$sample))
+wes_mut_events  <- wes_maf[feature %in% oncokb_driver_genes, .(feature, sample)]
+
+wes_mut_mat <- make_binary_gene_sample_matrix(wes_mut_events, wes_all_samples, MIN_MUTATED_SAMPLES)
+dim(wes_mut_mat)
+```
+
+```{r wes-cnv-view}
+wes_cnv <- fread(WES_CNV_FILE)
+miss <- setdiff(c("Sample", "SYMBOL", "VARIANT_CLASS"), colnames(wes_cnv))
+if (length(miss) > 0) stop("Missing columns in WES CNV: ", paste(miss, collapse = ", "))
+
+wes_cnv[, `:=`(sample = clean_sample_id(Sample),
+               feature = clean_gene(SYMBOL),
+               cnv_call = toupper(trimws(as.character(VARIANT_CLASS))))]
+
+# Homdel = -2, Hetdel = -1, Neutral = 0, Gain = 1, Amp = 2
+wes_cnv[, cnv_value := fifelse(
+  grepl("HOMDEL|HOMODEL|HOMOZYGOUS.*DEL|DEEP.*DEL", cnv_call), -2,
+  fifelse(grepl("HETDEL|HETEROZYGOUS.*DEL|SHALLOW.*DEL|LOSS|DEL", cnv_call), -1,
+  fifelse(grepl("AMP|AMPLIFICATION", cnv_call), 2,
+  fifelse(grepl("GAIN|DUP", cnv_call), 1,
+  fifelse(grepl("NEUTRAL|DIPLOID|NONE|NO[_ ]?CALL|WT", cnv_call), 0, NA_real_)))))]
+
+wes_cnv_long <- wes_cnv[feature %in% oncokb_driver_genes & is.finite(cnv_value),
+                        .(feature, sample, value = cnv_value)]
+
+# If a gene-sample pair is duplicated, keep the strongest call
+wes_cnv_long <- wes_cnv_long[, .(value = value[which.max(abs(value))[1]]), by = .(feature, sample)]
+
+wes_cnv_wide <- dcast(wes_cnv_long, feature ~ sample, value.var = "value", fill = 0)
+wes_cnv_mat <- as.matrix(wes_cnv_wide[, -"feature"])
+rownames(wes_cnv_mat) <- wes_cnv_wide$feature
+storage.mode(wes_cnv_mat) <- "numeric"
+wes_cnv_mat <- drop_zero_variance_features(wes_cnv_mat)
+dim(wes_cnv_mat)
+```
+
+```{r impact-view}
+impact_raw <- fread(IMPACT_FILE)
+miss <- setdiff(c("TUMOR_SAMPLE", "SYMBOL", "Variant_Classification"), colnames(impact_raw))
+if (length(miss) > 0) stop("Missing columns in IMPACT: ", paste(miss, collapse = ", "))
+
+impact_raw[, `:=`(sample = clean_sample_id(TUMOR_SAMPLE),
+                  feature = clean_gene(SYMBOL),
+                  variant_class = trimws(as.character(Variant_Classification)))]
+
+impact_all_samples <- sort(unique(impact_raw$sample))   # keep samples even without retained mutations
+
+impact_events <- unique(impact_raw[variant_class %in% KEEP_CLASSES & feature %in% oncokb_driver_genes,
+                                   .(feature, sample)])
+
+impact_genes <- sort(unique(impact_events$feature))
+impact_mut_mat <- matrix(0, nrow = length(impact_genes), ncol = length(impact_all_samples),
+                         dimnames = list(impact_genes, impact_all_samples))
+if (nrow(impact_events) > 0) impact_mut_mat[cbind(impact_events$feature, impact_events$sample)] <- 1
+impact_mut_mat <- impact_mut_mat[rowSums(impact_mut_mat) > 0, , drop = FALSE]  # no recurrence filter (targeted panel)
+dim(impact_mut_mat)
+```
+
+```{r save-views-and-check-overlap}
+view_mats <- list(
+  RNA_VST_top5000var     = rna_mat,
+  WES_CNV_numeric        = wes_cnv_mat,
+  WES_mutation_recurrent = wes_mut_mat,
+  IMPACT_mutation_OncoKB = impact_mut_mat
+)
+view_mats <- view_mats[vapply(view_mats, function(x) is.matrix(x) && nrow(x) > 0 && ncol(x) > 0, logical(1))]
+saveRDS(view_mats, VIEW_MATRIX_RDS)
+
+view_summary <- rbindlist(lapply(names(view_mats), function(v) {
+  m <- view_mats[[v]]
+  data.table(view = v, n_features = nrow(m), n_samples = ncol(m),
+             n_missing_values = sum(!is.finite(m)))
+}))
+print(view_summary)
+fwrite(view_summary, file.path(TABLE_DIR, "MOFA2_prepared_view_summary_GENCODEv47.tsv"), sep = "\t")
+
+# ---- Sample ID overlap check (RNA vs the other views) ----
+other_samples <- unique(unlist(lapply(view_mats[names(view_mats) != "RNA_VST_top5000var"], colnames)))
+rna_samples   <- colnames(view_mats$RNA_VST_top5000var)
+message("RNA samples: ", length(rna_samples),
+        " | found in at least one other view: ", length(intersect(rna_samples, other_samples)))
+message("RNA-only samples (check IDs): ", paste(setdiff(rna_samples, other_samples), collapse = ", "))
+
+# Presence of each sample across views
+sample_view_dt <- rbindlist(lapply(names(view_mats), function(v) {
+  data.table(sample = colnames(view_mats[[v]]), view = v, present = 1)
+}))
+sample_summary <- dcast(sample_view_dt, sample ~ view, value.var = "present", fill = 0)
+view_cols <- setdiff(colnames(sample_summary), "sample")
+sample_summary[, n_views_present := rowSums(.SD), .SDcols = view_cols]
+sample_summary <- sample_summary[order(-n_views_present, sample)]
+print(sample_summary)
+fwrite(sample_summary, file.path(TABLE_DIR, "MOFA2_prepared_sample_view_presence_GENCODEv47.tsv"), sep = "\t")
+
+if (sample_summary[n_views_present >= 2, .N] == 0) stop("No samples shared across >= 2 views. Check sample IDs.")
+
+lapply(view_mats, dim)
+```
