@@ -18,6 +18,7 @@ knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
 Run WGCNA on the strand-corrected top-5000 VST matrix and relate the modules to TILs
 High vs Low instead of the three NMF clusters used before.
 
+* Define High vs Low TILs using 10% cutoff (Ref: https://www.nature.com/articles/s41523-021-00346-1)
 * Low TILs  = TILs < 10 (this includes the text value "<5")
 * High TILs = TILs >= 10
 * The trait is coded High = 1, Low = 0. Positive module correlation = higher in High TILs.
