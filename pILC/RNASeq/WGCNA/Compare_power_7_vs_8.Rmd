@@ -1,0 +1,371 @@
+---
+title: "Sensitivity of the WGCNA Results to the Soft-Threshold Power (7 vs 8)"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = TRUE)
+```
+
+# Purpose
+
+The prespecified rule (lowest power with scale-free R-squared >= 0.80) selects power 8.
+Power 7 narrowly misses the cutoff (0.794). This file checks whether that choice matters,
+by comparing the two complete WGCNA runs produced by `WGCNA_NMF_K3_50runs.Rmd`:
+
+1. module assignments (do the same genes end up in the same modules?),
+2. module-cluster associations (are the same modules linked to the same clusters?),
+3. the selected top positive/negative module per cluster,
+4. the hub genes.
+
+Module colours are only labels, given by module size, so the same colour in two runs can
+be a different set of genes. Modules are therefore matched by gene overlap (Jaccard index
+= shared genes / all genes in either module), never by colour name.
+
+# 1. Settings and inputs
+
+```{r settings}
+suppressPackageStartupMessages({
+  library(WGCNA)
+  library(dplyr)
+})
+
+options(stringsAsFactors = FALSE)
+
+SEED <- 42
+set.seed(SEED)
+
+base_dir <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/WGCNA/NMFcluster/K3_50runs"
+
+P_MAIN <- 8            # power chosen by the prespecified rule (primary analysis)
+P_ALT  <- 7            # power for the sensitivity analysis
+FDR_SIG <- 0.05        # FDR level for calling a module-cluster association significant
+MATCH_JACCARD <- 0.5   # reading aid: modules with Jaccard >= 0.5 are called well matched
+
+CLUSTER_COLORS <- c(cluster1 = "#1b9e77", cluster2 = "#d95f02", cluster3 = "#7570b3")
+
+out_dir <- file.path(base_dir, paste0("comparison_power_", P_ALT, "_vs_", P_MAIN))
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+read_run <- function(p) {
+  f <- file.path(base_dir, paste0("power_", p), "WGCNA_Cluster_Core_Objects.rds")
+  stopifnot("Core objects file not found; run the main Rmd for this power first" = file.exists(f))
+  x <- readRDS(f)
+  stopifnot("The power stored in the file does not match its folder" = x$softPower == p)
+  x
+}
+
+run_main <- read_run(P_MAIN)
+run_alt  <- read_run(P_ALT)
+
+cat("Primary run  (power", P_MAIN, "):", run_main$power_source, "\n")
+cat("Sensitivity run (power", P_ALT, "):", run_alt$power_source, "\n")
+```
+
+# 2. Module assignments
+
+```{r module-assignments}
+ga <- run_main$geneInfo[, c("Gene", "Module")]
+gb <- run_alt$geneInfo[, c("Gene", "Module")]
+
+stopifnot("The two runs contain different genes" = setequal(ga$Gene, gb$Gene))
+gb <- gb[match(ga$Gene, gb$Gene), ]   # same gene order in both runs
+
+# Overlap table: rows = modules at power 8, columns = modules at power 7.
+ov <- table(ga$Module, gb$Module)
+ov <- matrix(as.numeric(ov), nrow = nrow(ov), dimnames = list(rownames(ov), colnames(ov)))
+
+# Jaccard index for every pair of modules.
+J <- ov / (outer(rowSums(ov), colSums(ov), "+") - ov)
+
+write.csv(ov, file.path(out_dir, "Module_Overlap_Counts.csv"))
+write.csv(J, file.path(out_dir, "Module_Overlap_Jaccard.csv"))
+
+# Best-matching module for each module (grey = unassigned genes, not a real module).
+match_modules <- function(J, ov) {
+  from <- setdiff(rownames(ov), "grey")
+  to   <- setdiff(colnames(ov), "grey")
+  best <- to[apply(J[from, to, drop = FALSE], 1, which.max)]
+  data.frame(
+    module_from  = from,
+    size_from    = unname(rowSums(ov)[from]),
+    module_to    = best,
+    size_to      = unname(colSums(ov)[best]),
+    shared_genes = ov[cbind(from, best)],
+    jaccard      = J[cbind(from, best)]
+  ) |>
+    mutate(pct_of_from_kept = shared_genes / size_from,
+           pct_of_to = shared_genes / size_to)
+}
+
+# "from" = the first power named in the file name, "to" = the second.
+match_main_to_alt <- match_modules(J, ov)
+match_alt_to_main <- match_modules(t(J), t(ov))
+
+write.csv(match_main_to_alt,
+          file.path(out_dir, paste0("Module_Match_power", P_MAIN, "_to_power", P_ALT, ".csv")),
+          row.names = FALSE)
+write.csv(match_alt_to_main,
+          file.path(out_dir, paste0("Module_Match_power", P_ALT, "_to_power", P_MAIN, ".csv")),
+          row.names = FALSE)
+
+cat("Power", P_MAIN, "modules and their best match at power", P_ALT, ":\n")
+print(match_main_to_alt)
+cat("\nPower", P_ALT, "modules and their best match at power", P_MAIN, ":\n")
+print(match_alt_to_main)
+```
+
+## Overall agreement of the two module assignments
+
+The adjusted Rand index (ARI) is 1 when two assignments are identical and about 0 when
+they agree no more than expected by chance.
+
+```{r agreement}
+ari <- function(x, y) {
+  tab <- table(x, y)
+  n <- sum(tab)
+  pairs <- function(v) sum(choose(v, 2))
+  sum_ij <- pairs(tab)
+  sum_i  <- pairs(rowSums(tab))
+  sum_j  <- pairs(colSums(tab))
+  expected <- sum_i * sum_j / choose(n, 2)
+  (sum_ij - expected) / (0.5 * (sum_i + sum_j) - expected)
+}
+
+grey_main <- ga$Module == "grey"
+grey_alt  <- gb$Module == "grey"
+both_assigned <- !grey_main & !grey_alt
+
+agreement <- data.frame(
+  Metric = c(
+    "Genes compared",
+    paste0("Modules excluding grey, power ", P_MAIN),
+    paste0("Modules excluding grey, power ", P_ALT),
+    paste0("Unassigned (grey) genes, power ", P_MAIN),
+    paste0("Unassigned (grey) genes, power ", P_ALT),
+    "Genes unassigned in one run but assigned in the other",
+    "Adjusted Rand index, all genes (grey counted as one group)",
+    "Adjusted Rand index, genes assigned in both runs"
+  ),
+  Value = c(
+    nrow(ga),
+    sum(rownames(ov) != "grey"),
+    sum(colnames(ov) != "grey"),
+    sum(grey_main),
+    sum(grey_alt),
+    sum(grey_main != grey_alt),
+    ari(ga$Module, gb$Module),
+    ari(ga$Module[both_assigned], gb$Module[both_assigned])
+  )
+)
+
+write.csv(agreement, file.path(out_dir, "Module_Assignment_Agreement.csv"), row.names = FALSE)
+agreement
+```
+
+## Overlap heatmap
+
+Colour = Jaccard index; the number in each cell = shared genes.
+
+```{r overlap-heatmap}
+mods_main <- setdiff(rownames(ov), "grey")
+mods_alt  <- setdiff(colnames(ov), "grey")
+
+plot_overlap <- function() {
+  op <- par(mar = c(8, 9, 3, 2))
+  on.exit(par(op))
+  Jm <- J[mods_main, mods_alt, drop = FALSE]
+  txt <- matrix(as.character(ov[mods_main, mods_alt, drop = FALSE]), nrow = length(mods_main))
+  labeledHeatmap(
+    Matrix = Jm,
+    xLabels = paste0("power ", P_ALT, " ", mods_alt),
+    yLabels = paste0("power ", P_MAIN, " ", mods_main),
+    colorLabels = FALSE,
+    colors = colorRampPalette(c("white", "firebrick"))(50),
+    textMatrix = txt,
+    setStdMargins = FALSE,
+    cex.text = 0.6, cex.lab.x = 0.8, cex.lab.y = 0.8,
+    zlim = c(0, 1),
+    main = "Module overlap between the two powers (Jaccard index)"
+  )
+}
+
+save_fig <- function(name, plot_fun, width_in, height_in, res = 200) {
+  png(file.path(out_dir, paste0(name, ".png")),
+      width = width_in * res, height = height_in * res, res = res)
+  tryCatch(plot_fun(), finally = dev.off())
+  pdf(file.path(out_dir, paste0(name, ".pdf")), width = width_in, height = height_in)
+  tryCatch(plot_fun(), finally = dev.off())
+  plot_fun()
+}
+
+save_fig("Module_Overlap_Heatmap", plot_overlap,
+         width_in = max(6, 0.7 * length(mods_alt) + 4),
+         height_in = max(5, 0.5 * length(mods_main) + 4))
+```
+
+# 3. Module-cluster associations
+
+Each module at power 8 is paired with its best-matching module at power 7, and the
+module-cluster correlations (and FDRs) are compared.
+
+```{r association-comparison}
+cor_main <- run_main$module.trait.correlation
+cor_alt  <- run_alt$module.trait.correlation
+fdr_main <- run_main$module.trait.FDR
+fdr_alt  <- run_alt$module.trait.FDR
+
+traits <- colnames(cor_main)
+stopifnot(identical(traits, colnames(cor_alt)))
+stopifnot(all(paste0("ME", match_main_to_alt$module_from) %in% rownames(cor_main)))
+stopifnot(all(paste0("ME", match_main_to_alt$module_to) %in% rownames(cor_alt)))
+
+assoc <- do.call(rbind, lapply(seq_len(nrow(match_main_to_alt)), function(i) {
+  me_main <- paste0("ME", match_main_to_alt$module_from[i])
+  me_alt  <- paste0("ME", match_main_to_alt$module_to[i])
+  data.frame(
+    module_main = match_main_to_alt$module_from[i],
+    module_alt  = match_main_to_alt$module_to[i],
+    jaccard     = match_main_to_alt$jaccard[i],
+    Trait       = traits,
+    r_main      = unname(cor_main[me_main, traits]),
+    r_alt       = unname(cor_alt[me_alt, traits]),
+    FDR_main    = unname(fdr_main[me_main, traits]),
+    FDR_alt     = unname(fdr_alt[me_alt, traits])
+  )
+})) |>
+  mutate(
+    r_diff       = r_alt - r_main,
+    same_sign    = sign(r_main) == sign(r_alt),
+    sig_main     = FDR_main < FDR_SIG,
+    sig_alt      = FDR_alt < FDR_SIG,
+    well_matched = jaccard >= MATCH_JACCARD
+  )
+
+write.csv(assoc, file.path(out_dir, "Module_Cluster_Association_Comparison.csv"), row.names = FALSE)
+
+wm <- assoc |> filter(well_matched)
+
+assoc_summary <- data.frame(
+  Metric = c(
+    "Module-cluster pairs compared",
+    paste0("Pairs with a well-matched module (Jaccard >= ", MATCH_JACCARD, ")"),
+    "Correlation of r between the two powers (well-matched pairs)",
+    "Largest absolute difference in r (well-matched pairs)",
+    "Well-matched pairs with opposite sign of r",
+    paste0("Significant (FDR < ", FDR_SIG, ") at both powers"),
+    paste0("Significant at power ", P_MAIN, " only"),
+    paste0("Significant at power ", P_ALT, " only")
+  ),
+  Value = c(
+    nrow(assoc),
+    nrow(wm),
+    if (nrow(wm) > 2) cor(wm$r_main, wm$r_alt) else NA_real_,
+    if (nrow(wm) > 0) max(abs(wm$r_diff)) else NA_real_,
+    sum(!wm$same_sign),
+    sum(wm$sig_main & wm$sig_alt),
+    sum(wm$sig_main & !wm$sig_alt),
+    sum(!wm$sig_main & wm$sig_alt)
+  )
+)
+
+write.csv(assoc_summary, file.path(out_dir, "Module_Cluster_Association_Summary.csv"), row.names = FALSE)
+assoc_summary
+```
+
+```{r association-scatter}
+plot_assoc_scatter <- function() {
+  op <- par(mar = c(5, 5, 3, 2))
+  on.exit(par(op))
+  plot(assoc$r_main, assoc$r_alt,
+       xlim = c(-1, 1), ylim = c(-1, 1),
+       pch = ifelse(assoc$well_matched, 19, 1),
+       col = unname(CLUSTER_COLORS[assoc$Trait]),
+       xlab = paste0("Module-cluster correlation, power ", P_MAIN),
+       ylab = paste0("Module-cluster correlation, power ", P_ALT),
+       main = "Module-cluster associations at the two powers")
+  abline(h = 0, v = 0, col = "grey80")
+  abline(0, 1, lty = 2)
+  legend("topleft", legend = names(CLUSTER_COLORS), col = CLUSTER_COLORS, pch = 19, bty = "n")
+  legend("bottomright",
+         legend = c(paste0("Jaccard >= ", MATCH_JACCARD), "weaker module match"),
+         pch = c(19, 1), bty = "n")
+}
+
+save_fig("Module_Cluster_Correlation_Scatter", plot_assoc_scatter, width_in = 6.5, height_in = 6)
+```
+
+# 4. Selected top positive and negative module per cluster
+
+For each cluster and direction, does the power-7 run select the module that matches the
+module selected at power 8?
+
+```{r selected-modules}
+sel_main <- run_main$selected_modules |>
+  rename(module_main = Module, r_main = r, p_main = p, FDR_main = FDR)
+
+sel_alt <- run_alt$selected_modules |>
+  rename(module_alt_selected = Module, r_alt = r, p_alt = p, FDR_alt = FDR)
+
+sel_cmp <- sel_main |>
+  left_join(sel_alt, by = c("Trait", "direction")) |>
+  left_join(
+    match_main_to_alt |>
+      select(module_main = module_from, module_alt_matched = module_to, jaccard),
+    by = "module_main"
+  ) |>
+  mutate(same_module = module_alt_selected == module_alt_matched)
+
+write.csv(sel_cmp, file.path(out_dir, "Selected_Module_Comparison.csv"), row.names = FALSE)
+sel_cmp
+```
+
+# 5. Hub genes
+
+```{r hub-genes}
+hubs_main <- run_main$all_cluster_hub_genes
+hubs_alt  <- run_alt$all_cluster_hub_genes
+
+combos <- bind_rows(
+  run_main$selected_modules[, c("Trait", "direction")],
+  run_alt$selected_modules[, c("Trait", "direction")]
+) |>
+  distinct()
+
+hub_overlap <- do.call(rbind, lapply(seq_len(nrow(combos)), function(i) {
+  g1 <- unique(hubs_main$gene[hubs_main$cluster == combos$Trait[i] &
+                                hubs_main$direction == combos$direction[i]])
+  g2 <- unique(hubs_alt$gene[hubs_alt$cluster == combos$Trait[i] &
+                               hubs_alt$direction == combos$direction[i]])
+  n_union <- length(union(g1, g2))
+  data.frame(
+    Trait = combos$Trait[i],
+    direction = combos$direction[i],
+    n_hubs_main = length(g1),
+    n_hubs_alt = length(g2),
+    n_shared = length(intersect(g1, g2)),
+    jaccard = if (n_union > 0) length(intersect(g1, g2)) / n_union else NA_real_
+  )
+}))
+
+names(hub_overlap)[3:4] <- c(paste0("n_hubs_power", P_MAIN), paste0("n_hubs_power", P_ALT))
+
+write.csv(hub_overlap, file.path(out_dir, "HubGene_Overlap.csv"), row.names = FALSE)
+hub_overlap
+```
+
+# 6. How to read the results
+
+- An adjusted Rand index close to 1, best-match Jaccard values close to 1 and matched
+  module-cluster correlations lying on the dashed line all mean that the choice between
+  power 7 and 8 does not change the conclusions.
+- A cluster whose selected module is the same module at both powers (`same_module` TRUE),
+  with a similar r and the same significance, is robust to the power.
+- Small differences in module membership at the edges are expected, because a different
+  power changes the network slightly. What matters is whether the main modules, their
+  cluster associations and their hub genes are preserved.
+- The Jaccard cutoff of 0.5 is only a reading aid, not a statistical threshold.
