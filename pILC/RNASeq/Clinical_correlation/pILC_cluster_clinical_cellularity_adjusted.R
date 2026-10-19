@@ -8,7 +8,7 @@ set.seed(SEED)
 
 # ---------------------------------------------------------------- 1. Paths
 root   <- Sys.getenv("PILC_ROOT", "/ix1/alee/LO_LAB/Personal/Rahul/pILC")
-clus_f <- file.path(root, "RNASeq/NMF/R_NMFConsensus_20runs/Cluster_membership_k3.csv")
+clus_f <- file.path(root, "RNASeq/NMF/R_NMFConsensus_50runs/Cluster_membership_k3_GPlabels.csv")
 clin_f <- file.path(root, "Clinical_correlation/pILC_ClinicoPathological_details.csv")
 out_dir <- file.path(root, "Clinical_correlation/Cluster_vs_clinical_cellularity_adjusted")
 dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
