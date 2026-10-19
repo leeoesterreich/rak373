@@ -54,7 +54,7 @@ OUT_DIR  <- file.path(ROOT, "NMF", "R_NMFConsensus")
 dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
 
 K_RANGE   <- 2:4        # k.initial = 2, k.final = 4
-N_CLUST   <- 50         # num.clusterings
+N_CLUST   <- 50         # num.clusterings (20 or 50)
 MAX_ITER  <- 2000       # max.num.iterations
 STOP_FREQ <- 10         # stop.frequency
 STOP_CONV <- 40         # stop.convergence
