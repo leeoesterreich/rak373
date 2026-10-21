@@ -215,7 +215,7 @@ sample_info <- data.frame(Sample_ID = estimated_frac$Sample_ID,
   mutate(Cluster = ifelse(is.na(Cluster), "Unassigned", as.character(Cluster)))
 
 message("Samples per cluster:")
-print(table(sample_info$Cluster))
+message("Samples per cluster:"); print(table(sample_info$Cluster))
 if (any(sample_info$Cluster == "Unassigned"))
   warning("Samples with no cluster: ",
           paste(sample_info$Sample_ID[sample_info$Cluster == "Unassigned"], collapse = ", "))
