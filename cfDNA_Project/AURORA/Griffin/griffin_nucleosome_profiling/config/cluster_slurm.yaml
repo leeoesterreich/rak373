@@ -14,7 +14,7 @@ calc_cov:
     partition: htc
     time: "24:00:00"
     mem: 10G
-    ncpus: 4
+    ncpus: 8
     ntasks: 1
     output: logs/cluster/{rule}.{wildcards.samples}.%j.out
     error: logs/cluster/{rule}.{wildcards.samples}.%j.err
@@ -22,8 +22,8 @@ calc_cov:
 
 merge_sites:
     partition: htc
-    time: "24:00:00"
-    mem: 10G
+    time: "03:00:00"
+    mem: 48G
     ncpus: 4
     ntasks: 1
     output: logs/cluster/{rule}.{wildcards.samples}.%j.out
