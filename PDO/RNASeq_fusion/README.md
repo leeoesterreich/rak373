@@ -38,9 +38,9 @@ because /ix1 is almost full. Only the key results are copied to /ix1, then /vast
 ## Scripts (in `Script/`)
 | Script | Purpose |
 |---|---|
+| `build_salmon_index.sh` | Builds the Salmon index (once per species) |
 | `check_strand_salmon.sh` | Salmon `-l A` on 1M read pairs per sample; writes `strand_summary.tsv` for the batch |
 | `summarise_strand.sh` | Builds `strand_summary.tsv` (called automatically by the script above) |
-| `build_salmon_index.sh` | Builds the Salmon index (once per species) |
 | `make_samplesheet.sh` | Builds `samplesheet_fusion.csv` for one batch (see the notes below) |
 | `download_rnafusion_refs.sh` | Record of how the rnafusion references were downloaded |
 | `run_rnafusion_v4.sh` launcher, `rnafusion_v4.config` Nextflow settings |
