@@ -68,4 +68,55 @@ All commands from this folder.
    Check the space with `crc-quota`.
 6. **Move the samplesheet** into the batch folder.
 7. **Consensus.** After all batches are done, run `build_consensus_v4.py` on all copied results
-   (in progress; see the script header for options).
+  .
+
+## Consensus fusion analysis (all batches together)
+Script: `Script/build_consensus_v4.py`. Results: `consensus_fusion/`.
+Arriba, STAR-Fusion and FusionCatcher each have their own false positives, so their calls are merged
+across all batches to find the fusions worth following up.
+
+Approach:
+1. Read every caller's output into one format (genes, breakpoints, supporting reads, tags).
+2. Calls with both breakpoints within 10 bp are the same event; `n_tools` counts how many callers agree.
+3. FusionInspector read support is added as extra evidence (it re-checks the reads, so it is not a fourth vote).
+4. Likely artifacts are flagged, not removed: readthrough or adjacent genes (same chromosome, closer than
+   100 kb), paralog and duplicated gene families, FusionCatcher normal tags (healthy, banned, gtex), unannotated genes.
+5. Events are counted across samples and batches: a fusion in many organoids is more likely an artifact or a
+   normal feature than a tumor-specific fusion.
+6. Shortlist = at least 2 callers, no artifact flag, found in at most 3 samples, at least 2 FusionInspector
+   junction reads (`--min_tools`, `--max_samples`, `--min_fi_junction`).
+
+Run ONCE for all batches together (list the results folder of each batch after --results; sample names must be unique across batches):
+
+    sbatch --clusters=htc --cpus-per-task=8 --mem=16G --time=02:00:00 --job-name=consensus \
+      --output=logs/consensus_%j.out --error=logs/consensus_%j.err \
+      --wrap='module load anaconda3/2025.7.0-2-python_3.11
+              cd /ix1/alee/LO_LAB/Personal/Rahul/PDO/RNASeq_fusion
+              python Script/build_consensus_v4.py \
+                --results 20220310_IPMBO_Jade_Organoid_RNAseq/results 20240315_Organoid_RNAseq/results 20260921_OrganoidBulkRNABatch3/results \
+                --outdir consensus_fusion'
+
+For a new batch, add its results folder to `--results`.
+
+Output files in `consensus_fusion/`:
+- `fusions_all_calls.tsv` every raw call, one row per call per tool
+- `fusions_consensus_per_sample.tsv` merged events per sample, with tools, support and flags
+- `fusions_event_recurrence.tsv` each event across samples and batches
+- `fusions_shortlist.tsv` the candidates to look at first
+
+How the files are made (each one is built from the one above it):
+
+```
+all_calls            every call, every tool
+   |  merge calls within 10 bp, add FusionInspector and flags
+   v
+consensus_per_sample    one event per sample
+   |-- group the same event over all samples --> event_recurrence
+   |-- keep rows passing the 4 rules ----------> shortlist
+```
+
+To check whether a fusion was ever detected, search `fusions_all_calls.tsv` (nothing is removed there).
+A fusion missing from the shortlist can still be present in the other three files.
+
+A shortlisted fusion is a candidate, not a proof. Next steps are checking the reads in IGV (FusionInspector
+BAMs), the reading frame, and RT-PCR validation. Check whether samples sharing a fusion come from the same patient.
