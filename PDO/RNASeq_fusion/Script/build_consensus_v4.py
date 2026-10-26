@@ -248,6 +248,9 @@ def main():
     cons["n_samples_with_event"] = cons["event_id"].map(n_samples)
     flags = ["flag_readthrough", "flag_paralog", "flag_fc_normal", "flag_unannotated"]
     cons["any_artifact_flag"] = cons[flags].any(axis=1)
+    # Names of the flags that are True for each event, e.g. "readthrough;fc_normal" (empty = none)
+    cons["artifact_flags"] = cons[flags].apply(
+        lambda r: ";".join(f.replace("flag_", "") for f in flags if r[f]), axis=1)
 
     rec = (cons.groupby("event_id")
            .agg(gene5=("gene5", "first"), gene3=("gene3", "first"),
@@ -257,7 +260,9 @@ def main():
                 samples=("sample", lambda x: ",".join(sorted(set(x)))),
                 batches=("batch", lambda x: ",".join(sorted(set(x)))),
                 max_tools=("n_tools", "max"),
-                any_artifact_flag=("any_artifact_flag", "max"))
+                # union of the flag names seen in any sample carrying this event
+                artifact_flags=("artifact_flags",
+                                lambda x: ";".join(sorted({t for v in x for t in v.split(";") if t}))))
            .sort_values("n_samples", ascending=False).reset_index())
 
     # Shortlist = called by at least --min_tools callers. Artifact flags, FusionInspector reads,
