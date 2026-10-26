@@ -76,16 +76,12 @@ Arriba, STAR-Fusion and FusionCatcher each have their own false positives, so th
 across all batches to find the fusions worth following up.
 
 Approach:
-1. Read every caller's output into one format (genes, breakpoints, supporting reads, tags).
-2. Calls with both breakpoints within 10 bp are the same event; `n_tools` counts how many callers agree.
+1. Read every caller’s output into one format (genes, breakpoints, supporting reads, tags).
+2. Calls with both breakpoints within 10 bp are the same event; n_tools counts how many callers agree.
 3. FusionInspector read support is added as extra evidence (it re-checks the reads, so it is not a fourth vote).
-4. Likely artifacts are flagged, not removed: readthrough or adjacent genes (same chromosome, closer than
-   100 kb), paralog and duplicated gene families, FusionCatcher normal tags (healthy, banned, gtex), unannotated genes.
-5. Events are counted across samples and batches: a fusion in many organoids is more likely an artifact or a
-   normal feature than a tumor-specific fusion.
-6. Shortlist = at least 2 callers, no artifact flag, found in at most 3 samples, at least 2 FusionInspector
-   junction reads (`--min_tools`, `--max_samples`, `--min_fi_junction`).
-
+4. Likely artifacts are flagged, not removed: readthrough or adjacent genes (same chromosome, closer than 100 kb), paralog and duplicated gene families, FusionCatcher normal tags (healthy, banned, gtex), unannotated genes.
+5. Known fusions are labelled in known_fusion_db with FusionCatcher’s database tags (known, tcga, 18cancers, mitelman, ccle3, tcga3). This is a label only.
+6. Shortlist = events called by at least 2 callers (--min_tools). Flags, tags, FusionInspector reads and the number of samples are kept as columns for the reader to judge..
 Run ONCE for all batches together (list the results folder of each batch after --results; sample names must be unique across batches):
 
     sbatch --clusters=htc --cpus-per-task=8 --mem=16G --time=02:00:00 --job-name=consensus \
