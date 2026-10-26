@@ -7,8 +7,6 @@ artifacts and count recurrence across samples.
 Usage (one results folder per batch; samples are found from results/arriba):
   python build_consensus_v4.py --results <results_batch1> <results_batch2> <results_batch3> \
          --outdir <dir>
-Optional: --keep_known keeps database-known fusions (FusionCatcher tags) in the shortlist
-even when flagged readthrough / FusionCatcher-normal.
 Optional: --samplesheet <sheet1.csv> <sheet2.csv> ... (same order) to take the sample list
 from samplesheets instead.
 """
@@ -193,12 +191,6 @@ def main():
                     help="optional: samplesheet of each batch, same order as --results")
     ap.add_argument("--outdir", required=True)
     ap.add_argument("--min_tools", type=int, default=2)
-    ap.add_argument("--max_samples", type=int, default=3)
-    ap.add_argument("--min_fi_junction", type=float, default=2)
-    ap.add_argument("--keep_known", action="store_true",
-                    help="also keep events with a FusionCatcher database tag in the shortlist "
-                         "even if flagged readthrough / FusionCatcher-normal "
-                         "(paralog and unannotated flags still exclude)")
     a = ap.parse_args()
 
     if a.samplesheet and len(a.results) != len(a.samplesheet):
@@ -268,13 +260,9 @@ def main():
                 any_artifact_flag=("any_artifact_flag", "max"))
            .sort_values("n_samples", ascending=False).reset_index())
 
-    base = ((cons.n_tools >= a.min_tools) & (cons.n_samples_with_event <= a.max_samples) &
-            (cons.fi_junction >= a.min_fi_junction))
-    keep = base & (~cons.any_artifact_flag)
-    if a.keep_known:                     # optional whitelist for database-known fusions
-        keep |= (base & (cons.known_fusion_db != "") &
-                 (~cons.flag_paralog) & (~cons.flag_unannotated))
-    short = cons[keep]
+    # Shortlist = called by at least --min_tools callers. Artifact flags, FusionInspector reads,
+    # known_fusion_db tags and recurrence are kept as columns for the reader to judge, not as filters
+    short = cons[cons.n_tools >= a.min_tools]
     short = short.sort_values(["n_tools", "fi_junction"], ascending=False)
 
     all_calls.to_csv(out / "fusions_all_calls.tsv", sep="\t", index=False)
