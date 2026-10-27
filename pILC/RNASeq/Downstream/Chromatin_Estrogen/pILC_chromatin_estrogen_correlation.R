@@ -55,8 +55,6 @@ plot_dir  <- file.path(out_dir, "plots")
 dir.create(table_dir, recursive = TRUE, showWarnings = FALSE)
 dir.create(plot_dir,  recursive = TRUE, showWarnings = FALSE)
 
-# Cluster membership: (0) Cluster_membership_k3_GPlabels.csv, (1) the NMF GCT at the default path, (2) any k=3 consensus GCT found under
-# the NMF folder, (3) cluster_metadata.tsv saved by the earlier pathway-score run.
 nmf_root         <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq"
 meta_fallback    <- file.path(nmf_root, "Downstream/Chromatin_Estrogen_pathway_scores/tables/cluster_metadata.tsv")
 cluster_csv_file <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/NMF/R_NMFConsensus_50runs/Cluster_membership_k3_GPlabels.csv"
