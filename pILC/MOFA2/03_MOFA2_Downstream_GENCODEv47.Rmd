@@ -52,7 +52,8 @@ HIGHLIGHT_GENES        <- character(0)  # optional genes to mark with * in the R
 MIN_PATHWAY_SIZE <- 10
 MAX_PATHWAY_SIZE <- 500
 FDR_CUTOFF       <- 0.05
-TOP_PATHWAYS_PLOT <- 40          # pathways shown per factor plot (tables keep all)
+TOP_PATHWAYS_PLOT <- 20          # pathways shown per direction (positive / negative) in each factor plot (tables keep all)
+LABEL_WRAP_WIDTH  <- 60          # characters per line for pathway labels in the GSEA plots
 ```
 
 ```{r helpers}
@@ -453,8 +454,18 @@ fwrite(rbindlist(rna_weight_plot_stats), file.path(DOWNSTREAM_DIR, "MOFA2_RNA_to
 ## 7. Covariation patterns
 
 ```{r covariation-plots}
-COVARIATION_VIEWS <- intersect(c("RNA_VST_top5000var", "WES_CNV_numeric"), all_views)
-MUTATION_VIEWS    <- intersect(c("WES_mutation_recurrent", "IMPACT_mutation_OncoKB"), all_views)
+EXPECTED_COVARIATION_VIEWS <- c("RNA_VST_top5000var", "WES_CNV_numeric")
+EXPECTED_MUTATION_VIEWS    <- c("WES_mutation_recurrent", "IMPACT_mutation_OncoKB")
+
+# Stop (instead of silently skipping) if an expected view name is not in the model
+missing_views <- setdiff(c(EXPECTED_COVARIATION_VIEWS, EXPECTED_MUTATION_VIEWS), all_views)
+if (length(missing_views) > 0) {
+  stop("View name(s) not found in the model: ", paste(missing_views, collapse = ", "),
+       ". Views in the model: ", paste(all_views, collapse = ", "))
+}
+
+COVARIATION_VIEWS <- EXPECTED_COVARIATION_VIEWS
+MUTATION_VIEWS    <- EXPECTED_MUTATION_VIEWS
 
 scatter_vars <- intersect(c("HR_HER2_subtype", "Grade"), metadata_available)
 if (length(scatter_vars) == 0) scatter_vars <- "view_completeness"
@@ -699,13 +710,19 @@ collection_colors <- c(GO_BP = "#3C78A8", Reactome = "#7B5EA7", Hallmark = "#D97
 plot_gsea_factor <- function(sig_dt, ff_name, top_n = TOP_PATHWAYS_PLOT) {
   d <- sig_dt[factor == ff_name]
   if (nrow(d) == 0) { message("No FDR-significant pathways for ", ff_name); return(NULL) }
-  d <- d[order(-abs(NES))][seq_len(min(.N, top_n))][order(NES)]
+  # Top pathways per direction, so negative-weight pathways are not hidden by strong positive ones
+  d <- rbindlist(list(d[NES > 0][order(-NES)][seq_len(min(.N, top_n))],
+                      d[NES < 0][order(NES)][seq_len(min(.N, top_n))]))
+  d <- d[order(NES)]
 
   lab <- d$pathway
   lab <- sub("^GOBP_", "GO BP: ", lab)
   lab <- sub("^REACTOME_", "Reactome: ", lab)
   lab <- sub("^HALLMARK_", "Hallmark: ", lab)
-  lab <- make.unique(gsub("_", " ", lab))
+  # Wrap long labels over several lines so the plot area keeps enough width
+  lab <- vapply(strwrap(gsub("_", " ", lab), width = LABEL_WRAP_WIDTH, simplify = FALSE),
+                paste, character(1), collapse = "\n")
+  lab <- make.unique(lab)
   d[, pathway_label := factor(lab, levels = lab)]
 
   ggplot(d, aes(x = NES, y = pathway_label, fill = collection)) +
@@ -713,20 +730,23 @@ plot_gsea_factor <- function(sig_dt, ff_name, top_n = TOP_PATHWAYS_PLOT) {
     geom_col(width = 0.72) +
     scale_fill_manual(values = collection_colors, name = "Pathway collection") +
     labs(title = paste0(ff_name, ": significant pathways from RNA-weight GSEA"),
-         subtitle = paste0("FDR < ", FDR_CUTOFF, "; top ", top_n, " by |NES| shown (full list in table)"),
+         subtitle = paste0("FDR < ", FDR_CUTOFF, "; top ", top_n, " per direction by NES shown (full list in table)"),
          x = "Normalized enrichment score (NES)", y = NULL) +
     theme_classic(base_size = 12) +
     theme(plot.title = element_text(face = "bold", size = 16),
-          axis.text.y = element_text(size = 9),
-          legend.position = "top")
+          plot.title.position = "plot",        # align title/subtitle to the full plot, not the narrow panel
+          axis.text.y = element_text(size = 9, lineheight = 0.9),
+          legend.position = "top",
+          legend.justification = "left")
 }
 
 for (ff_name in FOCUS_FACTOR_NAMES) {
   p <- plot_gsea_factor(gsea_significant, ff_name)
   if (!is.null(p)) {
     print(p)
-    h <- max(4.5, 0.32 * nrow(p$data) + 2)
-    save_plot(p, paste0(ff_name, "_significant_GSEA"), 11, h, dir = GSEA_DIR)
+    n_lines <- sum(lengths(strsplit(as.character(p$data$pathway_label), "\n")))  # wrapped label lines
+    h <- max(5, 0.2 * n_lines + 2.5)
+    save_plot(p, paste0(ff_name, "_significant_GSEA"), 12, h, dir = GSEA_DIR)
   }
 }
 ```
