@@ -1,0 +1,37 @@
+Sample name,Age at Diagnosis,Age at Menopause,MirrorFFPE_overall_tumor_cellularity (%),MirrorFFPE_pleomorphic_invasive_compoent_cellularity (%),MirrorFFPE_TILs (%),Grade/Differentiation-Desc,BREAST: Her-2/Neu-Desc,Tumor Marker #ER                         ,Tumor Marker #PR
+TP03-117,51,,60,10,5,Grade II,Negative              ,Positive,Positive
+TP04-104,64,46,60,60,15,Cell type not determined,Negative              ,Negative,Negative
+TP05-1063,81,,40,10,<5,Grade II,Negative              ,Positive,Positive
+TP05-232,51,NA,95,NA,60,Grade III,Positive           ,Positive,Negative
+TP05-668,70,,70,10,10,Cell type not determined,Positive           ,Positive,Positive
+TP05-726,84,NA,70,40,15,Grade III,Negative              ,Positive,Positive
+TP05-791,39,,70,70,30,Grade III,Negative              ,Negative,Negative
+TP07-172,43,,40,5,<5,Cell type not determined,Negative              ,Positive,Positive
+TP07-197,82,,60,15,<5,Grade II,Negative              ,Positive,Negative
+TP07-626,44,NA,70,55,5,Grade III,Negative              ,Positive,Positive
+TP08-1319,89,,40,<10,<5,Grade II,Positive           ,Positive,Positive
+TP08-1447,67,,55,35,15,Grade III,Positive           ,Positive,Positive
+TP08-2202,42,39,85,40,15,Grade II,Negative              ,Positive,Positive
+TP08-356,69,,65,60,70,Grade II,Negative              ,Positive,Positive
+TP08-370,49,,40,15,<5,Grade III,Negative              ,Positive,Positive
+TP08-517,44,,15,70,<5,Grade II,Negative              ,Positive,Positive
+TP09-71,78,,85,85,<5,Grade II,Negative              ,Positive,Positive
+TP09-746,73,,65,30,5,Grade III,Positive           ,Positive,Positive
+TP09-9,55,,50,20,30,Grade III,Positive           ,Positive,Positive
+TP10-705,50,,40,20,<5,Grade III,Positive           ,Positive,Positive
+TP10-S1190,78,,15,80,10,Grade III,Negative              ,Positive,Positive
+TP11-1127,65,,80,35,<5,Grade II,Negative              ,Negative,Negative
+TP11-1516,54,40,50,30,5,Grade II,Negative              ,Positive,Positive
+TP11-1780,63,53,70,70,15,Grade III,Negative              ,Positive,Positive
+TP11-372,75,,50,35,20,Grade III,Positive           ,Negative,Negative
+TP12-1864,68,,50,20,<5,Grade III,Negative              ,Positive,Positive
+TP12-2045,72,,80,40,15,Grade III,Negative              ,Positive,Positive
+TP12-240,46,,40,15,<5,Grade III,Negative              ,Negative,Negative
+TP12-880,64,,70,70,30,Grade II,Positive           ,Positive,Positive
+TP13-1150,59,,60,20,<5,Grade III,Negative              ,Positive,Positive
+TP13-820,86,50,60,40,<5,Grade III,Negative              ,Positive,Positive
+TP13-862,56,,60,20,10,Grade II,Negative              ,Positive,Positive
+TP14-490,79,,90,80,<5,Grade III,Positive           ,Positive,Positive
+TP14-586,55,50,70,15,5,Grade II,Negative              ,Negative,Negative
+TP15-M509,69,NA,80,40,20,Grade III,Negative              ,Positive,Negative
+TP17-M11,52,,NA,NA,NA,Grade III,Negative              ,Positive,Positive
