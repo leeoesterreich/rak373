@@ -11,7 +11,7 @@
 #  * Statistics: only an EXPLORATORY PDOs-vs-tumors Wilcoxon test (4 vs 31, BH over pathways).
 #    PDOs also differ from tumors in culture conditions and in having no stromal/immune cells.
 # Positive difference / z = higher in the PDOs.
-# Run first: PDO_counts_to_VST_GENCODEv47.R   Output names carry no dates.
+# Run first: PDO_counts_to_VST_GENCODEv47.R
 ###############################################################################
 
 suppressPackageStartupMessages({
@@ -48,6 +48,12 @@ N_SHOW    <- 12     # bar plot: max pathways per direction (significant ones onl
 PER_PAGE  <- 12     # boxplots: panels per figure; more significant pathways -> extra figures (_page1, _page2, ...)
 KEY_PATHWAYS <- c("ESTROGEN_RESPONSE_EARLY", "ESTROGEN_RESPONSE_LATE", "ANDROGEN_RESPONSE")
 ADD_KEY_PATHWAYS <- FALSE   # TRUE: also add the key pathways to the boxplots even if not significant
+
+# Scores used by the two PDO-only plots (top/bottom 5 and "where the PDOs differ most"):
+#   "pdo_only": ssGSEA run on the 4 PDOs alone (PDO VST, no tumors) - NOT on the tumor scale
+#   "joint"   : scores of the joint run with the tumors
+PDO_PLOT_SCORES <- "pdo_only"
+VST_P_FILE <- file.path(PDO_DIR, "VST_data_GENCODEv47/htseq_VST_matrix_all_expression_filtered_genes.rds")   # PDO-only VST (step 3)
 
 cluster_colors <- c("Cluster 1" = "#1B9E77", "Cluster 2" = "#D95F02", "Cluster 3" = "#7570B3")
 cluster_levels <- names(cluster_colors)
@@ -131,6 +137,38 @@ ss_p <- ss_all[, pdo_keys, drop = FALSE]
 fwrite(as.data.table(ss_p,   keep.rownames = "Pathway"), file.path(OUT_SS, "ssGSEA_Hallmark_scores_PDO.csv"))
 fwrite(as.data.table(ss_all, keep.rownames = "Pathway"), file.path(OUT_SS, "ssGSEA_Hallmark_scores_tumors_and_PDO_joint_run.csv"))
 
+# ------------------------------- 5b. PDO-only ssGSEA run (for the PDO-only plots) ----
+# The 4 PDOs are scored on their own, from the PDO-only VST matrix (no tumors).
+# These scores are relative to the PDOs only; never mix them with the joint-run (tumor-scale) scores.
+if (!PDO_PLOT_SCORES %in% c("pdo_only", "joint")) stop("PDO_PLOT_SCORES must be 'pdo_only' or 'joint'.")
+if (PDO_PLOT_SCORES == "pdo_only") {
+  if (!file.exists(VST_P_FILE)) stop("Missing PDO VST matrix: ", VST_P_FILE, " (run PDO_counts_to_VST_GENCODEv47.R first)")
+  vp <- readRDS(VST_P_FILE)
+  if (!all(pdo_keys %in% colnames(vp)))
+    stop("PDO names in the PDO VST matrix (", paste(colnames(vp), collapse = ", "), ") do not match the count file (",
+         paste(pdo_keys, collapse = ", "), ").")
+  vp    <- vp[, pdo_keys, drop = FALSE]
+  sym_p <- sub("\\|.*$", "", rownames(vp))                                  # "SYMBOL|ENSG" -> "SYMBOL"
+  okp   <- !is.na(sym_p) & sym_p != ""
+  vp    <- vp[okp, , drop = FALSE]; sym_p <- sym_p[okp]
+  op    <- order(rowMeans(vp), decreasing = TRUE)                           # keep the highest-expressed row per symbol
+  vp    <- vp[op, , drop = FALSE]; sym_p <- sym_p[op]
+  vp    <- vp[!duplicated(sym_p), , drop = FALSE]; rownames(vp) <- sym_p[!duplicated(sym_p)]
+  message(sprintf("PDO-only ssGSEA input: %d genes x %d PDOs; %.1f%% of Hallmark genes present",
+                  nrow(vp), ncol(vp), 100 * mean(unique(unlist(hallmark)) %in% rownames(vp))))
+  ss_pdo_only <- gsva(ssgseaParam(exprData = vp, geneSets = hallmark, normalize = TRUE))[, pdo_keys, drop = FALSE]
+  fwrite(as.data.table(ss_pdo_only, keep.rownames = "Pathway"), file.path(OUT_SS, "ssGSEA_Hallmark_scores_PDO_only_run.csv"))
+  ss_plot   <- ss_pdo_only
+  plot_tag  <- "PDOonly"
+  plot_axis <- "ssGSEA score (PDO-only run)"
+  plot_note <- " Scores from an ssGSEA run on the PDOs alone; not on the tumor scale."
+} else {
+  ss_plot   <- ss_p
+  plot_tag  <- "joint"
+  plot_axis <- "ssGSEA score (joint run with tumors)"
+  plot_note <- " Scores from the joint run with the tumors."
+}
+
 # ------------------------------- 6. Cluster labels of the tumors -------------
 clus <- read.csv(CLUSTER_FILE); clus$Key <- norm_id(clus$sample)
 cl <- factor(paste("Cluster", clus$cluster[match(tum_keys, clus$Key)]), levels = cluster_levels)
@@ -197,13 +235,14 @@ save_pheatmap(draw_ss_heatmap, file.path(OUT_SS, "ssGSEA_Hallmark_heatmap_PDO_vs
 # ------------------------------- 9b. Top / bottom pathways by mean score across the 4 PDOs
 # Ranking of ABSOLUTE ssGSEA scores of the PDOs (descriptive, no test, no tumor comparison).
 N_TOPBOT <- 5
+wrap_txt <- function(x, width) paste(strwrap(x, width), collapse = "\n")   # wraps long titles/captions so they are not cut off
 pdo_cols <- setNames(c("#D55E00", "#0072B2", "#009E73", "#CC79A7")[seq_along(pdo_keys)], pdo_keys)
-ord_p    <- names(sort(rowMeans(ss_p), decreasing = TRUE))
+ord_p    <- names(sort(rowMeans(ss_plot), decreasing = TRUE))
 sel_top  <- head(ord_p, N_TOPBOT)
 sel_bot  <- tail(ord_p, N_TOPBOT)                              # also in descending order
 panel_lv <- c(paste("Top", N_TOPBOT), paste("Bottom", N_TOPBOT))
 tb_long <- rbindlist(lapply(c(sel_top, sel_bot), function(p) data.table(
-  Pathway = p, PDO = pdo_keys, Score = as.numeric(ss_p[p, pdo_keys]),
+  Pathway = p, PDO = pdo_keys, Score = as.numeric(ss_plot[p, pdo_keys]),
   Panel = if (p %in% sel_top) panel_lv[1] else panel_lv[2])))
 tb_long[, Panel := factor(Panel, levels = panel_lv)]
 tb_long[, Pathway_lab := factor(gsub("_", " ", Pathway), levels = rev(gsub("_", " ", c(sel_top, sel_bot))))]
@@ -216,26 +255,28 @@ p_tb <- ggplot(tb_long, aes(Score, Pathway_lab)) +
   geom_point(data = tb_sum, aes(x = Mean, y = Pathway_lab), shape = 18, size = 5, colour = "black", inherit.aes = FALSE) +
   facet_grid(Panel ~ ., scales = "free_y", space = "free_y") +
   scale_colour_manual(values = pdo_cols, name = "PDO") +
-  labs(x = "ssGSEA score", y = NULL,
+  labs(x = plot_axis, y = NULL,
        title = paste0("Top ", N_TOPBOT, " and bottom ", N_TOPBOT, " Hallmark pathways\nby mean ssGSEA score"),
        subtitle = paste0("Dots: individual PDOs. Black diamond: mean of the ", length(pdo_keys), " PDOs.\nGrey line: min to max."),
-       caption = paste0("Descriptive ranking only: one sample per PDO (n = ", length(pdo_keys), ", no replicates), no statistical test.")) +
+       caption = wrap_txt(paste0("Descriptive ranking only: one sample per PDO (n = ", length(pdo_keys), ", no replicates), no statistical test.",
+                                 plot_note), 95)) +
   theme_bw(base_size = 12) +
   theme(plot.title = element_text(face = "bold"), strip.text = element_text(face = "bold", size = 11),
-        panel.grid.minor = element_blank(), plot.caption = element_text(size = 9, hjust = 0))
-save_plot(p_tb, file.path(OUT_SS, "ssGSEA_Hallmark_PDO_top_bottom_pathways"), 9, 6.5)
+        panel.grid.minor = element_blank(), plot.caption = element_text(size = 9, hjust = 0),
+        plot.title.position = "plot", plot.caption.position = "plot")
+save_plot(p_tb, file.path(OUT_SS, paste0("ssGSEA_Hallmark_", plot_tag, "_top_bottom_pathways")), 9, 6.5)
 
 tb_tab <- merge(tb_sum[, .(Panel, Pathway, Mean, Min, Max)],
                 dcast(tb_long, Panel + Pathway ~ PDO, value.var = "Score"), by = c("Panel", "Pathway"))
 setorder(tb_tab, -Mean)
-fwrite(tb_tab, file.path(OUT_SS, "ssGSEA_Hallmark_PDO_top_bottom_pathways.csv"))
+fwrite(tb_tab, file.path(OUT_SS, paste0("ssGSEA_Hallmark_", plot_tag, "_top_bottom_pathways.csv")))
 
 # ------------------------------- 9c. Where the 4 PDOs differ most (ranked by range across the PDOs)
 # Range = max - min of the ssGSEA score over the 4 PDOs. Descriptive only (one sample per PDO, no test).
 N_DIFF <- 10
-rng_all <- apply(ss_p, 1, function(x) max(x) - min(x))
+rng_all <- apply(ss_plot, 1, function(x) max(x) - min(x))
 sel_d   <- head(names(sort(rng_all, decreasing = TRUE)), N_DIFF)        # largest range first
-d_long <- rbindlist(lapply(sel_d, function(p) data.table(Pathway = p, PDO = pdo_keys, Score = as.numeric(ss_p[p, pdo_keys]))))
+d_long <- rbindlist(lapply(sel_d, function(p) data.table(Pathway = p, PDO = pdo_keys, Score = as.numeric(ss_plot[p, pdo_keys]))))
 d_long[, Pathway_lab := factor(gsub("_", " ", Pathway), levels = rev(gsub("_", " ", sel_d)))]   # largest range at the top
 d_sum <- d_long[, .(Mean = mean(Score), Min = min(Score), Max = max(Score), Range = max(Score) - min(Score),
                     Highest_PDO = PDO[which.max(Score)], Lowest_PDO = PDO[which.min(Score)]),
@@ -247,22 +288,23 @@ p_diff <- ggplot(d_long, aes(Score, Pathway_lab)) +
   geom_point(aes(colour = PDO), size = 3.5, alpha = 0.9) +
   geom_point(data = d_sum, aes(x = Mean, y = Pathway_lab), shape = 18, size = 5, colour = "black", inherit.aes = FALSE) +
   scale_colour_manual(values = pdo_cols, name = "PDO") +
-  labs(x = "ssGSEA score", y = NULL,
+  labs(x = plot_axis, y = NULL,
        title = "Where the four PDOs differ most",
-       caption = paste0("Top ", N_DIFF, " Hallmark pathways ranked by range (max minus min) across the ", length(pdo_keys),
-                        " PDOs. Dots: PDOs; diamond: mean. Descriptive only (one sample per PDO, no test).")) +
+       caption = wrap_txt(paste0("Top ", N_DIFF, " Hallmark pathways ranked by range (max minus min) across the ", length(pdo_keys),
+                                 " PDOs. Dots: PDOs; diamond: mean. Descriptive only (one sample per PDO, no test).", plot_note), 95)) +
   theme_bw(base_size = 12) +
   theme(plot.title = element_text(face = "bold"), panel.grid.minor = element_blank(),
-        plot.caption = element_text(size = 9, hjust = 0))
-save_plot(p_diff, file.path(OUT_SS, "ssGSEA_Hallmark_PDO_largest_range_pathways"), 8.5, 5.5)
+        plot.caption = element_text(size = 9, hjust = 0),
+        plot.title.position = "plot", plot.caption.position = "plot")
+save_plot(p_diff, file.path(OUT_SS, paste0("ssGSEA_Hallmark_", plot_tag, "_largest_range_pathways")), 8.5, 5.5)
 
 d_tab <- merge(d_sum[, .(Pathway, Range, Mean, Min, Max, Highest_PDO, Lowest_PDO)],
                dcast(d_long, Pathway ~ PDO, value.var = "Score"), by = "Pathway")
 setorder(d_tab, -Range)
-fwrite(d_tab, file.path(OUT_SS, "ssGSEA_Hallmark_PDO_largest_range_pathways.csv"))
-# All 50 pathways, for reference
-fwrite(data.table(Pathway = names(rng_all), Range = rng_all, ss_p)[order(-Range)],
-       file.path(OUT_SS, "ssGSEA_Hallmark_PDO_range_all_pathways.csv"))
+fwrite(d_tab, file.path(OUT_SS, paste0("ssGSEA_Hallmark_", plot_tag, "_largest_range_pathways.csv")))
+# All pathways, for reference
+fwrite(data.table(Pathway = names(rng_all), Range = rng_all, ss_plot)[order(-Range)],
+       file.path(OUT_SS, paste0("ssGSEA_Hallmark_", plot_tag, "_range_all_pathways.csv")))
 
 # ------------------------------- 10. Bar plot: pathways most different in the PDOs
 sig  <- cmp[cmp$Wilcoxon_FDR < FDR_CUT, ]                 # significant pathways only (already sorted by |z|)
@@ -277,9 +319,11 @@ p_bar <- ggplot(bar_df, aes(PDO_mean_z_vs_tumors, Pathway, fill = Direction)) +
   scale_fill_manual(values = c("Higher in PDOs" = "#B2182B", "Lower in PDOs" = "#2166AC"), name = NULL) +
   labs(x = "Mean PDO ssGSEA score (SD from the tumor mean)", y = NULL,
        title = "Hallmark pathways significantly different in the PDOs",
-       caption = paste0("Only pathways with FDR < ", FDR_CUT, " (PDOs vs tumors, Wilcoxon, BH); up to ", N_SHOW,
-                        " per direction. Exploratory; PDOs also differ from tumors in culture conditions and cell composition.")) +
-  theme_bw(base_size = 12) + theme(legend.position = "bottom")
+       caption = wrap_txt(paste0("Only pathways with FDR < ", FDR_CUT, " (PDOs vs tumors, Wilcoxon, BH); up to ", N_SHOW,
+                                 " per direction. Exploratory; PDOs also differ from tumors in culture conditions and cell composition."), 90)) +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "bottom", plot.title.position = "plot", plot.caption.position = "plot",
+        plot.caption = element_text(size = 9, hjust = 0))
 save_plot(p_bar, file.path(OUT_SS, "ssGSEA_Hallmark_PDO_top_pathways_barplot"), 8, 7)
 
 # ------------------------------- 11. Boxplots: tumors by cluster, PDOs overlaid
@@ -319,12 +363,13 @@ for (pg in seq_len(n_pages)) {
     labs(x = NULL, y = "ssGSEA Enrichment Score",
          title = paste0("Hallmark ssGSEA, significant pathways: tumors by cluster and PDOs",
                         if (n_pages > 1) paste0(" (page ", pg, " of ", n_pages, ")") else ""),
-         caption = paste0("Only pathways with FDR < ", FDR_CUT, " (PDOs vs all tumors, Wilcoxon, BH over ", nrow(cmp),
-                          " pathways), exploratory. Boxes: tumors by RNA cluster; grey points: tumors; coloured points: PDOs.")) +
+         caption = wrap_txt(paste0("Only pathways with FDR < ", FDR_CUT, " (PDOs vs all tumors, Wilcoxon, BH over ", nrow(cmp),
+                                   " pathways), exploratory. Boxes: tumors by RNA cluster; grey points: tumors; coloured points: PDOs."), 130)) +
     theme_bw(base_size = 12) +
     theme(plot.title = element_text(face = "bold"), strip.text = element_text(face = "bold", size = 9),
           panel.grid.minor = element_blank(), axis.text.x = element_text(angle = 30, hjust = 1),
-          plot.caption = element_text(size = 9, hjust = 0))
+          plot.caption = element_text(size = 9, hjust = 0),
+          plot.title.position = "plot", plot.caption.position = "plot")
   stem <- if (n_pages > 1) paste0("ssGSEA_Hallmark_boxplots_PDO_vs_tumors_significant_page", pg)
           else "ssGSEA_Hallmark_boxplots_PDO_vs_tumors_significant"
   save_plot(p_box, file.path(OUT_SS, stem), 12, 3.4 * ceiling(length(show) / 3) + 1)
