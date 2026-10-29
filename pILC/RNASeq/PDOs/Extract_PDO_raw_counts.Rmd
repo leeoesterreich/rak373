@@ -1,0 +1,154 @@
+---
+title: "Extract_PDO_raw_counts"
+output: html_document
+date: "2026-10-11"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r}
+###############################################################################
+# Extract raw RNA-seq counts for 4 patient-derived organoids (PDOs)
+#   BO-046, BO-114, BO-189, BO-268
+#
+# PURPOSE
+#   This script pulls the raw counts of the
+#   four PDOs out of the organoid RNA-seq count matrix, checks them, and saves
+#   a clean gene x sample matrix. That matrix is the input for the next step:
+#   one joint VST run (PDOs + pILC tumors), then ssGSEA (Hallmark).
+#
+# INPUT (organoid RNA-seq data, Michael Gorry)
+#   Org_RAWcounts__ENSG_63140.csv      raw counts, Ensembl IDs (used here)
+#   colData_organoid_metadata.xlsx     sample metadata (used for checking only)
+#   Not used here: Org_RNAseq_RAWcounts_IDconverted_63140.csv (symbol version)
+#
+# KNOWN FEATURES OF THE COUNT FILE (found while testing)
+#   1. Row 1 is a SECOND header (featureCounts style): "Geneid" followed by the
+#      BAM path of each sample. Because of this, R reads every column as text.
+#      The script removes this row and keeps the BAM paths as a record.
+#   2. Ensembl IDs carry version numbers (e.g. ENSG00000290825.1). They are
+#      kept here; remove them later with sub("\\..*$", "", id), as in the pILC
+#      DESeq2/ssGSEA script.
+#   3. The BAM name of BO-268 is "BO268_S36_B...". The extra "B" may mean a
+#      second library, a re-sequencing run or a batch. Check the metadata.
+#
+# OUTPUT (folder: OUT, no dates in file names)
+#   PDO_raw_counts.csv            gene x 4 samples, raw integer counts
+#   PDO_sample_to_bam_map.csv     which BAM file each sample came from
+#   PDO_library_sizes.csv         total counts per sample (quality check)
+#   (the metadata rows of the 4 samples are only printed to the console)
+#
+# SAFETY CHECKS (the script stops with an error if any of them fails)
+#   - each sample name matches exactly one column
+#   - the BAM path in row 1 contains the same sample ID (cross-check)
+#   - after removing the header row, no value is lost by number conversion
+#   - all values are whole numbers and not negative (true raw counts)
+#   - gene IDs are unique
+#
+# NEXT STEP
+#   Merge these counts with the pILC tumor counts (4_Count_file_pILC) on shared
+#   protein-coding genes, run vst(blind = TRUE) ONCE on all samples, then run
+#   ssGSEA (Hallmark) on the joint VST matrix.
+###############################################################################
+
+suppressPackageStartupMessages({
+  library(readxl)
+})
+
+SEED <- 42
+set.seed(SEED)
+
+# ------------------------------- 1. PATHS ------------------------------------
+IN_DIR   <- "/ix1/alee/LO_LAB/Personal/Michael_Gorry/Org_RNAseq_Data"
+COUNTS   <- file.path(IN_DIR, "Org_RAWcounts__ENSG_63140.csv")
+METADATA <- file.path(IN_DIR, "colData_organoid_metadata.xlsx")
+
+OUT <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/PDO"
+dir.create(OUT, recursive = TRUE, showWarnings = FALSE)
+
+want <- c("BO-046", "BO-114", "BO-189", "BO-268")   # samples to extract
+
+# Helper: make names comparable (ignore case, dots, hyphens, underscores)
+# "BO-046", "BO046" and "bo_046" all become "BO046"
+key <- function(x) toupper(gsub("[^A-Za-z0-9]", "", x))
+
+# --------------------------- 2. READ COUNT MATRIX ----------------------------
+# check.names = FALSE keeps the original column names
+# colClasses = "character": read everything as text first, so that the extra
+# header row cannot silently change the column types; we convert below
+cnt <- read.csv(COUNTS, check.names = FALSE, stringsAsFactors = FALSE,
+                colClasses = "character")
+cat("Count file dimensions (rows x columns):", dim(cnt), "\n")
+cat("First column names:", paste(head(colnames(cnt), 10), collapse = ", "), "\n")
+
+# ----------------------- 3. MATCH THE 4 SAMPLE NAMES -------------------------
+# Search each sample ID in the column names (column 1 = gene IDs is skipped)
+sample_cols <- colnames(cnt)[-1]
+hit <- lapply(want, function(w) which(grepl(key(w), key(sample_cols), fixed = TRUE)) + 1L)
+names(hit) <- want
+print(hit)   # each sample must match exactly one column
+
+n_hit <- lengths(hit)
+if (any(n_hit != 1))
+  stop("These samples do not match exactly one column: ",
+       paste(names(n_hit)[n_hit != 1], collapse = ", "),
+       "\nLook at the column names printed above (e.g. 'BO046', '_S12' suffix).")
+
+sel <- cnt[, c(1, unlist(hit))]
+colnames(sel) <- c("gene", want)
+
+# ------------------ 4. REMOVE THE SECOND HEADER ROW (BAM PATHS) --------------
+# Row 1 = "Geneid" + BAM paths (featureCounts style). Keep it as a record.
+stopifnot(sel$gene[1] == "Geneid")
+bam_paths <- unlist(sel[1, want])
+
+# Cross-check: the sample ID must also appear in its own BAM path
+ok <- mapply(function(w, b) grepl(key(w), key(b), fixed = TRUE), want, bam_paths)
+if (!all(ok))
+  stop("Column name and BAM path disagree for: ", paste(want[!ok], collapse = ", "))
+
+sel <- sel[-1, ]
+rownames(sel) <- NULL
+
+# ---------------------------- 5. CONVERT AND CHECK ---------------------------
+# Convert to numbers. NAs created here would mean text values were lost,
+# so we check for that right after.
+sel[want] <- lapply(sel[want], function(v) as.numeric(trimws(v)))
+
+stopifnot(!anyNA(sel[want]))                                  # nothing lost
+m <- as.matrix(sel[want])
+stopifnot(all(abs(m - round(m)) < 1e-8))                      # whole numbers
+stopifnot(all(m >= 0))                                        # no negatives
+stopifnot(!anyDuplicated(sel$gene))                           # unique gene IDs
+stopifnot(all(grepl("^ENSG", sel$gene)))                      # all Ensembl IDs
+sel[want] <- lapply(sel[want], as.integer)                    # raw integer counts
+
+# Library sizes: the four samples should be in a similar range
+lib <- data.frame(sample = want,
+                  total_counts = colSums(sel[want]),
+                  genes_with_counts = colSums(sel[want] > 0),
+                  row.names = NULL)
+print(lib)
+
+# ----------------------------- 6. METADATA CHECK -----------------------------
+# Print the metadata rows that mention the 4 samples (what does "_B" mean for
+# BO-268? batch? re-sequencing?). Console output only; nothing is saved.
+meta <- read_excel(METADATA)
+cat("\nMetadata columns:", paste(colnames(meta), collapse = ", "), "\n")
+
+row_has_sample <- apply(meta, 1, function(r)
+  any(sapply(want, function(w) any(grepl(key(w), key(as.character(r)), fixed = TRUE)))))
+meta_sub <- meta[row_has_sample, , drop = FALSE]
+print(as.data.frame(meta_sub))
+
+# ------------------------------- 7. SAVE OUTPUTS -----------------------------
+write.csv(sel, file.path(OUT, "PDO_raw_counts.csv"), row.names = FALSE)
+write.csv(data.frame(sample = want, bam = bam_paths, row.names = NULL),
+          file.path(OUT, "PDO_sample_to_bam_map.csv"), row.names = FALSE)
+write.csv(lib, file.path(OUT, "PDO_library_sizes.csv"), row.names = FALSE)
+
+cat("\nDone. Saved", nrow(sel), "genes x", length(want), "samples in:", OUT, "\n")
+sessionInfo()
+```
+
