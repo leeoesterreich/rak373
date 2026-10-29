@@ -2,10 +2,8 @@
 # Consensus NMF with the R package "NMF", method = "KL", k = 2, 3, 4, 50 runs
 #
 # WHY THIS SCRIPT
-#   To compare the NMF package with the hand-written NMF (NMF_consensus_clustering.R)
-#   on the same VST matrix. Everything that is not the NMF itself is done exactly
-#   as in the hand-written script, so the two sets of results can be compared directly:
-#     - same input (vst_transformed_data.gct), same seed (42), 50 random starts
+#   To Run the NMF package 
+#     - input (vst_transformed_data.gct), same seed (42), 50 random starts
 #     - consensus matrix = fraction of runs in which two tumors share a cluster
 #     - final clusters = average-linkage tree on 1 - consensus, cut at k, and the
 #       clusters are numbered in the order they appear in the tree
@@ -19,6 +17,8 @@
 #   Cophenetic_correlation.csv       cophenetic correlation and PAC for k = 2, 3, 4
 #   Consensus_matrix_k{k}.csv        tumor x tumor consensus
 #   Cluster_membership_k{k}.csv      cluster of each tumor ("sample","cluster")
+#   NMF_best_run_k3_W.csv            gene weights W (genes x 3) of the best run (lowest objective)
+#   NMF_best_run_k3_H.csv            tumor weights H (3 x tumors) of the best run
 #   Run_settings_and_session_info.txt
 # Each k is saved as soon as it is finished, so a time-out does not lose earlier k.
 ###############################################################################
@@ -29,11 +29,12 @@ suppressPackageStartupMessages(library(NMF))     # nmf(), consensus()
 ROOT     <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq"
 GCT_FILE <- file.path(ROOT, "4_Count_file_HTSeq_stranded", "VST_data_GENCODEv47",
                       "vst_transformed_data.gct")
-OUT_DIR  <- file.path(ROOT, "NMF", "NMFpackage_KL_50runs")
+OUT_DIR  <- file.path(ROOT, "NMF", "R_NMFConsensus_50runs")     # <- folder you use for the NMF-package run
 dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
 stopifnot(dir.exists(OUT_DIR))
 
 K_RANGE <- 2:4
+K_WH    <- 3            # W and H of the best run are saved for this k only
 N_CLUST <- 50           # number of random starts per k
 SEED    <- 42
 METHOD  <- "KL"
@@ -70,6 +71,16 @@ for (k in K_RANGE) {
   cl <- cutree(hc, k)
   cl_ord <- match(cl, unique(cl[hc$order]))         # 1, 2, 3 ... in tree order
   names(cl_ord) <- colnames(X)
+
+  # ---- best run, k = K_WH only: W (genes x k) and H (k x tumors), for projecting new samples (e.g. PDOs) ----
+  if (k == K_WH) {
+    best <- NMF::fit(fit)                           # run with the lowest objective among the N_CLUST runs
+    W <- basis(best); H <- coef(best)
+    rownames(W) <- rownames(X); colnames(W) <- paste0("P", seq_len(k))
+    rownames(H) <- paste0("P", seq_len(k)); colnames(H) <- colnames(X)
+    write.csv(W, file.path(OUT_DIR, sprintf("NMF_best_run_k%d_W.csv", k)))
+    write.csv(H, file.path(OUT_DIR, sprintf("NMF_best_run_k%d_H.csv", k)))
+  }
 
   ut  <- upper.tri(C)
   pac <- mean(C[ut] > PAC_LO & C[ut] < PAC_HI)
