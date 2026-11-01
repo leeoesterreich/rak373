@@ -3,6 +3,36 @@ title: "01_Prepare_MOFA2_input_GENCODEv47"
 output: html_document
 ---
 
+## Purpose
+
+Builds the four MOFA2 input views (RNA, WES CNV, WES recurrent mutation, MSK-IMPACT mutation) and saves them as one RDS file for script 02. This version runs the **restricted-RNA analysis**: only the RNA view is changed, and the three other views are built exactly as in the original analysis.
+
+## RNA view: filtering criteria
+
+**Step 1: Expression filter and variance ranking (done before this script, in the VST step)**
+- Genes are kept if the raw count is >= 5 in at least 10% of samples.
+- Counts are VST-transformed and the top 5000 most variable genes are kept (GENCODE v47, strand-corrected HTSeq counts).
+
+**Step 2: Gene-class filter (done in this script)**
+The restricted gene list is made by `RNA_top5000_gene_class_check_GENCODEv47.R` from the GENCODE v47 annotation. The filter is applied to the existing top 5000 genes; no new top 5000 is selected, so the remaining genes are a subset of the original RNA view.
+
+| Gene class | Decision | Rule used |
+|---|---|---|
+| Protein-coding | Keep | gene_type = protein_coding |
+| Immunoglobulin (IG) and T-cell receptor (TR) genes | Keep | gene_type starts with IG_ or TR_ (these are not labelled protein_coding in GENCODE) |
+| Annotated lncRNA, not antisense | Keep | gene_type = lncRNA with a gene symbol, and not antisense |
+| Antisense lncRNA | Exclude | gene name ends in -AS[0-9]*, or the gene overlaps a protein-coding gene on the opposite strand |
+| Unannotated genes | Exclude | only an Ensembl ID, no gene symbol |
+| Pseudogenes | Exclude | gene_type contains pseudogene |
+| rRNA, snRNA, snoRNA and all other classes not listed under Keep | Exclude | any other gene_type |
+| Mitochondrial genes | Exclude | chrM, or gene name starting with MT- |
+
+**Feature names:** gene symbol; Ensembl ID where no symbol exists; `SYMBOL|ENSG...` where one symbol is shared by several Ensembl IDs. Genes are matched to the annotation by Ensembl ID.
+
+**Result of the filter:** 3,973 of the 5,000 genes are kept (3,543 protein-coding, 296 other lncRNA, 134 IG/TR). Removed: 705 unannotated, 188 antisense, 99 pseudogenes, 35 other non-coding. The gene counts at each step are saved in `MOFA2_Tables/RNA_gene_class_filter_summary_GENCODEv47.tsv`.
+
+**Settings:** `RNA_GENE_FILTER_FILE` = path of the restricted gene list; set it to `NULL` to run the original analysis (all 5000 genes). The RNA view is named `RNA_VST_restricted` (the original analysis used `RNA_VST_top5000var`); scripts 02 and 03 use this name.
+
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 
@@ -18,7 +48,9 @@ set.seed(42)
 
 ```{r paths}
 # ---- Output ----
-OUT_DIR   <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/MOFA2"
+# Restricted-RNA analysis is saved in Biased_analysis.
+# For the original top-5000 analysis use ".../pILC/MOFA2" and set RNA_GENE_FILTER_FILE <- NULL
+OUT_DIR   <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/MOFA2/Restricted_analysis"
 RDS_DIR   <- file.path(OUT_DIR, "MOFA2_RDS")
 TABLE_DIR <- file.path(OUT_DIR, "MOFA2_Tables")
 for (d in c(OUT_DIR, RDS_DIR, TABLE_DIR)) {
@@ -28,6 +60,11 @@ for (d in c(OUT_DIR, RDS_DIR, TABLE_DIR)) {
 # ---- Inputs ----
 # Updated RNA matrix (stranded HTSeq, GENCODE v47, already VST + top 5000 variable genes)
 RNA_VST_FILE <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/4_Count_file_HTSeq_stranded/VST_data_GENCODEv47/htseq_VST_matrix_top5000_variable_genes.rds"
+
+# Allowed RNA genes (one name per line) written by RNA_top5000_gene_class_check_GENCODEv47.R:
+# protein-coding, IG/TR and non-antisense lncRNA genes. Only these genes of the top-5000 matrix
+# are kept. Set to NULL to use all 5000 genes (original analysis).
+RNA_GENE_FILTER_FILE <- file.path(OUT_DIR, "RNA_gene_filter", "RNA_genes_restricted_set.txt")
 
 # Same inputs as the earlier analysis
 WES_MAF_FILE <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/WES/Downstream/PCGR/Compare_TumorOnly_vs_WithPON/maftools/Tier_1_common/Combined_MAF/Tier_1_common_all_samples.combined.maf"
@@ -152,12 +189,34 @@ rna_mat <- collapse_duplicate_rows_numeric(rna_mat)
 rna_mat <- collapse_duplicate_cols_numeric(rna_mat)
 rna_mat <- rna_mat[apply(rna_mat, 1, function(z) any(is.finite(z))), , drop = FALSE]
 
+n_rna_input <- nrow(rna_mat)
+
+# Optional gene filter: keep only the allowed genes (restricted analysis)
+if (!is.null(RNA_GENE_FILTER_FILE)) {
+  if (!file.exists(RNA_GENE_FILTER_FILE)) stop("Gene filter list not found: ", RNA_GENE_FILTER_FILE)
+  allowed_genes <- unique(readLines(RNA_GENE_FILTER_FILE))
+  message("Allowed genes in the list: ", length(allowed_genes),
+          " | not found in the RNA matrix: ", sum(!allowed_genes %in% rownames(rna_mat)))
+  rna_mat <- rna_mat[rownames(rna_mat) %in% allowed_genes, , drop = FALSE]
+  if (nrow(rna_mat) == 0) stop("No RNA genes left after the gene filter. Check the gene names in the list.")
+}
+n_rna_after_filter <- nrow(rna_mat)
+
 # Only re-select if the file has more than 5000 genes
 if (nrow(rna_mat) > TOP_N_RNA_GENES) {
   rna_var <- apply(rna_mat, 1, var, na.rm = TRUE)
   rna_mat <- rna_mat[names(sort(rna_var, decreasing = TRUE))[seq_len(TOP_N_RNA_GENES)], , drop = FALSE]
 }
 rna_mat <- drop_zero_variance_features(rna_mat)
+
+# Paired table: number of RNA genes at each step
+rna_gene_steps <- data.table(
+  step    = c("RNA genes in the input matrix (after cleaning)",
+              "RNA genes after the gene-class filter",
+              "RNA genes in the final view (after zero-variance removal)"),
+  n_genes = c(n_rna_input, n_rna_after_filter, nrow(rna_mat)))
+print(rna_gene_steps)
+fwrite(rna_gene_steps, file.path(TABLE_DIR, "RNA_gene_class_filter_summary_GENCODEv47.tsv"), sep = "\t")
 
 dim(rna_mat)
 
@@ -242,7 +301,7 @@ dim(impact_mut_mat)
 
 ```{r save-views-and-check-overlap}
 view_mats <- list(
-  RNA_VST_top5000var     = rna_mat,
+  RNA_VST_restricted     = rna_mat,
   WES_CNV_numeric        = wes_cnv_mat,
   WES_mutation_recurrent = wes_mut_mat,
   IMPACT_mutation_OncoKB = impact_mut_mat
@@ -259,8 +318,8 @@ print(view_summary)
 fwrite(view_summary, file.path(TABLE_DIR, "MOFA2_prepared_view_summary_GENCODEv47.tsv"), sep = "\t")
 
 # ---- Sample ID overlap check (RNA vs the other views) ----
-other_samples <- unique(unlist(lapply(view_mats[names(view_mats) != "RNA_VST_top5000var"], colnames)))
-rna_samples   <- colnames(view_mats$RNA_VST_top5000var)
+other_samples <- unique(unlist(lapply(view_mats[names(view_mats) != "RNA_VST_restricted"], colnames)))
+rna_samples   <- colnames(view_mats$RNA_VST_restricted)
 message("RNA samples: ", length(rna_samples),
         " | found in at least one other view: ", length(intersect(rna_samples, other_samples)))
 message("RNA-only samples (check IDs): ", paste(setdiff(rna_samples, other_samples), collapse = ", "))
