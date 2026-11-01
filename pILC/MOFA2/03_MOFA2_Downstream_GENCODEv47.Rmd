@@ -20,7 +20,7 @@ set.seed(SEED)
 ```
 
 ```{r paths-and-settings}
-OUT_DIR   <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/MOFA2"
+OUT_DIR   <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/MOFA2/Restricted_analysis"
 RDS_DIR   <- file.path(OUT_DIR, "MOFA2_RDS")
 TABLE_DIR <- file.path(OUT_DIR, "MOFA2_Tables")
 MODEL_DIR <- file.path(OUT_DIR, "MOFA2_Model")
@@ -29,7 +29,7 @@ GSEA_DIR       <- file.path(OUT_DIR, "MOFA2_Pathway_GSEA")
 for (d in c(DOWNSTREAM_DIR, GSEA_DIR)) dir.create(d, recursive = TRUE, showWarnings = FALSE)
 
 # Model and sample-view table written by 02_Train_MOFA2_model_GENCODEv47.Rmd
-MODEL_TAG <- "K10_drop02_seed42_GENCODEv47"
+MODEL_TAG <- "K10_drop02_seed42_GENCODEv47_restrictedRNA"
 MODEL_HDF5 <- file.path(MODEL_DIR, paste0("MOFA2_pILC_model_", MODEL_TAG, ".hdf5"))
 SAMPLE_VIEW_FILE <- file.path(TABLE_DIR, paste0("MOFA2_training_sample_view_presence_", MODEL_TAG, ".tsv"))
 
@@ -45,7 +45,7 @@ for (f in c(MODEL_HDF5, SAMPLE_VIEW_FILE, CLINICAL_FILE)) {
 FOCUS_R2_CUTOFF        <- 5      # focus factors = max variance explained in any view >= 5%
 FOCUS_FACTORS_OVERRIDE <- NULL   # e.g. c(1, 2, 3) to choose factors manually
 TOP_N_WEIGHTS          <- 25
-RNA_VIEW               <- "RNA_VST_top5000var"
+RNA_VIEW               <- "RNA_VST_restricted"
 HIGHLIGHT_GENES        <- character(0)  # optional genes to mark with * in the RNA weight bar plots
 
 # GSEA settings
@@ -454,7 +454,7 @@ fwrite(rbindlist(rna_weight_plot_stats), file.path(DOWNSTREAM_DIR, "MOFA2_RNA_to
 ## 7. Covariation patterns
 
 ```{r covariation-plots}
-EXPECTED_COVARIATION_VIEWS <- c("RNA_VST_top5000var", "WES_CNV_numeric")
+EXPECTED_COVARIATION_VIEWS <- c("RNA_VST_restricted", "WES_CNV_numeric")
 EXPECTED_MUTATION_VIEWS    <- c("WES_mutation_recurrent", "IMPACT_mutation_OncoKB")
 
 # Stop (instead of silently skipping) if an expected view name is not in the model
