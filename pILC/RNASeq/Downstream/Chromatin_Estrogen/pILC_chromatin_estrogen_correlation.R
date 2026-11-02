@@ -38,7 +38,7 @@ suppressPackageStartupMessages({
 })
 
 # ----------------------------
-# Paths (fixed names, no date or time stamps)
+# Paths 
 # ----------------------------
 input_dir  <- "/ix1/alee/LO_LAB/Personal/Rahul/pILC/RNASeq/4_Count_file_HTSeq_stranded/VST_data_GENCODEv47"
 vst_file   <- file.path(input_dir, "htseq_VST_matrix_all_expression_filtered_genes.rds")   # saved VST, all expression-filtered genes
