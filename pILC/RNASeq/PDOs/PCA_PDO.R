@@ -63,6 +63,50 @@ write.csv(data.frame(PC = paste0("PC", seq_along(pve)), Variance_explained_pct =
           file.path(OUT_DIR, "PCA_PDO_variance.csv"), row.names = FALSE)
 print(round(pve, 2))
 
+# ------------------------------ 4b. Genes driving PC1 and PC2 -----------------
+suppressPackageStartupMessages(library(pheatmap))
+N_LOAD <- 15                                    # genes shown per direction per PC
+
+load_df <- data.frame(Gene = rownames(pca$rotation),
+                      PC1 = pca$rotation[, "PC1"], PC2 = pca$rotation[, "PC2"])
+load_df$PC1_contribution_pct <- 100 * load_df$PC1^2    # rotation columns have unit length
+load_df$PC2_contribution_pct <- 100 * load_df$PC2^2
+load_df <- load_df[order(-abs(load_df$PC1)), ]
+write.csv(load_df, file.path(OUT_DIR, "PCA_PDO_gene_loadings.csv"), row.names = FALSE)
+
+# top genes per PC: N_LOAD positive and N_LOAD negative
+pick <- function(pc) {
+  v <- sort(setNames(load_df[[pc]], load_df$Gene))
+  g <- c(head(v, N_LOAD), tail(v, N_LOAD))
+  data.frame(PC = pc, Gene = names(g), Loading = as.numeric(g),
+             Direction = ifelse(g > 0, "Higher in PC+ samples", "Higher in PC- samples"))
+}
+top_load <- rbind(pick("PC1"), pick("PC2"))
+write.csv(top_load, file.path(OUT_DIR, "PCA_PDO_top_loading_genes.csv"), row.names = FALSE)
+
+# bar plot of top loadings
+top_load$Gene_ord <- paste(top_load$PC, top_load$Gene, sep = "_")
+top_load$Gene_ord <- factor(top_load$Gene_ord, levels = top_load$Gene_ord[order(top_load$Loading)])
+p_ld <- ggplot(top_load, aes(Loading, Gene_ord, fill = Direction)) +
+  geom_col() +
+  facet_wrap(~ PC, scales = "free_y") +
+  scale_y_discrete(labels = function(x) sub("^PC[12]_", "", x)) +
+  scale_fill_manual(values = c("Higher in PC+ samples" = "#B2182B", "Higher in PC- samples" = "#2166AC")) +
+  labs(title = "Genes with the largest PCA loadings (PDOs)", x = "Loading", y = NULL) +
+  theme_bw(base_size = 12) +
+  theme(legend.position = "bottom", plot.title.position = "plot", legend.title = element_blank())
+ggsave(file.path(OUT_DIR, "PCA_PDO_top_loading_genes_barplot.png"), p_ld, width = 10, height = 7, dpi = 300)
+ggsave(file.path(OUT_DIR, "PCA_PDO_top_loading_genes_barplot.pdf"), p_ld, width = 10, height = 7)
+
+# heatmap of the same genes (VST, centred per gene across the 4 PDOs)
+hm_genes <- unique(top_load$Gene)
+hm <- t(scale(t(vsd[hm_genes, , drop = FALSE]), center = TRUE, scale = FALSE))
+png(file.path(OUT_DIR, "PCA_PDO_top_loading_genes_heatmap.png"), width = 5,
+    height = 0.17 * length(hm_genes) + 2, units = "in", res = 300)
+pheatmap(hm, cluster_rows = TRUE, cluster_cols = TRUE, border_color = NA,
+         main = "Top PC1/PC2 loading genes (VST, centred)")
+dev.off()
+
 # ------------------------------ 5. Plot --------------------------------------
 pdo_cols <- c("#D55E00", "#0072B2", "#009E73", "#CC79A7")
 p <- ggplot(scores, aes(PC1, PC2, color = sample)) +
